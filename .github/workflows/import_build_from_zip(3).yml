@@ -1,0 +1,278 @@
+# .github/workflows/import_build_from_zip.yml — v1.0 (luci-app-podkop-bot)
+# Imports a development ZIP into the luci-app-podkop-bot repository source tree.
+# Run manually: Actions → import-from-zip → Run workflow
+#
+# Expected layout INSIDE the zip (under the source-root folder):
+#   nfpm.yaml
+#   Makefile                       (optional, for feeds builds)
+#   CHANGELOG.md                   (optional)
+#   scripts/{postinst,postrm}
+#   root/usr/libexec/rpcd/podkop_bot
+#   root/usr/lib/podkop_bot/{install.sh,podkop_bot,podkop_bot_init}
+#   root/usr/share/luci/menu.d/luci-app-podkop-bot.json
+#   root/usr/share/rpcd/acl.d/luci-app-podkop-bot.json
+#   root/www/luci-static/resources/view/podkop-bot/*.js
+#   root/www/luci-static/resources/css/podkop-bot/*.css
+#
+# NOTE: this imports the LuCI app only. The bot core (podkop_bot repo) and its
+# install.sh live in a separate repo and are synced by hand.
+
+name: import-from-zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Path to zip inside the repository"
+        required: true
+        default: "_incoming/luci-app-podkop-bot-0.16.82.zip"
+      source_root:
+        description: "Root folder name inside the zip (blank = auto-detect first dir)"
+        required: false
+        default: "luci-app-podkop-bot"
+      commit_message:
+        description: "Commit message"
+        required: true
+        default: "Import luci-app-podkop-bot 0.16.82 from ZIP"
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate zip exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "${{ inputs.zip_path }}" ]; then
+            echo "ERROR: zip not found at '${{ inputs.zip_path }}'"
+            echo "Available files in _incoming/:"
+            ls -la _incoming/ 2>/dev/null || echo "  (_incoming/ does not exist)"
+            exit 1
+          fi
+
+      - name: Unpack zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf _workzip
+          mkdir -p _workzip
+          unzip -q "${{ inputs.zip_path }}" -d _workzip
+          echo "=== ZIP contents (top 3 levels) ==="
+          find _workzip -maxdepth 3 -type f | sort | head -60
+
+      - name: Detect source root
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ inputs.source_root }}"
+
+          # 1) exact match if a source_root was given
+          if [ -n "$ROOT" ] && [ -d "_workzip/$ROOT" ]; then
+            echo "src=_workzip/$ROOT" >> "$GITHUB_OUTPUT"
+            echo "Found exact match: _workzip/$ROOT"
+            exit 0
+          fi
+
+          # 2) if the zip has exactly one top-level dir, use it
+          dir_count="$(find _workzip -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          first_dir="$(find _workzip -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
+          if [ -n "$first_dir" ]; then
+            echo "src=$first_dir" >> "$GITHUB_OUTPUT"
+            echo "Using first directory: $first_dir (top-level dirs: $dir_count)"
+            exit 0
+          fi
+
+          # 3) zip may be flat (files at root) — use _workzip itself
+          if [ -f "_workzip/nfpm.yaml" ]; then
+            echo "src=_workzip" >> "$GITHUB_OUTPUT"
+            echo "Flat zip detected, using _workzip"
+            exit 0
+          fi
+
+          echo "ERROR: Cannot detect source root inside zip"
+          exit 1
+
+      - name: Validate expected zip layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.detect.outputs.src }}"
+
+          # Required pieces for the LuCI app
+          test -f "$SRC/nfpm.yaml"                                             || { echo "MISSING: nfpm.yaml"; exit 1; }
+          test -f "$SRC/root/usr/libexec/rpcd/podkop_bot"                      || { echo "MISSING: rpcd/podkop_bot"; exit 1; }
+          test -f "$SRC/root/usr/lib/podkop_bot/install.sh"                    || { echo "MISSING: lib/install.sh"; exit 1; }
+          test -f "$SRC/root/usr/lib/podkop_bot/podkop_bot"                    || { echo "MISSING: lib/podkop_bot"; exit 1; }
+          test -f "$SRC/root/usr/lib/podkop_bot/podkop_bot_init"               || { echo "MISSING: lib/podkop_bot_init"; exit 1; }
+          test -d "$SRC/root/www/luci-static/resources/view/podkop-bot"        || { echo "MISSING: view/podkop-bot"; exit 1; }
+          test -f "$SRC/root/www/luci-static/resources/view/podkop-bot/overview.js" \
+            || { echo "MISSING: view/overview.js"; exit 1; }
+          test -f "$SRC/root/usr/share/luci/menu.d/luci-app-podkop-bot.json"   || { echo "MISSING: menu.d json"; exit 1; }
+          test -f "$SRC/root/usr/share/rpcd/acl.d/luci-app-podkop-bot.json"    || { echo "MISSING: acl.d json"; exit 1; }
+
+          # Guard: the stale duplicate installer must NOT be imported.
+          if [ -f "$SRC/root/usr/share/luci-app-podkop-bot/install.sh" ]; then
+            echo "WARN: stale usr/share/luci-app-podkop-bot/install.sh present in zip — it will be skipped on import"
+          fi
+
+          echo "ZIP layout validated OK"
+          echo "=== Source tree ==="
+          find "$SRC" -maxdepth 6 -type f | sort | head -80
+
+      - name: JS syntax check (node --check)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.detect.outputs.src }}"
+          fail=0
+          while IFS= read -r f; do
+            if node --check "$f" 2>/tmp/jserr; then
+              echo "OK:   $f"
+            else
+              echo "FAIL: $f"; cat /tmp/jserr; fail=1
+            fi
+          done < <(find "$SRC/root/www/luci-static/resources/view/podkop-bot" -type f -name '*.js')
+          [ "$fail" = 0 ] || { echo "JS syntax check failed"; exit 1; }
+
+      - name: Shell syntax check (sh -n)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.detect.outputs.src }}"
+          fail=0
+          for f in \
+            "$SRC/root/usr/libexec/rpcd/podkop_bot" \
+            "$SRC/root/usr/lib/podkop_bot/install.sh" \
+            "$SRC/root/usr/lib/podkop_bot/podkop_bot" \
+            "$SRC/root/usr/lib/podkop_bot/podkop_bot_init" \
+            "$SRC/scripts/postinst" \
+            "$SRC/scripts/postrm"; do
+            [ -f "$f" ] || continue
+            if sh -n "$f" 2>/tmp/sherr; then
+              echo "OK:   $f"
+            else
+              echo "FAIL: $f"; cat /tmp/sherr; fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || { echo "Shell syntax check failed"; exit 1; }
+
+      - name: JSON validation (menu.d + acl.d)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.detect.outputs.src }}"
+          for j in \
+            "$SRC/root/usr/share/luci/menu.d/luci-app-podkop-bot.json" \
+            "$SRC/root/usr/share/rpcd/acl.d/luci-app-podkop-bot.json"; do
+            jq empty "$j" && echo "OK: $j"
+          done
+
+      - name: Clean managed trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Clean ONLY the parts we manage. Never touch .github/, .git/,
+          # _incoming/, or other repo-local files.
+          rm -rf root
+          rm -rf scripts
+          mkdir -p root scripts
+
+      - name: Import files preserving repo layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.detect.outputs.src }}"
+
+          # Whole payload tree
+          cp -a "$SRC/root/." root/
+
+          # Drop the stale duplicate installer if the zip carried it.
+          rm -f root/usr/share/luci-app-podkop-bot/install.sh
+          rmdir root/usr/share/luci-app-podkop-bot 2>/dev/null || true
+
+          # Maintainer scripts
+          if [ -d "$SRC/scripts" ]; then
+            cp -a "$SRC/scripts/." scripts/
+          fi
+
+          # Root-level managed files
+          cp -a "$SRC/nfpm.yaml" nfpm.yaml
+          [ -f "$SRC/Makefile" ]     && cp -a "$SRC/Makefile" Makefile         || echo "note: no Makefile in zip"
+          [ -f "$SRC/CHANGELOG.md" ] && cp -a "$SRC/CHANGELOG.md" CHANGELOG.md  || echo "note: no CHANGELOG.md in zip"
+
+          # Do NOT overwrite .github/workflows — managed separately.
+
+      - name: Normalize permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Everything defaults to 0644...
+          find root -type f -exec chmod 0644 {} \;
+          # ...then the four-file exec contract gets 0755.
+          for x in \
+            root/usr/libexec/rpcd/podkop_bot \
+            root/usr/lib/podkop_bot/install.sh \
+            root/usr/lib/podkop_bot/podkop_bot \
+            root/usr/lib/podkop_bot/podkop_bot_init; do
+            [ -f "$x" ] && chmod 0755 "$x"
+          done
+          # Maintainer scripts executable.
+          find scripts -type f -exec chmod 0755 {} \; 2>/dev/null || true
+          chmod 0644 nfpm.yaml 2>/dev/null || true
+
+      - name: Post-import validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Imported files ==="
+          find root scripts nfpm.yaml -type f 2>/dev/null | sort
+          echo ""
+          echo "=== Exec bits (must be exactly 4 files at 0755 under root/) ==="
+          find root -type f -perm -u+x | sort
+          echo ""
+          echo "=== Key files check ==="
+          for f in \
+            root/usr/libexec/rpcd/podkop_bot \
+            root/usr/lib/podkop_bot/install.sh \
+            root/www/luci-static/resources/view/podkop-bot/overview.js \
+            root/www/luci-static/resources/css/podkop-bot/podkop-bot.css \
+            nfpm.yaml scripts/postinst scripts/postrm; do
+            test -f "$f" && echo "OK: $f" || echo "WARN: missing $f"
+          done
+
+      - name: Show git diff summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --short
+          git diff --stat || true
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add root scripts nfpm.yaml
+          [ -f Makefile ]     && git add Makefile     || true
+          [ -f CHANGELOG.md ] && git add CHANGELOG.md || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "${{ inputs.commit_message }}"
+          git push

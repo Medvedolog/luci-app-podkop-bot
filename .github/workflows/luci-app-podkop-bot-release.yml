@@ -1,0 +1,242 @@
+# ==============================================================================
+# LuCI App Podkop Bot — Build & Release Workflow
+# Builds IPK (OpenWrt opkg) and APK (OpenWrt 24+ apk-tools) via nFPM.
+# No compilation — JS/shell/config package (arch: all / noarch).
+#
+# Trigger:
+#   1. Push tag "0.16.*" or "0.[2-9]*" or "[1-9]*"
+#   2. Manual dispatch: enter version string (e.g. "0.16.82" or "0.16.82-1")
+#
+# The four-file exec contract (rpcd script, install.sh, podkop_bot,
+# podkop_bot_init at 0755) is enforced by nfpm.yaml file_info and re-verified
+# after build.
+# ==============================================================================
+
+name: Build and Release luci-app-podkop-bot
+
+on:
+  push:
+    tags:
+      - '0.16.*'
+      - '0.[2-9]*'
+      - '[1-9]*'
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (e.g. 0.16.82 or 0.16.82-1)'
+        required: true
+        default: '0.16.82'
+
+jobs:
+  release:
+    name: Build IPK + APK and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ─────────────────────────────────────────────────────────────────────────
+      # 1. Determine version
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Determine version
+        id: vars
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="nightly"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "Resolved VERSION=${VERSION}"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 2. Checkout repo
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 3. Install nFPM (latest release, auto-resolved)
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Install nFPM
+        run: |
+          NFPM_TAG=$(curl -sL https://api.github.com/repos/goreleaser/nfpm/releases/latest | jq -r .tag_name)
+          NFPM_VER=${NFPM_TAG#v}
+          echo "Installing nFPM ${NFPM_VER}"
+          curl -sSfL \
+            "https://github.com/goreleaser/nfpm/releases/download/${NFPM_TAG}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" \
+            | tar -xz nfpm
+          sudo mv nfpm /usr/local/bin/
+          nfpm --version
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 4. Install dos2unix (prevent CRLF issues on OpenWrt sh scripts)
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Install dos2unix
+        run: sudo apt-get update -qq && sudo apt-get install -y dos2unix
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 5. Fix CRLF line endings and UTF-8 BOM in shell scripts
+      #    CRITICAL: prevents "not found" errors in OpenWrt's POSIX sh; a BOM
+      #    (0xEF 0xBB 0xBF) before the shebang breaks exec on some sh builds.
+      #    Covers maintainer scripts AND the shipped rpcd/installer/bot scripts.
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Fix CRLF and BOM in scripts
+        run: |
+          set -e
+          FILES="scripts/postinst scripts/postrm \
+                 root/usr/libexec/rpcd/podkop_bot \
+                 root/usr/lib/podkop_bot/install.sh \
+                 root/usr/lib/podkop_bot/podkop_bot \
+                 root/usr/lib/podkop_bot/podkop_bot_init"
+          for f in $FILES; do
+            [ -f "$f" ] || continue
+            dos2unix "$f"
+            sed -i '1s/^\xef\xbb\xbf//' "$f"
+          done
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 6. Pre-build sanity: syntax + no stale duplicate installer
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Pre-build sanity checks
+        run: |
+          set -e
+          echo "--- JS syntax ---"
+          for f in root/www/luci-static/resources/view/podkop-bot/*.js; do
+            node --check "$f" && echo "OK: $f"
+          done
+          echo "--- Shell syntax ---"
+          for f in root/usr/libexec/rpcd/podkop_bot \
+                   root/usr/lib/podkop_bot/install.sh \
+                   root/usr/lib/podkop_bot/podkop_bot \
+                   root/usr/lib/podkop_bot/podkop_bot_init \
+                   scripts/postinst scripts/postrm; do
+            sh -n "$f" && echo "OK: $f"
+          done
+          echo "--- JSON validity ---"
+          jq empty root/usr/share/luci/menu.d/luci-app-podkop-bot.json && echo "OK: menu.d"
+          jq empty root/usr/share/rpcd/acl.d/luci-app-podkop-bot.json && echo "OK: acl.d"
+          echo "--- stale duplicate installer must be absent ---"
+          if [ -f root/usr/share/luci-app-podkop-bot/install.sh ]; then
+            echo "ERROR: stale root/usr/share/luci-app-podkop-bot/install.sh present — remove it"; exit 1
+          fi
+          echo "OK: no stale duplicate"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 7. Patch nfpm.yaml version with the resolved VERSION
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Patch version in nfpm.yaml
+        run: |
+          PKG_VER="${{ env.VERSION }}"
+          echo "Updating nfpm.yaml version → ${PKG_VER}"
+          sed -i "s/^version:.*$/version: \"${PKG_VER}\"/" nfpm.yaml
+          grep "^version:" nfpm.yaml
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 8. Build IPK package (OpenWrt opkg) — arch "all" = noarch
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Build IPK package
+        run: |
+          PKG_VER="${{ env.VERSION }}"
+          export SOURCE_DATE_EPOCH=1704067200   # reproducible builds
+
+          nfpm pkg \
+            --config nfpm.yaml \
+            --packager ipk \
+            --target "luci-app-podkop-bot_${PKG_VER}_all.ipk"
+
+          echo "Built: luci-app-podkop-bot_${PKG_VER}_all.ipk"
+          ls -lh luci-app-podkop-bot_*.ipk
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 9. Build APK package (OpenWrt 24+ apk-tools)
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Build APK package
+        run: |
+          PKG_VER="${{ env.VERSION }}"
+          unset SOURCE_DATE_EPOCH   # APK signing dislikes fixed epoch
+
+          nfpm pkg \
+            --config nfpm.yaml \
+            --packager apk \
+            --target "luci-app-podkop-bot_${PKG_VER}_noarch.apk"
+
+          echo "Built: luci-app-podkop-bot_${PKG_VER}_noarch.apk"
+          ls -lh luci-app-podkop-bot_*.apk
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 10. Verify the built IPK: format, version, and the exec contract
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Verify built IPK
+        run: |
+          set -e
+          PKG_VER="${{ env.VERSION }}"
+          IPK="luci-app-podkop-bot_${PKG_VER}_all.ipk"
+
+          echo "--- container format (expect gzip tar) ---"
+          file "$IPK"
+
+          mkdir -p _vfy && tar xzf "$IPK" -C _vfy
+          echo "--- control Version ---"
+          tar xzf _vfy/control.tar.gz -O ./control | grep -E '^(Package|Version|Architecture):'
+
+          mkdir -p _vfy/data && tar xzf _vfy/data.tar.gz -C _vfy/data
+          echo "--- exec contract: these four MUST be executable ---"
+          rc=0
+          for x in \
+            usr/libexec/rpcd/podkop_bot \
+            usr/lib/podkop_bot/install.sh \
+            usr/lib/podkop_bot/podkop_bot \
+            usr/lib/podkop_bot/podkop_bot_init; do
+            if tar tvzf _vfy/data.tar.gz | grep -E " \./$x\$" | grep -q '^-rwx'; then
+              echo "OK (exec): $x"
+            else
+              echo "FAIL (not exec): $x"; rc=1
+            fi
+          done
+          echo "--- CSS + views present ---"
+          test -f _vfy/data/www/luci-static/resources/css/podkop-bot/podkop-bot.css && echo "OK: css"
+          test -f _vfy/data/www/luci-static/resources/view/podkop-bot/overview.js && echo "OK: views"
+          echo "--- stale duplicate must be absent ---"
+          if [ -f _vfy/data/usr/share/luci-app-podkop-bot/install.sh ]; then
+            echo "FAIL: stale duplicate shipped"; rc=1
+          else
+            echo "OK: no stale duplicate"
+          fi
+          exit $rc
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # 11. Create GitHub Release and upload artifacts
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          name: "Release ${{ env.VERSION }}"
+          tag_name: "${{ env.VERSION }}"
+          prerelease: false
+          draft: false
+          body: |
+            ## luci-app-podkop-bot ${{ env.VERSION }}
+
+            LuCI WebUI for the podkop_bot Telegram bot — JS/shell/config package, **arch: noarch** (works on all OpenWrt targets).
+
+            ### Installation (opkg)
+            ```sh
+            opkg update
+            opkg install luci-app-podkop-bot_${{ env.VERSION }}_all.ipk
+            ```
+
+            ### Installation (apk — OpenWrt 24+)
+            ```sh
+            apk add --allow-untrusted luci-app-podkop-bot_${{ env.VERSION }}_noarch.apk
+            ```
+
+            ### Dependencies
+            - `libc`, `luci-base`, `jq`
+          files: |
+            luci-app-podkop-bot_*.ipk
+            luci-app-podkop-bot_*.apk

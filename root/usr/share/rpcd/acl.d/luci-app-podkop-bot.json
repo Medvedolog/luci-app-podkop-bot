@@ -11,6 +11,7 @@
           "test_github",
           "resources",
           "check_update",
+          "luci_update_check",
           "transport_state",
           "transport_probe",
           "singbox_info",

@@ -19,7 +19,7 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.16.82-1"   # kept in sync with the package Version at build
+LUCI_APP_VERSION="0.16.83-1"   # kept in sync with the package Version at build
 
 # -- degraded helper (18q.1) -------------------------------------------------
 emit_unavailable() {
@@ -653,6 +653,56 @@ method_check_update() {
 
 	_out=$(printf '{"ok":true,"current":"%s","latest":"%s","update_available":%s,"via":"%s","checked_at":%s}' "$_cur" "$_latest" "$_avail" "$_via" "$_now")
 	[ "$_latest" != "unknown" ] && printf '%s' "$_out" > "$UPDATE_CACHE" 2>/dev/null
+	printf '%s\n' "$_out"
+}
+
+# luci_update_check: same mechanism as check_update, but for THIS LuCI app
+# instead of the bot. Compares the installed LUCI_APP_VERSION against
+# version.txt in the luci-app repo, with the identical direct→tier1-SOCKS
+# fallback so the check works even when GitHub is blocked directly. The app
+# doesn't self-install; a positive result just points the user at Releases.
+LUCI_UPDATE_CACHE="/tmp/podkop_bot_luci_update_check.json"
+method_luci_update_check() {
+	_read_input
+	_force=$(_field force)
+	_now=$(date +%s 2>/dev/null || echo 0)
+	# strip packaging suffix: "0.16.82-1" -> "0.16.82" so it matches version.txt
+	_cur=$(printf '%s' "$LUCI_APP_VERSION" | sed 's/-[0-9]*$//')
+	[ -z "$_cur" ] && _cur="unknown"
+
+	if [ "$_force" != "true" ] && [ -f "$LUCI_UPDATE_CACHE" ]; then
+		_ts=$(sed -n 's/.*"checked_at":\([0-9]*\).*/\1/p' "$LUCI_UPDATE_CACHE")
+		if [ -n "$_ts" ] && [ "$((_now - _ts))" -lt "$UPDATE_CACHE_TTL" ] 2>/dev/null; then
+			cat "$LUCI_UPDATE_CACHE"; printf '\n'; return
+		fi
+	fi
+
+	_latest=""
+	_via="none"
+	_url="https://raw.githubusercontent.com/Medvedolog/luci-app-podkop-bot/main/version.txt"
+	command -v curl >/dev/null 2>&1 && _latest=$(curl -fsS --connect-timeout 6 --max-time 12 "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
+	[ -z "$_latest" ] && command -v wget >/dev/null 2>&1 && _latest=$(wget -q -T 12 -O - "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
+	[ -n "$_latest" ] && _via="direct"
+	if [ -z "$_latest" ]; then
+		_sb_ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+		_sb_port=""
+		_v=$(_cached_status | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+		_pk=$(podkop_uci_pkg "${_v:-podkop}")
+		_psec=$(_primary_section "$_pk" 2>/dev/null)
+		[ -n "$_psec" ] && _sb_port=$(uci -q get "$_pk.$_psec.mixed_proxy_port" 2>/dev/null)
+		if [ -n "$_sb_port" ] && [ -n "$_sb_ip" ]; then
+			_latest=$(curl -fsS --proxy "socks5h://$_sb_ip:$_sb_port" --connect-timeout 6 --max-time 12 "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
+			[ -n "$_latest" ] && _via="socks"
+		fi
+	fi
+	[ -z "$_latest" ] && _latest="unknown"
+
+	_avail="false"
+	[ "$_latest" != "unknown" ] && [ "$_cur" != "unknown" ] && _ver_gt "$_latest" "$_cur" && _avail="true"
+
+	_releases="https://github.com/Medvedolog/luci-app-podkop-bot/releases"
+	_out=$(printf '{"ok":true,"current":"%s","latest":"%s","update_available":%s,"via":"%s","releases_url":"%s","checked_at":%s}' "$_cur" "$_latest" "$_avail" "$_via" "$_releases" "$_now")
+	[ "$_latest" != "unknown" ] && printf '%s' "$_out" > "$LUCI_UPDATE_CACHE" 2>/dev/null
 	printf '%s\n' "$_out"
 }
 
@@ -1667,7 +1717,7 @@ method_active_probe() {
 
 case "$1" in
 	list)
-		echo '{ "list": {}, "status": {}, "service": { "action": "start_bot" }, "installer": { "action": "status", "config_path": "x", "config_inline": "x" }, "logs": { "offset": 0 }, "bot_logs": { "lines": 200 }, "resources": {}, "transport_state": {}, "transport_probe": { "target": "x" }, "set_transport_policy": { "policy": "x" }, "fallback_crud": { "op": "x", "value": "x", "index": 0 }, "list_interfaces": {}, "set_uci_field": { "field": "x", "value": "x" }, "set_tier1_port": { "value": "x" }, "active_probe": { "cached": "x", "section": "x" }, "runtime_sections": {}, "podkop_update_check": {}, "app_info": {}, "singbox_info": {}, "check_update": { "force": "x" }, "update_paste": { "body": "x" }, "test_telegram": { "token": "x" }, "ensure_mixed_proxy": { "section": "x" }, "test_github": {} }'
+		echo '{ "list": {}, "status": {}, "service": { "action": "start_bot" }, "installer": { "action": "status", "config_path": "x", "config_inline": "x" }, "logs": { "offset": 0 }, "bot_logs": { "lines": 200 }, "resources": {}, "transport_state": {}, "transport_probe": { "target": "x" }, "set_transport_policy": { "policy": "x" }, "fallback_crud": { "op": "x", "value": "x", "index": 0 }, "list_interfaces": {}, "set_uci_field": { "field": "x", "value": "x" }, "set_tier1_port": { "value": "x" }, "active_probe": { "cached": "x", "section": "x" }, "runtime_sections": {}, "podkop_update_check": {}, "app_info": {}, "singbox_info": {}, "check_update": { "force": "x" }, "luci_update_check": { "force": "x" }, "update_paste": { "body": "x" }, "test_telegram": { "token": "x" }, "ensure_mixed_proxy": { "section": "x" }, "test_github": {} }'
 		;;
 	call)
 		case "$2" in
@@ -1690,6 +1740,7 @@ case "$1" in
 			app_info)             method_app_info ;;
 			singbox_info)         method_singbox_info ;;
 			check_update)         method_check_update ;;
+			luci_update_check)    method_luci_update_check ;;
 			update_paste)         method_update_paste ;;
 			test_telegram)        method_test_telegram ;;
 			ensure_mixed_proxy)   method_ensure_mixed_proxy ;;

@@ -17,6 +17,7 @@
  */
 
 var callCheckUpdate = rpc.declare({ object:'podkop_bot', method:'check_update', params:['force'] });
+var callLuciUpdate  = rpc.declare({ object:'podkop_bot', method:'luci_update_check', params:['force'] });
 var callUpdatePaste = rpc.declare({ object:'podkop_bot', method:'update_paste', params:['body'] });
 var callInstaller   = rpc.declare({ object:'podkop_bot', method:'installer', params:['action','config_path','config_inline'] });
 var callStatus      = rpc.declare({ object:'podkop_bot', method:'status' });
@@ -155,38 +156,60 @@ return view.extend({
 			})
 		}, _('Удалить бота'));
 
+		/* Collapsible offline-install block (folded by default). */
+		var offlineBody = E('div', { 'style':'display:none;margin-top:.6em;' }, [
+			E('p', { 'style':'color:#888;font-size:90%;' }, [
+				_('Когда GitHub и Telegram недоступны: вставьте содержимое свежего '),
+				E('code', {}, 'podkop_bot.sh'),
+				_(' и установите. Скрипт проверяется (shebang, BOT_VERSION, синтаксис), текущая версия сохраняется в .bak, бот перезапускается.')
+			]),
+			ta,
+			E('div', { 'style':'margin-top:.6em;' }, [ installBtn ]),
+			result
+		]);
+		var offlineToggle = E('button', {
+			'class':'cbi-button',
+			'style':'margin-top:.8em;',
+			'click': function() {
+				var open = offlineBody.style.display !== 'none';
+				offlineBody.style.display = open ? 'none' : 'block';
+				this.textContent = open ? _('Автономная установка из текста ▸')
+				                        : _('Автономная установка из текста ▾');
+			}
+		}, _('Автономная установка из текста ▸'));
+
 		return E('div', {}, [
-			E('h2', {}, _('Обновление Podkop Bot')),
-			E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;' }, [
-				E('h3', { 'style':'margin-top:0;' }, _('Текущая установка')),
+			E('h2', {}, _('Обновление модулей')),
+			E('p', { 'style':'color:#888;font-size:90%;max-width:760px;margin-top:-.4em;' },
+				_('Три независимых модуля: сам веб-интерфейс (LuCI), Telegram-бот и Podkop. Каждый обновляется своим способом.')),
+
+			/* ─── Card 1: this LuCI app ─────────────────────────────────── */
+			this.luciCard(),
+
+			/* ─── Card 2: the bot — version + all update methods together ── */
+			E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+				E('h3', { 'style':'margin-top:0;' }, _('Telegram-бот (podkop_bot)')),
 				this.currentBlock(),
-			]),
-			E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
-				E('h3', { 'style':'margin-top:0;' }, _('Версия')),
-				verLine,
-				recheckBtn
-			]),
-			this.podkopUpdateCard(),
-			E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
-				E('h3', { 'style':'margin-top:0;' }, _('Обновление с GitHub')),
-				E('p', { 'style':'color:#888;font-size:90%;' }, _('Запускает install.sh --action update: скачивает свежий бот с GitHub (с SOCKS-fallover) и устанавливает. Лог установки — ниже.')),
-				ghBtn,
-				ghStatus,
-				ghLog
-			]),
-			E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
-				E('h3', { 'style':'margin-top:0;' }, _('Автономная установка из текста')),
-				E('p', { 'style':'color:#888;font-size:90%;' }, [
-					_('Когда GitHub и Telegram недоступны: вставьте содержимое свежего '),
-					E('code', {}, 'podkop_bot.sh'),
-					_(' и установите. Скрипт проверяется (shebang, BOT_VERSION, синтаксис), текущая версия сохраняется в .bak, бот перезапускается.')
+				E('div', { 'style':'margin:.8em 0 .3em;border-top:1px solid rgba(127,127,127,.15);padding-top:.8em;' }, [ verLine, recheckBtn ]),
+
+				/* update method: GitHub */
+				E('div', { 'style':'margin-top:1em;' }, [
+					E('strong', {}, _('Обновление с GitHub')),
+					E('p', { 'style':'color:#888;font-size:90%;margin:.3em 0;' }, _('Запускает install.sh --action update: скачивает свежий бот с GitHub (с SOCKS-fallback) и устанавливает. Лог установки — ниже.')),
+					ghBtn, ghStatus, ghLog
 				]),
-				ta,
-				E('div', { 'style':'margin-top:.6em;' }, [ installBtn ]),
-				result
+
+				/* update method: offline paste (collapsible) */
+				offlineToggle,
+				offlineBody
 			]),
+
+			/* ─── Card 3: Podkop / fork ─────────────────────────────────── */
+			this.podkopUpdateCard(),
+
+			/* ─── Danger zone: uninstall the bot ────────────────────────── */
 			E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(204,43,43,.4);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
-				E('h3', { 'style':'margin-top:0;color:#cc2b2b;' }, _('Удаление')),
+				E('h3', { 'style':'margin-top:0;color:#cc2b2b;' }, _('Удаление бота')),
 				E('p', { 'style':'color:#888;font-size:90%;' }, _('Полностью удаляет бот (install.sh --action uninstall): останавливает службу, убирает /usr/bin/podkop_bot, автозапуск и runtime-файлы. Конфиг с токеном тоже удаляется. Введите REMOVE для подтверждения.')),
 				E('div', { 'style':'display:flex;align-items:center;flex-wrap:wrap;' }, [ uninstInput, uninstBtn ]),
 				uninstStatus,
@@ -194,6 +217,51 @@ return view.extend({
 			]),
 			pbFooter()
 		]);
+	},
+
+	/* This LuCI app's own version card. Shows installed version and, when a
+	 * newer release exists in the repo (checked over the network with the same
+	 * direct→SOCKS fallback as the bot), a button to the Releases page. The app
+	 * does not self-update; it points the user at the release to install. */
+	luciCard: function() {
+		var self = this;
+		var line = E('div', { 'style':'margin:.3em 0;' }, dot('grey', _('проверяю…')));
+		var actions = E('div', { 'style':'margin-top:.5em;' });
+		var recheck = E('button', {
+			'class':'cbi-button', 'style':'margin-top:.5em;',
+			'click': function() {
+				dom.content(line, dot('grey', _('Проверка…')));
+				callLuciUpdate('true').then(function(d){ self.fillLuci(line, actions, d); });
+			}
+		}, _('Проверить версию'));
+		callLuciUpdate('').then(function(d){ self.fillLuci(line, actions, d); })
+			.catch(function(){ dom.content(line, dot('grey', _('Не удалось проверить'))); });
+		return E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+			E('h3', { 'style':'margin-top:0;' }, _('Веб-интерфейс (luci-app-podkop-bot)')),
+			line, actions, recheck
+		]);
+	},
+
+	fillLuci: function(line, actions, d) {
+		dom.content(actions, '');
+		if (!d || d.ok === false) { dom.content(line, dot('grey', _('Не удалось проверить версию'))); return; }
+		if (d.latest === 'unknown') {
+			dom.content(line, dot('yellow', _('Текущая: v') + (d.current||'?') + ' · ' +
+				_('последнюю проверить не удалось (ни напрямую, ни через SOCKS).')));
+			return;
+		}
+		var via = (d.via === 'socks') ? (' (' + _('через SOCKS') + ')')
+			: (d.via === 'direct' ? (' (' + _('напрямую') + ')') : '');
+		if (d.update_available) {
+			dom.content(line, dot('yellow', _('Доступно обновление: v') + d.current + ' → v' + d.latest + via));
+			dom.content(actions, E('a', {
+				'class':'cbi-button cbi-button-apply',
+				'href': d.releases_url || 'https://github.com/Medvedolog/luci-app-podkop-bot/releases',
+				'target':'_blank', 'rel':'noopener'
+			}, _('Скачать релиз')));
+		} else {
+			dom.content(line, dot('green', _('Установлена последняя версия: v') + (d.current||'?') + via));
+		}
 	},
 
 	/* Current installation summary, filled async from status. */

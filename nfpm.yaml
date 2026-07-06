@@ -1,0 +1,69 @@
+# ==============================================================================
+# nFPM Build Configuration — luci-app-podkop-bot
+# Defines package metadata, architecture, and dependencies for IPK/APK builds.
+# Pure JS/shell/config LuCI package (no compilation), arch: all / noarch.
+#
+# Format mirrors the working luci-app-telemt config: top-level `scripts:`,
+# per-format `arch` under ipk/apk, no redundant top-level arch.
+#
+# Difference from telemt: this app ships a JS-based frontend + rpcd backend +
+# the podkop_bot installer/runtime, and four files MUST be executable. We pin
+# those modes via file_info so a lost exec bit in git (web edits, Windows
+# checkouts) cannot ship a broken rpcd. postinst re-chmods as a third safety net.
+#
+# NOTE: no /etc/config/podkop_bot here — unlike telemt's UCI defaults, the bot's
+# config is created by the bot's own install.sh, not by this LuCI package.
+# NOTE: usr/share/luci-app-podkop-bot/install.sh is a stale duplicate and is
+# deliberately NOT listed; the live installer is usr/lib/podkop_bot/install.sh.
+#
+# `version` is a placeholder — the release workflow overrides it via sed.
+# ==============================================================================
+name: "luci-app-podkop-bot"
+platform: "linux"
+version: "0.16.82"
+section: "luci"
+maintainer: "Medvedolog <Medvedolog@github.com>"
+description: |
+  LuCI interface for the podkop_bot Telegram bot on OpenWrt. Eight tabs:
+  Overview, Settings, Transport (fallback chain), Setup Wizard, Runtime
+  (per-section tunnel diagnostics), Update, Logs, Help. Manages the bot and
+  reads Podkop/forks (podkop, podkop-plus, netshift) only for transport,
+  Mixed Proxy and diagnostics.
+depends:
+  - libc
+  - luci-base
+  - jq
+contents:
+  # Executables (0755) — the four-file exec contract, modes pinned explicitly.
+  - src: ./root/usr/libexec/rpcd/podkop_bot
+    dst: /usr/libexec/rpcd/podkop_bot
+    file_info:
+      mode: 0755
+  - src: ./root/usr/lib/podkop_bot/install.sh
+    dst: /usr/lib/podkop_bot/install.sh
+    file_info:
+      mode: 0755
+  - src: ./root/usr/lib/podkop_bot/podkop_bot
+    dst: /usr/lib/podkop_bot/podkop_bot
+    file_info:
+      mode: 0755
+  - src: ./root/usr/lib/podkop_bot/podkop_bot_init
+    dst: /usr/lib/podkop_bot/podkop_bot_init
+    file_info:
+      mode: 0755
+  # Everything else (0644) copied by directory.
+  - src: ./root/www/luci-static/resources/view/podkop-bot/
+    dst: /www/luci-static/resources/view/podkop-bot/
+  - src: ./root/www/luci-static/resources/css/podkop-bot/
+    dst: /www/luci-static/resources/css/podkop-bot/
+  - src: ./root/usr/share/luci/menu.d/luci-app-podkop-bot.json
+    dst: /usr/share/luci/menu.d/luci-app-podkop-bot.json
+  - src: ./root/usr/share/rpcd/acl.d/luci-app-podkop-bot.json
+    dst: /usr/share/rpcd/acl.d/luci-app-podkop-bot.json
+scripts:
+  postinstall: ./scripts/postinst
+  postremove: ./scripts/postrm
+apk:
+  arch: "noarch"
+ipk:
+  arch: "all"

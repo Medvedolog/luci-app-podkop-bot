@@ -1,0 +1,10 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+chmod +x /usr/libexec/rpcd/podkop_bot 2>/dev/null
+chmod +x /usr/lib/podkop_bot/install.sh 2>/dev/null
+chmod +x /usr/lib/podkop_bot/podkop_bot 2>/dev/null
+chmod +x /usr/lib/podkop_bot/podkop_bot_init 2>/dev/null
+/etc/init.d/rpcd restart 2>/dev/null
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+exit 0

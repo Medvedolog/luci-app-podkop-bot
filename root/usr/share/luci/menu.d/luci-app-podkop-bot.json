@@ -1,0 +1,39 @@
+{
+	"admin/services/podkop-bot": {
+		"title": "Podkop Bot", "order": 60,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": [ "luci-app-podkop-bot" ] }
+	},
+	"admin/services/podkop-bot/overview": {
+		"title": "Обзор", "order": 10,
+		"action": { "type": "view", "path": "podkop-bot/overview" }
+	},
+	"admin/services/podkop-bot/settings": {
+		"title": "Настройки", "order": 15,
+		"action": { "type": "view", "path": "podkop-bot/settings" }
+	},
+	"admin/services/podkop-bot/transport": {
+		"title": "Транспорт", "order": 20,
+		"action": { "type": "view", "path": "podkop-bot/transport" }
+	},
+	"admin/services/podkop-bot/wizard": {
+		"title": "Мастер настройки", "order": 25,
+		"action": { "type": "view", "path": "podkop-bot/wizard" }
+	},
+	"admin/services/podkop-bot/runtime": {
+		"title": "Runtime", "order": 30,
+		"action": { "type": "view", "path": "podkop-bot/runtime" }
+	},
+	"admin/services/podkop-bot/update": {
+		"title": "Обновление", "order": 35,
+		"action": { "type": "view", "path": "podkop-bot/update" }
+	},
+	"admin/services/podkop-bot/logs": {
+		"title": "Логи", "order": 40,
+		"action": { "type": "view", "path": "podkop-bot/logs" }
+	},
+	"admin/services/podkop-bot/help": {
+		"title": "Помощь", "order": 45,
+		"action": { "type": "view", "path": "podkop-bot/help" }
+	}
+}

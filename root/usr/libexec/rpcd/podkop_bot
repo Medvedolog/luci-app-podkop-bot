@@ -1,0 +1,1703 @@
+#!/bin/sh
+# /usr/libexec/rpcd/podkop_bot  — ubus object: podkop_bot
+#
+# Live backend (v0.16.2). Methods:
+#   list    — method advertisement
+#   status  — rich status: installer 12-field JSON + service_running + mixed_proxy
+#   service — start/stop/restart the bot, with POST-action re-check (no optimism)
+#
+# Contracts (TZ 18-quater):
+#   - status NEVER throws; returns data or {available:false,reason,detail,action}.
+#   - mixed_proxy is a SUB-layer: it degrades independently. If the UCI schema
+#     can't be resolved, mixed_proxy.available=false with a reason — the rest of
+#     the card still renders (18q.2 independent degradation).
+#   - service re-checks /etc/init.d status AFTER the action and reports the real
+#     post-state, because podkop_bot has a history of init.d not reaping forked
+#     children on stop (the 409-Conflict bug) -> UI must not claim "stopped"
+#     while the process is alive.
+
+BOT_PATH="/usr/bin/podkop_bot"
+INIT_PATH="/etc/init.d/podkop_bot"
+INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
+LUCI_APP_VERSION="0.16.82-1"   # kept in sync with the package Version at build
+
+# -- degraded helper (18q.1) -------------------------------------------------
+emit_unavailable() {
+	# $1 reason $2 detail $3 action_label $4 action_method $5 action_arg
+	if [ -n "$3" ]; then
+		printf '{"available":false,"reason":"%s","detail":"%s","action":{"label":"%s","method":"%s","arg":"%s"}}\n' \
+			"$1" "$2" "$3" "$4" "$5"
+	else
+		printf '{"available":false,"reason":"%s","detail":"%s","action":null}\n' "$1" "$2"
+	fi
+}
+
+# -- UCI package name for a given variant (mirrors install.sh _podkop_uci_pkg) -
+podkop_uci_pkg() {
+	case "$1" in
+		plus)     printf 'podkop-plus' ;;
+		netshift) printf 'netshift' ;;
+		*)        printf 'podkop' ;;
+	esac
+}
+
+# -- cached install.sh status. Each `install.sh --action status` re-parses the
+# whole installer and runs ~12 `opkg list-installed` scans, which is slow on
+# opkg systems (noticeable Wizard/Overview lag). Multiple rpc methods call it on
+# a single page open, so cache the JSON for a few seconds and reuse it. Fresh
+# enough for UI, avoids the N× multiplier.
+_STATUS_CACHE="/tmp/podkop_bot/luci_status_cache.json"
+_STATUS_TTL=5
+_cached_status() {
+	mkdir -p /tmp/podkop_bot 2>/dev/null
+	if [ -f "$_STATUS_CACHE" ]; then
+		_age=$(( $(date +%s 2>/dev/null || echo 0) - $(date -r "$_STATUS_CACHE" +%s 2>/dev/null || echo 0) ))
+		if [ "$_age" -ge 0 ] 2>/dev/null && [ "$_age" -lt "$_STATUS_TTL" ]; then
+			cat "$_STATUS_CACHE"; return
+		fi
+	fi
+	_s=$(sh "$INSTALLER_PATH" --unattended --action status 2>/dev/null)
+	[ -n "$_s" ] && printf '%s' "$_s" > "$_STATUS_CACHE" 2>/dev/null
+	printf '%s' "$_s"
+}
+
+# -- find active routing section (mirrors install.sh _get_socks_endpoints) ----
+podkop_active_section() {
+	_pkg="$1"
+	if [ "$_pkg" = "podkop-plus" ]; then _field="action"; else _field="connection_type"; fi
+	_sec=$(uci -q show "$_pkg" 2>/dev/null \
+		| grep -E "^${_pkg}\.[^.=]+=section$" \
+		| while IFS='=' read -r _k _v; do
+			_s=$(printf '%s' "$_k" | cut -d. -f2)
+			_ct=$(uci -q get "${_pkg}.${_s}.${_field}" 2>/dev/null)
+			[ "$_ct" = "proxy" ] && echo "$_s" && break
+		done | head -1)
+	[ -z "$_sec" ] && _sec="main"
+	printf '%s' "$_sec"
+}
+
+# -- mixed_proxy sub-object as a JSON fragment (no outer braces) --------------
+emit_mixed_proxy() {
+	_variant="$1"
+	_pkver="$2"
+	if [ "$_variant" = "unknown" ] || [ -z "$_variant" ]; then
+		printf '"mixed_proxy":{"available":false,"reason":"variant_unknown","detail":"Вариант podkop не определён"}'
+		return
+	fi
+	# Gate: podkop older than the supported floor has an incompatible schema.
+	# Report unavailable with a specific reason so the UI greys it out (§18t.1)
+	# and the deprecation banner explains why, instead of a raw RPCError.
+	if _podkop_deprecated "$_pkver"; then
+		printf '"mixed_proxy":{"available":false,"reason":"podkop_too_old","detail":"Podkop %s ниже минимальной %s — обновите Podkop"}' "$_pkver" "$PODKOP_MIN_VERSION"
+		return
+	fi
+	_pkg=$(podkop_uci_pkg "$_variant")
+	if ! uci -q show "$_pkg" >/dev/null 2>&1; then
+		printf '"mixed_proxy":{"available":false,"reason":"uci_missing","detail":"UCI-пакет %s не найден"}' "$_pkg"
+		return
+	fi
+	_sec=$(podkop_active_section "$_pkg")
+	_en=$(uci -q get "${_pkg}.${_sec}.mixed_proxy_enabled" 2>/dev/null)
+	_port=$(uci -q get "${_pkg}.${_sec}.mixed_proxy_port" 2>/dev/null)
+
+	if [ -z "$_en" ] && [ -z "$_port" ]; then
+		printf '"mixed_proxy":{"available":false,"reason":"field_absent","detail":"Поле mixed_proxy не найдено в %s.%s"}' "$_pkg" "$_sec"
+		return
+	fi
+
+	if [ "$_en" = "1" ]; then _enabled="true"; else _enabled="false"; fi
+	if [ -n "$_port" ]; then
+		printf '"mixed_proxy":{"available":true,"enabled":%s,"section":"%s","port":%s}' "$_enabled" "$_sec" "$_port"
+	else
+		printf '"mixed_proxy":{"available":true,"enabled":%s,"section":"%s","port":null}' "$_enabled" "$_sec"
+	fi
+}
+
+# -- service running check ---------------------------------------------------
+# Authoritative liveness via /proc scan, NOT `init.d status`: routers running
+# bot <=0.15.1 shipped incomplete init.d scripts whose `status` lies (returns
+# 0 even when the process is dead), which made the UI show a green lamp on a
+# stopped bot. The bot runs as `/bin/sh /usr/bin/podkop_bot` and forks a child,
+# so there may be several matching PIDs — one live match is enough. We exclude
+# the init wrapper and rc.common so we don't count the service manager itself.
+bot_is_running() {
+	for _c in /proc/[0-9]*/cmdline; do
+		_cl=$(tr '\0' ' ' < "$_c" 2>/dev/null) || continue
+		case "$_cl" in
+			*"/etc/init.d/podkop_bot"*) continue ;;
+			*rc.common*) continue ;;
+			*"/usr/bin/podkop_bot"*) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# -- status method -----------------------------------------------------------
+method_status() {
+	if [ ! -f "$BOT_PATH" ]; then
+		emit_unavailable "bot_not_installed" "Бот не установлен" "Установить" "installer" "install"
+		return
+	fi
+	if [ ! -f "$INSTALLER_PATH" ]; then
+		emit_unavailable "installer_missing" "Установщик не найден" "Скачать" "installer" "fetch"
+		return
+	fi
+
+	_out=$(_cached_status)
+	_rc=$?
+	case "$_out" in
+		\{*\}) ;;
+		*) emit_unavailable "installer_error" "Установщик не вернул статус (код $_rc)" "Повторить" "status" ""; return ;;
+	esac
+
+	_variant=$(printf '%s' "$_out" | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+	[ -z "$_variant" ] && _variant="unknown"
+	_pkver=$(printf '%s' "$_out" | sed -n 's/.*"podkop_version":"\([^"]*\)".*/\1/p')
+
+	if bot_is_running; then _running="true"; else _running="false"; fi
+
+	# autostart state (init.d enabled => rc.d S-symlink present)
+	_autostart="false"
+	[ -x "$INIT_PATH" ] && "$INIT_PATH" enabled 2>/dev/null && _autostart="true"
+
+	_mixed=$(emit_mixed_proxy "$_variant" "$_pkver")
+
+	# Deprecation sub-object: honest boolean so the frontend can render a banner
+	# without re-deriving the threshold. min_supported is echoed for the message.
+	if _podkop_deprecated "$_pkver"; then
+		_deprecated=$(printf '"podkop_deprecated":{"deprecated":true,"current":"%s","min_supported":"%s"}' "$_pkver" "$PODKOP_MIN_VERSION")
+	else
+		_deprecated='"podkop_deprecated":{"deprecated":false}'
+	fi
+
+	# _body = installer JSON with BOTH braces stripped, so we control the wrapper.
+	_body=$(printf '%s' "$_out" | sed -e 's/^{//' -e 's/}$//')
+	printf '{"available":true,"service_running":%s,"autostart":%s,%s,%s,%s}\n' "$_running" "$_autostart" "$_mixed" "$_deprecated" "$_body"
+}
+
+# -- service method ----------------------------------------------------------
+method_service() {
+	read -r _input 2>/dev/null
+	_act=$(printf '%s' "$_input" | sed -n 's/.*"action":"\([^"]*\)".*/\1/p')
+	rm -f "$_STATUS_CACHE" 2>/dev/null
+
+	if [ ! -x "$INIT_PATH" ]; then
+		printf '{"ok":false,"reason":"init_missing","detail":"%s не найден"}\n' "$INIT_PATH"
+		return
+	fi
+
+	case "$_act" in
+		start_bot)   "$INIT_PATH" start   >/dev/null 2>&1 ;;
+		stop_bot)    "$INIT_PATH" stop    >/dev/null 2>&1 ;;
+		restart_bot) "$INIT_PATH" restart >/dev/null 2>&1 ;;
+		enable_bot)  "$INIT_PATH" enable  >/dev/null 2>&1 ;;
+		disable_bot) "$INIT_PATH" disable >/dev/null 2>&1 ;;
+		*) printf '{"ok":false,"reason":"bad_action","detail":"%s"}\n' "$_act"; return ;;
+	esac
+
+	sleep 1
+	if bot_is_running; then _running="true"; else _running="false"; fi
+	# autostart state: init.d enabled => an rc.d S-symlink exists.
+	if "$INIT_PATH" enabled 2>/dev/null; then _autostart="true"; else _autostart="false"; fi
+	printf '{"ok":true,"action":"%s","service_running":%s,"autostart":%s}\n' "$_act" "$_running" "$_autostart"
+}
+
+INSTALL_LOG="/tmp/podkop_bot_install.log"
+INSTALL_DONE="/tmp/podkop_bot_install.done"   # holds exit code when finished
+INSTALL_LOCK="/tmp/podkop_bot_install.lock"   # mkdir-based atomic lock dir
+WIZ_CONFIG="/tmp/podkop_bot_install.json"
+
+# -- read raw stdin JSON once into _input -----------------------------------
+_read_input() { read -r _input 2>/dev/null; }
+# extract a string field from _input (flat JSON, no nesting)
+_field() { printf '%s' "$_input" | sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p'; }
+# extract a numeric field
+_field_num() { printf '%s' "$_input" | sed -n 's/.*"'"$1"'":\([0-9][0-9]*\).*/\1/p'; }
+
+# -- installer: launch install/update/uninstall in background, poll via logs --
+method_installer() {
+	_read_input
+	_act=$(_field action)
+	# any install/update/uninstall changes what status reports — drop the cache
+	case "$_act" in install|update|uninstall) rm -f "$_STATUS_CACHE" 2>/dev/null ;; esac
+	case "$_act" in
+		install|update|uninstall|status|check) ;;
+		*) printf '{"ok":false,"reason":"bad_action","detail":"%s"}\n' "$_act"; return ;;
+	esac
+
+	if [ ! -f "$INSTALLER_PATH" ]; then
+		printf '{"ok":false,"reason":"installer_missing","detail":"%s"}\n' "$INSTALLER_PATH"
+		return
+	fi
+
+	# status/check are quick + synchronous — just proxy their JSON/output.
+	if [ "$_act" = "status" ] || [ "$_act" = "check" ]; then
+		_out=$(sh "$INSTALLER_PATH" --unattended --action "$_act" 2>/dev/null)
+		printf '{"ok":true,"action":"%s","output":%s}\n' "$_act" "$(_json_str "$_out")"
+		return
+	fi
+
+	# install/update/uninstall are long — run detached, stream via `logs`.
+	# Atomic lock via mkdir (touch+test had a TOCTOU race; two quick calls could
+	# both pass). Stale lock from a killed run is reclaimed if its PID is gone.
+	if ! mkdir "$INSTALL_LOCK" 2>/dev/null; then
+		_lk_pid=$(cat "$INSTALL_LOCK/pid" 2>/dev/null)
+		if [ -n "$_lk_pid" ] && [ ! -d "/proc/$_lk_pid" ]; then
+			rm -rf "$INSTALL_LOCK" 2>/dev/null
+			mkdir "$INSTALL_LOCK" 2>/dev/null || { printf '{"ok":false,"reason":"already_running","detail":"installer lock busy"}\n'; return; }
+		else
+			printf '{"ok":false,"reason":"already_running","detail":"installer already running"}\n'
+			return
+		fi
+	fi
+
+	# config for install: prefer inline JSON (written here, chmod 600), else a
+	# provided path, else the default wizard path. Inline is how the LuCI Setup
+	# Wizard passes collected fields (it cannot write files itself). TZ 16.8:
+	# token-bearing temp config must be 600 and removed after the run.
+	_cfg_for_run=""
+	if [ "$_act" = "install" ]; then
+		# Extract config_inline (a JSON string whose value is itself a JSON
+		# object). sed cannot reliably parse nested JSON. Prefer jsonfilter
+		# (always present in OpenWrt base, libubox) so this works even before the
+		# bot/jq are installed during the Wizard; fall back to jq if available.
+		_inline=""
+		if command -v jsonfilter >/dev/null 2>&1; then
+			_inline=$(printf '%s' "$_input" | jsonfilter -e '@.config_inline' 2>/dev/null)
+		fi
+		if [ -z "$_inline" ] && command -v jq >/dev/null 2>&1; then
+			_inline=$(printf '%s' "$_input" | jq -r '.config_inline // empty' 2>/dev/null)
+		fi
+		if [ -n "$_inline" ]; then
+			_cfg="$WIZ_CONFIG"
+			( umask 077; printf '%s' "$_inline" > "$_cfg" )
+			chmod 600 "$_cfg" 2>/dev/null
+		else
+			_cfg=$(_field config_path); [ -z "$_cfg" ] && _cfg="$WIZ_CONFIG"
+		fi
+		[ -f "$_cfg" ] && _cfg_for_run="$_cfg"
+	fi
+
+	: > "$INSTALL_LOG"
+	rm -f "$INSTALL_DONE"
+	echo "$$" > "$INSTALL_LOCK/pid" 2>/dev/null
+
+	# Detached run: setsid so it survives the rpcd call returning. argv-safe —
+	# the config path is passed as a real argument, not interpolated into a shell
+	# command string. Exit code goes to INSTALL_DONE and the lock is dropped when
+	# finished, so `logs` can report completion/status to the frontend.
+	(
+		if [ -n "$_cfg_for_run" ]; then
+			setsid sh "$INSTALLER_PATH" --unattended --action "$_act" --config "$_cfg_for_run" >> "$INSTALL_LOG" 2>&1
+		else
+			setsid sh "$INSTALLER_PATH" --unattended --action "$_act" >> "$INSTALL_LOG" 2>&1
+		fi
+		echo $? > "$INSTALL_DONE"
+		# Remove the token-bearing temp config once the installer has consumed it
+		# (it has been copied into UCI by now). Leaving it in /tmp would expose the
+		# bot token. Only remove the wizard-managed file, never a user config_path.
+		[ "$_cfg_for_run" = "$WIZ_CONFIG" ] && rm -f "$WIZ_CONFIG" 2>/dev/null
+		rm -rf "$INSTALL_LOCK"
+	) >/dev/null 2>&1 &
+	echo "$!" > "$INSTALL_LOCK/pid" 2>/dev/null
+
+	printf '{"ok":true,"action":"%s","started":true}\n' "$_act"
+}
+
+# -- logs: return new log bytes from a given offset + completion state --------
+method_logs() {
+	_read_input
+	_off=$(_field_num offset); [ -z "$_off" ] && _off=0
+
+	if [ ! -f "$INSTALL_LOG" ]; then
+		printf '{"ok":true,"offset":0,"chunk":"","running":false,"done":false}\n'
+		return
+	fi
+
+	_size=$(wc -c < "$INSTALL_LOG" 2>/dev/null | tr -d ' ')
+	[ -z "$_size" ] && _size=0
+
+	# new bytes since offset (dd skips _off bytes). Guard offset>size (log reset).
+	_chunk=""
+	if [ "$_off" -lt "$_size" ] 2>/dev/null; then
+		_chunk=$(dd if="$INSTALL_LOG" bs=1 skip="$_off" 2>/dev/null)
+	else
+		_off="$_size"
+	fi
+
+	_running="false"; [ -d "$INSTALL_LOCK" ] && _running="true"
+	_done="false"; _exit="null"
+	if [ -f "$INSTALL_DONE" ]; then
+		_done="true"
+		_exit=$(cat "$INSTALL_DONE" 2>/dev/null | tr -d ' \n')
+		[ -z "$_exit" ] && _exit="null"
+	fi
+
+	printf '{"ok":true,"offset":%s,"chunk":%s,"running":%s,"done":%s,"exit_code":%s}\n' \
+		"$_size" "$(_json_str "$_chunk")" "$_running" "$_done" "$_exit"
+}
+
+# -- test_telegram: validate a token via install.sh check-token (socks-aware) --
+method_test_telegram() {
+	_read_input
+	_tok=$(_field token)
+	if [ -z "$_tok" ]; then
+		printf '{"valid":false,"reason":"empty_token","detail":"no token provided"}\n'
+		return
+	fi
+	if [ ! -f "$INSTALLER_PATH" ]; then
+		printf '{"valid":false,"reason":"installer_missing","detail":"%s"}\n' "$INSTALLER_PATH"
+		return
+	fi
+	# Write a minimal temp config with the token, chmod 600 (token is secret),
+	# call check-token, then remove it (TZ 16.8).
+	_tmp="/tmp/podkop_bot_checktoken.$$.json"
+	( umask 077; printf '{"bot_token":"%s"}\n' "$_tok" > "$_tmp" )
+	chmod 600 "$_tmp" 2>/dev/null
+	_out=$(sh "$INSTALLER_PATH" --unattended --action check-token --config "$_tmp" 2>/dev/null)
+	rm -f "$_tmp"
+	case "$_out" in
+		\{*\}) printf '%s\n' "$_out" ;;
+		*) printf '{"valid":false,"reason":"installer_error","detail":"check-token produced no result"}\n' ;;
+	esac
+}
+
+# -- ensure_mixed_proxy: enable mixed_proxy in the active podkop section ------
+method_ensure_mixed_proxy() {
+	_read_input
+	_req_sec=$(_field section)
+
+	# determine variant via installer status (authoritative)
+	_variant="unknown"
+	if [ -f "$INSTALLER_PATH" ]; then
+		_st=$(_cached_status)
+		_variant=$(printf '%s' "$_st" | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+	fi
+	[ -z "$_variant" ] && _variant="unknown"
+	if [ "$_variant" = "unknown" ]; then
+		printf '{"ok":false,"reason":"variant_unknown","detail":"podkop variant not detected"}\n'; return
+	fi
+	# Refuse to write mixed_proxy config on a deprecated podkop: the schema
+	# predates these fields, so a write could produce a config the old podkop
+	# mishandles. Mirror the read-side gate (emit_mixed_proxy) so the wizard/RPC
+	# can't bypass it. Version comes from the same cached installer status.
+	_pkver=$(printf '%s' "$_st" | sed -n 's/.*"podkop_version":"\([^"]*\)".*/\1/p')
+	if _podkop_deprecated "$_pkver"; then
+		printf '{"ok":false,"reason":"podkop_too_old","detail":"Podkop %s ниже минимальной %s — обновите Podkop","current":"%s","min_supported":"%s"}\n' \
+			"$_pkver" "$PODKOP_MIN_VERSION" "$_pkver" "$PODKOP_MIN_VERSION"; return
+	fi
+	_pkg=$(podkop_uci_pkg "$_variant")
+	if ! uci -q show "$_pkg" >/dev/null 2>&1; then
+		printf '{"ok":false,"reason":"uci_missing","detail":"%s not found"}\n' "$_pkg"; return
+	fi
+
+	# section: requested one, else the active section
+	_sec="$_req_sec"
+	[ -z "$_sec" ] && _sec=$(podkop_active_section "$_pkg")
+	if [ -z "$_sec" ] || ! uci -q get "$_pkg.$_sec" >/dev/null 2>&1; then
+		printf '{"ok":false,"reason":"no_section","detail":"section not found"}\n'; return
+	fi
+
+	# --- section type check (variant-aware, mirrors bot get_section_type) ---
+	# Mixed Proxy only makes sense on a PROXY section. Reject block/exclusion/
+	# outbound/vpn/byedpi/zapret so we never enable SOCKS on a non-proxy section.
+	if [ "$_variant" = "plus" ]; then
+		_ct=$(uci -q get "$_pkg.$_sec.action" 2>/dev/null)
+	else
+		_ct=$(uci -q get "$_pkg.$_sec.connection_type" 2>/dev/null)
+	fi
+	_ct="${_ct:-proxy}"
+	if [ "$_ct" != "proxy" ]; then
+		printf '{"ok":false,"reason":"not_proxy_section","detail":"section %s is %s, not proxy","action":"pick a proxy section"}\n' "$_sec" "$_ct"; return
+	fi
+
+	# --- save old state for rollback ---
+	_old_en=$(uci -q get "$_pkg.$_sec.mixed_proxy_enabled" 2>/dev/null); [ -z "$_old_en" ] && _old_en=""
+	_old_port=$(uci -q get "$_pkg.$_sec.mixed_proxy_port" 2>/dev/null)
+
+	# already enabled AND has a real port? report and stop (idempotent). If it's
+	# enabled but the port is empty, fall through to the auto-port apply branch so
+	# a real port gets assigned and written (contract from 0.16.38).
+	if [ "$_old_en" = "1" ] && [ -n "$_old_port" ]; then
+		_ip=$(_resolve_proxy_ip "$_old_port")
+		printf '{"ok":true,"already_enabled":true,"section":"%s","port":%s,"endpoint":%s}\n' \
+			"$_sec" "$_old_port" "$(_json_str "socks5h://$_ip:$_old_port")"
+		return
+	fi
+
+	# --- auto-port: if unset, pick the first free port from 2080 up, skipping any
+	# port already used by another section's mixed_proxy_port (no collisions) ---
+	_port="$_old_port"
+	if [ -z "$_port" ]; then
+		_used_ports=$(uci -q show "$_pkg" 2>/dev/null | sed -n 's/.*\.mixed_proxy_port=.\(.*\).$/\1/p')
+		_port=2080
+		while :; do
+			_collision=0
+			for _used in $_used_ports; do
+				[ "$_used" = "$_port" ] && { _collision=1; break; }
+			done
+			[ "$_collision" = "0" ] && break
+			_port=$((_port+1))
+		done
+	fi
+
+	# --- apply ---
+	uci set "$_pkg.$_sec.mixed_proxy_enabled=1" 2>/dev/null
+	uci set "$_pkg.$_sec.mixed_proxy_port=$_port" 2>/dev/null
+	# mixed_proxy state appears in install.sh status — drop the cache so Overview
+	# reflects the change immediately instead of up to TTL seconds later.
+	rm -f "$_STATUS_CACHE" 2>/dev/null
+	if ! uci commit "$_pkg" 2>/dev/null; then
+		printf '{"ok":false,"reason":"commit_failed","detail":"uci commit %s failed"}\n' "$_pkg"; return
+	fi
+	[ -x "/etc/init.d/${_pkg}" ] && "/etc/init.d/${_pkg}" reload >/dev/null 2>&1
+	sleep 2
+
+	# --- probe the SOCKS endpoint after reload ---
+	_ip=$(_resolve_proxy_ip "$_port")
+	_endpoint="socks5h://$_ip:$_port"
+	_probe=$(curl -s -o /dev/null -w '%{http_code}' --proxy "$_endpoint" \
+		--connect-timeout 4 --max-time 7 "https://api.telegram.org" 2>/dev/null)
+
+	if [ -n "$_probe" ] && [ "$_probe" != "000" ]; then
+		printf '{"ok":true,"section":"%s","port":%s,"endpoint":%s,"probe":"ok","http":"%s"}\n' \
+			"$_sec" "$_port" "$(_json_str "$_endpoint")" "$_probe"
+		return
+	fi
+
+	# --- probe failed → rollback to previous state ---
+	if [ -z "$_old_en" ]; then uci -q delete "$_pkg.$_sec.mixed_proxy_enabled" 2>/dev/null
+	else uci set "$_pkg.$_sec.mixed_proxy_enabled=$_old_en" 2>/dev/null; fi
+	if [ -z "$_old_port" ]; then uci -q delete "$_pkg.$_sec.mixed_proxy_port" 2>/dev/null
+	else uci set "$_pkg.$_sec.mixed_proxy_port=$_old_port" 2>/dev/null; fi
+	uci commit "$_pkg" 2>/dev/null
+	[ -x "/etc/init.d/${_pkg}" ] && "/etc/init.d/${_pkg}" reload >/dev/null 2>&1
+	printf '{"ok":false,"reason":"probe_failed","detail":"enabled but SOCKS endpoint did not respond; rolled back","section":"%s","endpoint":%s,"action":"check podkop/sing-box"}\n' \
+		"$_sec" "$(_json_str "$_endpoint")"
+}
+
+# -- test_github: reachability of raw.githubusercontent.com ------------------
+method_test_github() {
+	_url="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
+	if command -v curl >/dev/null 2>&1; then
+		if curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null "$_url" 2>/dev/null; then
+			printf '{"reachable":true,"route":"direct"}\n'; return
+		fi
+	elif wget -q -T 5 -O /dev/null "$_url" 2>/dev/null; then
+		printf '{"reachable":true,"route":"direct"}\n'; return
+	fi
+	printf '{"reachable":false,"route":"none"}\n'
+}
+
+# -- JSON string escaper (for embedding arbitrary text as a JSON string) -----
+# Escapes backslash, double-quote, tab, CR, then converts every newline (incl.
+# a trailing one) to a literal \n. Uses a sed loop that joins all lines with a
+# placeholder, so trailing newlines don't leak a raw control char (the awk
+# approach did, breaking JSON.parse on log chunks ending in newline).
+_json_str() {
+	_s=$(printf '%s' "$1" \
+		| sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g' \
+		| sed ':a;N;$!ba;s/\n/\\n/g')
+	printf '"%s"' "$_s"
+}
+
+# -- bot_logs: tail of the bot's syslog (logread -e podkop-bot) with a line cap.
+# The bot tags every line `podkop-bot` (logger -t podkop-bot) and never prints
+# the token value itself — only references to it — so this is safe to surface in
+# LuCI (TZ 2176: "token not visible in LuCI logs"). Support-bundle/redaction is
+# intentionally NOT reimplemented here: the bot already builds a redacted bundle
+# in its Telegram handler (TZ 4.2 — don't duplicate bot logic).
+method_bot_logs() {
+	_read_input
+	_lines=$(_field_num lines); [ -z "$_lines" ] && _lines=200
+	# clamp to sane bounds
+	[ "$_lines" -gt 1000 ] 2>/dev/null && _lines=1000
+	[ "$_lines" -lt 1 ] 2>/dev/null && _lines=50
+
+	if ! command -v logread >/dev/null 2>&1; then
+		printf '{"ok":false,"reason":"no_logread","detail":"logread not available"}\n'
+		return
+	fi
+	_log=$(logread -e podkop-bot 2>/dev/null | tail -n "$_lines")
+	_init_status="unknown"
+	if [ -x /etc/init.d/podkop_bot ]; then
+		if /etc/init.d/podkop_bot status >/dev/null 2>&1; then _init_status="running"; else _init_status="stopped"; fi
+	fi
+	printf '{"ok":true,"lines":%s,"init_status":"%s","log":%s}\n' \
+		"$_lines" "$_init_status" "$(_json_str "$_log")"
+}
+
+# -- resources: lightweight live diagnostics for the Overview mini-card.
+# sing-box PID(s) + summed RSS (podkop runs sing-box; there is no separate
+# "podkop process" — the bot itself measures only sing-box, TZ 4.2), plus RAM
+# available/total. Read-only and cheap, safe to poll every few seconds.
+method_resources() {
+	# sing-box: pidof may return several PIDs (forks) — sum their RSS.
+	_sb_pids=$(pidof sing-box 2>/dev/null)
+	_sb_running="false"; _sb_rss=0; _sb_n=0
+	if [ -n "$_sb_pids" ]; then
+		_sb_running="true"
+		for _p in $_sb_pids; do
+			_r=$(awk '/VmRSS/{print int($2/1024)}' "/proc/$_p/status" 2>/dev/null)
+			[ -n "$_r" ] && { _sb_rss=$((_sb_rss + _r)); _sb_n=$((_sb_n + 1)); }
+		done
+	fi
+	# normalise PID list to a JSON array
+	_sb_pid_json="["
+	_first=1
+	for _p in $_sb_pids; do
+		[ "$_first" = "1" ] && _first=0 || _sb_pid_json="${_sb_pid_json},"
+		_sb_pid_json="${_sb_pid_json}${_p}"
+	done
+	_sb_pid_json="${_sb_pid_json}]"
+
+	# RAM
+	_ram_avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+	_ram_total=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+	[ -z "$_ram_avail" ] && _ram_avail=0
+	[ -z "$_ram_total" ] && _ram_total=0
+	_ram_used=$((_ram_total - _ram_avail))
+	_ram_pct=0
+	[ "$_ram_total" -gt 0 ] 2>/dev/null && _ram_pct=$(( _ram_used * 100 / _ram_total ))
+
+	# bot's own liveness (reuse existing helper)
+	if bot_is_running; then _bot_running="true"; else _bot_running="false"; fi
+
+	printf '{"ok":true,"singbox":{"running":%s,"pids":%s,"count":%s,"rss_mb":%s},"ram":{"avail_mb":%s,"total_mb":%s,"used_mb":%s,"used_pct":%s},"bot_running":%s}\n' \
+		"$_sb_running" "$_sb_pid_json" "$_sb_n" "$_sb_rss" \
+		"$_ram_avail" "$_ram_total" "$_ram_used" "$_ram_pct" "$_bot_running"
+}
+
+UPDATE_CACHE="/tmp/podkop_bot_update_check.json"   # daily version-check cache
+UPDATE_CACHE_TTL=86400                              # 1 day
+
+_ver_gt() {
+	_a="$1"; _b="$2"
+	[ "$_a" = "$_b" ] && return 1
+	_a1=$(printf '%s' "$_a" | cut -d. -f1); _a2=$(printf '%s' "$_a" | cut -d. -f2)
+	_a3=$(printf '%s' "$_a" | cut -d. -f3); _a4=$(printf '%s' "$_a" | cut -d. -f4)
+	_b1=$(printf '%s' "$_b" | cut -d. -f1); _b2=$(printf '%s' "$_b" | cut -d. -f2)
+	_b3=$(printf '%s' "$_b" | cut -d. -f3); _b4=$(printf '%s' "$_b" | cut -d. -f4)
+	if   [ "${_a1:-0}" -gt "${_b1:-0}" ] 2>/dev/null; then return 0
+	elif [ "${_a1:-0}" -eq "${_b1:-0}" ] 2>/dev/null && [ "${_a2:-0}" -gt "${_b2:-0}" ] 2>/dev/null; then return 0
+	elif [ "${_a1:-0}" -eq "${_b1:-0}" ] 2>/dev/null && [ "${_a2:-0}" -eq "${_b2:-0}" ] 2>/dev/null && [ "${_a3:-0}" -gt "${_b3:-0}" ] 2>/dev/null; then return 0
+	elif [ "${_a1:-0}" -eq "${_b1:-0}" ] 2>/dev/null && [ "${_a2:-0}" -eq "${_b2:-0}" ] 2>/dev/null && [ "${_a3:-0}" -eq "${_b3:-0}" ] 2>/dev/null && [ "${_a4:-0}" -gt "${_b4:-0}" ] 2>/dev/null; then return 0
+	fi
+	return 1
+}
+
+# _ver_lt a b -> true (0) when a < b. Defined in terms of _ver_gt so the
+# per-component parsing lives in one place; equal versions are NOT less-than.
+_ver_lt() { [ "$1" = "$2" ] && return 1; _ver_gt "$2" "$1"; }
+
+# Minimum podkop release this app supports. Below it the podkop UCI schema
+# (mixed_proxy_* fields, section model) predates what the bot/LuCI expect, which
+# is what surfaced the RPCError/variant=unknown crash on old boxes. We don't
+# block the whole UI — status/service still work — but Mixed Proxy is gated and
+# a deprecation banner is shown. Bump this if the supported floor moves.
+PODKOP_MIN_VERSION="0.7.0"
+
+# _podkop_deprecated <version> -> true (0) when a real X.Y.Z version is below
+# PODKOP_MIN_VERSION. "unknown"/empty/non-numeric are NOT treated as deprecated
+# (we can't prove they're old, and variant_unknown is handled separately).
+_podkop_deprecated() {
+	_v="$1"
+	[ -z "$_v" ] && return 1
+	[ "$_v" = "unknown" ] && return 1
+	case "$_v" in *[0-9]*.*[0-9]*) ;; *) return 1 ;; esac
+	_ver_lt "$_v" "$PODKOP_MIN_VERSION"
+}
+
+_installed_bot_version() { grep -m1 '^BOT_VERSION=' "$BOT_PATH" 2>/dev/null | cut -d'"' -f2; }
+
+# check_update: newer-version check, cached for a day so page refreshes don't
+# hit the network. {force:true} bypasses cache. (TZ 4.2: comparison mirrors bot.)
+method_check_update() {
+	_read_input
+	_force=$(_field force)
+	_now=$(date +%s 2>/dev/null || echo 0)
+	_cur=$(_installed_bot_version); [ -z "$_cur" ] && _cur="unknown"
+
+	if [ "$_force" != "true" ] && [ -f "$UPDATE_CACHE" ]; then
+		_ts=$(sed -n 's/.*"checked_at":\([0-9]*\).*/\1/p' "$UPDATE_CACHE")
+		if [ -n "$_ts" ] && [ "$((_now - _ts))" -lt "$UPDATE_CACHE_TTL" ] 2>/dev/null; then
+			cat "$UPDATE_CACHE"; printf '\n'; return
+		fi
+	fi
+
+	_latest=""
+	_via="none"
+	_url="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
+	command -v curl >/dev/null 2>&1 && _latest=$(curl -fsS --connect-timeout 6 --max-time 12 "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
+	[ -z "$_latest" ] && command -v wget >/dev/null 2>&1 && _latest=$(wget -q -T 12 -O - "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
+	[ -n "$_latest" ] && _via="direct"
+	# fallback-aware: if direct fetch failed (likely blocked), retry through the
+	# bot's primary SOCKS (tier1 mixed_proxy) — the same path `update from GitHub`
+	# uses — so the check doesn't falsely report "unknown" while update works.
+	if [ -z "$_latest" ]; then
+		_sb_ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+		_sb_port=""
+		_v=$(_cached_status | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+		_pk=$(podkop_uci_pkg "${_v:-podkop}")
+		_psec=$(_primary_section "$_pk" 2>/dev/null)
+		[ -n "$_psec" ] && _sb_port=$(uci -q get "$_pk.$_psec.mixed_proxy_port" 2>/dev/null)
+		if [ -n "$_sb_port" ] && [ -n "$_sb_ip" ]; then
+			_latest=$(curl -fsS --proxy "socks5h://$_sb_ip:$_sb_port" --connect-timeout 6 --max-time 12 "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
+			[ -n "$_latest" ] && _via="socks"
+		fi
+	fi
+	[ -z "$_latest" ] && _latest="unknown"
+
+	_avail="false"
+	[ "$_latest" != "unknown" ] && [ "$_cur" != "unknown" ] && _ver_gt "$_latest" "$_cur" && _avail="true"
+
+	_out=$(printf '{"ok":true,"current":"%s","latest":"%s","update_available":%s,"via":"%s","checked_at":%s}' "$_cur" "$_latest" "$_avail" "$_via" "$_now")
+	[ "$_latest" != "unknown" ] && printf '%s' "$_out" > "$UPDATE_CACHE" 2>/dev/null
+	printf '%s\n' "$_out"
+}
+
+# update_paste: install a pasted bot script with the same validation as the
+# bot's Upload Bot Script (shebang + BOT_VERSION + syntax), backup, restart.
+method_update_paste() {
+	_read_input
+	_body=""
+	command -v jsonfilter >/dev/null 2>&1 && _body=$(printf '%s' "$_input" | jsonfilter -e '@.body' 2>/dev/null)
+	[ -z "$_body" ] && command -v jq >/dev/null 2>&1 && _body=$(printf '%s' "$_input" | jq -r '.body // empty' 2>/dev/null)
+	[ -z "$_body" ] && { printf '{"ok":false,"reason":"empty","detail":"no script body"}\n'; return; }
+
+	_tmp="/tmp/podkop_bot_paste.$$"
+	printf '%s' "$_body" > "$_tmp"
+	if ! head -1 "$_tmp" | grep -q '^#!' || ! grep -q '^BOT_VERSION=' "$_tmp"; then
+		rm -f "$_tmp"; printf '{"ok":false,"reason":"not_bot_script","detail":"missing shebang or BOT_VERSION"}\n'; return
+	fi
+	if ! busybox ash -n "$_tmp" 2>/dev/null && ! sh -n "$_tmp" 2>/dev/null; then
+		rm -f "$_tmp"; printf '{"ok":false,"reason":"syntax_error","detail":"syntax errors; current bot unchanged"}\n'; return
+	fi
+	_newver=$(grep -m1 '^BOT_VERSION=' "$_tmp" | cut -d'"' -f2)
+	[ -f "$BOT_PATH" ] && cp -f "$BOT_PATH" "${BOT_PATH}.bak" 2>/dev/null
+	chmod +x "$_tmp"
+	if ! mv "$_tmp" "$BOT_PATH" 2>/dev/null; then
+		rm -f "$_tmp"; printf '{"ok":false,"reason":"install_failed","detail":"could not write %s"}\n' "$BOT_PATH"; return
+	fi
+	[ -x "$INIT_PATH" ] && "$INIT_PATH" restart >/dev/null 2>&1
+	sleep 2
+	if bot_is_running; then _running="true"; else _running="false"; fi
+	rm -f "$UPDATE_CACHE" 2>/dev/null
+	printf '{"ok":true,"installed_version":"%s","service_running":%s,"backup":"%s.bak"}\n' "${_newver:-unknown}" "$_running" "$BOT_PATH"
+}
+
+BOT_DIR="/tmp/podkop_bot"
+SOCKS_STATE="$BOT_DIR/socks_state"
+HEALTH_STATE="$BOT_DIR/health_state"
+
+# Read one key=value line from a bot state file. Empty if absent.
+_state_get() { grep "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2-; }
+
+# WAN interface, same way the bot resolves it (default route dev, then uci).
+_wan_if() {
+	_if=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+	[ -z "$_if" ] && _if=$(uci -q get network.wan.ifname 2>/dev/null || uci -q get network.wan.device 2>/dev/null)
+	printf '%s' "${_if:-}"
+}
+
+# Resolve the podkop UCI package + primary proxy section's mixed_proxy info for
+# tier1. Mirrors how the bot builds tier1 (TZ 4.2): primary proxy section's
+# mixed_proxy_port, default 2080.
+_primary_section() {
+	_pkg="$1"
+	# first section with mixed_proxy_enabled=1 (the bot's key name — NOT
+	# "mixed_proxy"), else the section named 'main', else empty.
+	for _s in $(uci -q show "$_pkg" 2>/dev/null | sed -n "s/^$_pkg\.\([^.=]*\)=section/\1/p"); do
+		[ "$(uci -q get "$_pkg.$_s.mixed_proxy_enabled" 2>/dev/null)" = "1" ] && { printf '%s' "$_s"; return; }
+	done
+	uci -q get "$_pkg.main" >/dev/null 2>&1 && printf 'main'
+}
+
+# Resolve the SOCKS listen IP for a mixed_proxy port, the way the bot does:
+# look up the inbound in sing-box config.json by listen_port; if listen is
+# 0.0.0.0/:: or absent, use the LAN IP. (TZ 12.4 get_proxy_ip equivalent.)
+_resolve_proxy_ip() {
+	_port="$1"
+	_ip=$(uci -q get network.lan.ipaddr 2>/dev/null); [ -z "$_ip" ] && _ip="192.168.1.1"
+	_cfg="/etc/sing-box/config.json"
+	if [ -f "$_cfg" ] && command -v jq >/dev/null 2>&1; then
+		_sb=$(jq -r --arg p "$_port" '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' "$_cfg" 2>/dev/null | head -1)
+		[ -n "$_sb" ] && [ "$_sb" != "0.0.0.0" ] && [ "$_sb" != "::" ] && _ip="$_sb"
+	fi
+	printf '%s' "$_ip"
+}
+
+# -- transport_state: the Transport tab's main read. Assembles the 6-tier
+# fallback picture from the bot's own state files (route/tg/socks) plus UCI
+# (mixed_proxy, fallback_socks, custom_proxy, transport policy) and WAN presence.
+# Read-only; does NOT probe (probing is a separate explicit action).
+method_transport_state() {
+	_out=$(_cached_status)
+	_variant=$(printf '%s' "$_out" | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+	[ -z "$_variant" ] && _variant="unknown"
+	_pkg=$(podkop_uci_pkg "$_variant")
+
+	# --- bot route state (live, written by the bot) ---
+	_route=$(_state_get "$SOCKS_STATE" route);        [ -z "$_route" ] && _route="unknown"
+	_st_tg=$(_state_get "$SOCKS_STATE" tg);           [ -z "$_st_tg" ] && _st_tg="unknown"
+	_st_socks=$(_state_get "$SOCKS_STATE" socks);     [ -z "$_st_socks" ] && _st_socks="unknown"
+	_last_ok=$(_state_get "$SOCKS_STATE" last_ok);    [ -z "$_last_ok" ] && _last_ok="unknown"
+	_tg_direct=$(_state_get "$HEALTH_STATE" tg_direct);     [ -z "$_tg_direct" ] && _tg_direct="unknown"
+	_tg_transport=$(_state_get "$HEALTH_STATE" tg_transport); [ -z "$_tg_transport" ] && _tg_transport="unknown"
+
+	# --- transport policy ---
+	_policy=$(uci -q get podkop_bot.settings.transport 2>/dev/null); [ -z "$_policy" ] && _policy="auto"
+
+	# --- tier1: primary mixed_proxy ---
+	_sec=$(_primary_section "$_pkg")
+	_mp_enabled="0"; _mp_port=""; _mp_endpoint=""
+	if [ -n "$_sec" ]; then
+		_mp_enabled=$(uci -q get "$_pkg.$_sec.mixed_proxy_enabled" 2>/dev/null); [ -z "$_mp_enabled" ] && _mp_enabled="0"
+		_mp_port=$(uci -q get "$_pkg.$_sec.mixed_proxy_port" 2>/dev/null); [ -z "$_mp_port" ] && _mp_port="2080"
+		if [ "$_mp_enabled" = "1" ]; then
+			_mp_ip=$(_resolve_proxy_ip "$_mp_port")
+			_mp_endpoint="socks5h://$_mp_ip:$_mp_port"
+		fi
+	fi
+
+	# --- tier2_N: fallback_socks list (UCI list on podkop_bot.settings) ---
+	_fb_json="["; _fb_first=1
+	for _fb in $(uci -q get podkop_bot.settings.fallback_socks 2>/dev/null); do
+		[ "$_fb_first" = "1" ] && _fb_first=0 || _fb_json="$_fb_json,"
+		_fb_json="$_fb_json$(_json_str "$_fb")"
+	done
+	_fb_json="$_fb_json]"
+
+	# --- tier3: custom_proxy ---
+	_custom=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
+
+	# --- tier4: Direct WAN (presence of WAN if; actual reachability is a probe) ---
+	_wan=$(_wan_if); [ -z "$_wan" ] && _wan="unknown"
+
+	printf '{"ok":true,"available":true,"variant":"%s","uci_pkg":"%s","policy":"%s",' "$_variant" "$_pkg" "$_policy"
+	printf '"route":"%s","tg":"%s","socks":"%s","last_ok":"%s","tg_direct":"%s","tg_transport":"%s",' \
+		"$_route" "$_st_tg" "$_st_socks" "$_last_ok" "$_tg_direct" "$_tg_transport"
+	printf '"tier1":{"section":%s,"mixed_proxy_enabled":%s,"port":%s,"endpoint":%s},' \
+		"$(_json_str "$_sec")" "$([ "$_mp_enabled" = "1" ] && echo true || echo false)" "$(_json_str "$_mp_port")" "$(_json_str "$_mp_endpoint")"
+	printf '"tier2_fallback_socks":%s,' "$_fb_json"
+	printf '"tier3_custom_proxy":%s,' "$(_json_str "$_custom")"
+	printf '"tier4_wan_if":%s,' "$(_json_str "$_wan")"
+	printf '"tier5_emergency":true}\n'
+}
+
+# -- transport_probe: actively test ONE transport path against Telegram and
+# report ok/fail + latency. {target} is "direct" (Direct WAN, using --interface
+# + --noproxy so tproxy/fakeip can't fake a pass, TZ 11.6) or a SOCKS endpoint
+# like socks5h://host:port (tier1/tier2_N/tier3). This is a deliberate action,
+# not part of the read-only state.
+method_transport_probe() {
+	_read_input
+	_target=$(_field target)
+	[ -z "$_target" ] && { printf '{"ok":false,"available":false,"reason":"no_target","detail":"no probe target given","action":null}\n'; return; }
+
+	# Telegram API endpoint that returns quickly (no token needed).
+	_url="https://api.telegram.org"
+	# latency from curl's own timing (-w time_total) — `date +%s%N` is unsupported
+	# on this BusyBox (%N emitted literally), which gave latency 0.
+	if [ "$_target" = "direct" ]; then
+		_wan=$(_wan_if)
+		if [ -z "$_wan" ]; then
+			printf '{"ok":true,"target":"direct","result":"unknown","reason":"no_wan_if"}\n'; return
+		fi
+		_resp=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --interface "$_wan" --noproxy '*' \
+			--connect-timeout 5 --max-time 8 "$_url" 2>/dev/null)
+	else
+		_resp=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --proxy "$_target" \
+			--connect-timeout 5 --max-time 8 "$_url" 2>/dev/null)
+	fi
+	_code=$(printf '%s' "$_resp" | awk '{print $1}')
+	_secs=$(printf '%s' "$_resp" | awk '{print $2}')
+	_ms=$(awk -v s="$_secs" 'BEGIN{ printf "%d", (s*1000) }' 2>/dev/null)
+	[ -z "$_ms" ] && _ms=0
+
+	# Any HTTP response (even 404) means the path reached Telegram.
+	if [ -n "$_code" ] && [ "$_code" != "000" ]; then
+		printf '{"ok":true,"target":%s,"result":"ok","http":"%s","latency_ms":%s}\n' "$(_json_str "$_target")" "$_code" "$_ms"
+	else
+		printf '{"ok":true,"target":%s,"result":"fail","http":"%s","latency_ms":%s}\n' "$(_json_str "$_target")" "${_code:-000}" "$_ms"
+	fi
+}
+
+# -- singbox_info: read the installed sing-box version + flavour for display.
+# Flavour (extended/tiny/standard) is a property of the INSTALLED sing-box, not
+# of the podkop variant — original podkop, podkop-plus and NetShift can each run
+# any flavour if the user installed it manually. So detect the flavour from the
+# actual package name (opkg/apk), which works on every variant, rather than from
+# a podkop-plus-only state file. Read-only; installing/switching flavours is a
+# podkop-plus/user action, not the bot's.
+# -- app_info: this LuCI package's own version + repo link, for the Overview
+# footer. Version is a build-synced constant (opkg may not be authoritative if
+# the file was replaced manually).
+method_app_info() {
+	printf '{"ok":true,"luci_app_version":"%s","repo":"https://github.com/Medvedolog/luci-app-podkop-bot"}\n' "$LUCI_APP_VERSION"
+}
+
+method_singbox_info() {
+	_ver=""; _flavour="standard"; _pkgname=""
+
+	# Package name + version from the package manager (variant-independent).
+	if command -v opkg >/dev/null 2>&1; then
+		_line=$(opkg list-installed 2>/dev/null | awk '/^sing-box/ {print; exit}')
+		_pkgname=$(printf '%s' "$_line" | awk '{print $1}')
+		_ver=$(printf '%s' "$_line" | awk '{print $3}')
+	fi
+	if [ -z "$_pkgname" ] && command -v apk >/dev/null 2>&1; then
+		_line=$(apk list --installed 2>/dev/null | grep -E '^sing-box' | head -1)
+		_pkgname=$(printf '%s' "$_line" | sed 's/-[0-9].*//')
+		_ver=$(printf '%s' "$_line" | sed -n 's/^sing-box[a-z-]*-\([0-9][^ ]*\).*/\1/p')
+	fi
+	# Fallback version source: podkop-plus state file (plus only), then unknown.
+	if [ -z "$_ver" ]; then
+		_state="/etc/podkop-plus/sing-box-version"
+		[ -r "$_state" ] && _ver=$(sed -n '1p' "$_state" 2>/dev/null)
+	fi
+	[ -z "$_ver" ] && _ver="unknown"
+
+	# Flavour from whatever signal we have. The version string is the most
+	# reliable source because podkop-plus may install sing-box outside the
+	# package manager (so there's no opkg/apk package name at all) — its version
+	# embeds the flavour, e.g. "1.13.12-extended-2.4.1". Fall back to the package
+	# name when the version string is uninformative.
+	case "$_ver" in
+		*extended*) _flavour="extended" ;;
+		*tiny*)     _flavour="tiny" ;;
+		*)
+			case "$_pkgname" in
+				*extended*) _flavour="extended" ;;
+				*tiny*)     _flavour="tiny" ;;
+			esac
+			;;
+	esac
+
+	printf '{"ok":true,"version":%s,"flavour":"%s","package":%s}\n' \
+		"$(_json_str "$_ver")" "$_flavour" "$(_json_str "$_pkgname")"
+}
+
+# -- set_transport_policy: change the bot's transport policy (auto/socks/direct)
+# and restart so it takes effect. This is the one writable control the Transport
+# tab needs without pulling in a full CBI form.
+method_set_transport_policy() {
+	_read_input
+	_pol=$(_field policy)
+	case "$_pol" in
+		auto|socks|direct) ;;
+		*) printf '{"ok":false,"reason":"bad_policy","detail":"%s"}\n' "$_pol"; return ;;
+	esac
+	uci set podkop_bot.settings.transport="$_pol" 2>/dev/null
+	uci commit podkop_bot 2>/dev/null
+	[ -x "$INIT_PATH" ] && "$INIT_PATH" restart >/dev/null 2>&1
+	sleep 1
+	if bot_is_running; then _running="true"; else _running="false"; fi
+	printf '{"ok":true,"policy":"%s","service_running":%s}\n' "$_pol" "$_running"
+}
+
+# -- fallback_crud: add / delete / move entries in the fallback_socks UCI list.
+# Validation mirrors the bot (TZ 4.2): ^socks5h?://host:port$, dedup by host:port
+# (socks5:// and socks5h:// to the same endpoint are duplicates). BusyBox uci has
+# no positional edit, so for delete/move we read the whole list, rebuild the
+# array in shell, then rewrite it (delete list + add_list in new order) + commit.
+_fb_list() {
+	# print current entries one per line
+	uci -q get podkop_bot.settings.fallback_socks 2>/dev/null | tr ' ' '\n' | sed '/^$/d'
+}
+_fb_rewrite() {
+	# stdin = newline-separated entries → replace the whole list atomically
+	uci -q delete podkop_bot.settings.fallback_socks 2>/dev/null
+	while IFS= read -r _e; do
+		[ -n "$_e" ] && uci add_list podkop_bot.settings.fallback_socks="$_e" 2>/dev/null
+	done
+	uci commit podkop_bot 2>/dev/null
+}
+_valid_port() {
+	# 1..65535
+	case "$1" in (*[!0-9]*|"") return 1;; esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+method_fallback_crud() {
+	_read_input
+	_op=$(_field op)
+	_val=$(_field value)
+	_idx=$(_field_num index)
+
+	case "$_op" in
+		add)
+			_clean=$(printf '%s' "$_val" | tr -d '\r\n' | sed 's/[[:space:]]//g')
+			if ! printf '%s' "$_clean" | grep -qE '^socks5h?://[^:]+:[0-9]+$'; then
+				printf '{"ok":false,"reason":"bad_format","detail":"expected socks5://IP:PORT or socks5h://IP:PORT"}\n'; return
+			fi
+			_p=$(printf '%s' "$_clean" | sed 's|.*:||')
+			_valid_port "$_p" || { printf '{"ok":false,"reason":"bad_port","detail":"port must be 1-65535"}\n'; return; }
+			_new_hp=$(printf '%s' "$_clean" | sed 's|^socks5h\?://||')
+			# dedup by host:port
+			_dup=0
+			for _e in $(_fb_list); do
+				_e_hp=$(printf '%s' "$_e" | sed 's|^socks5h\?://||')
+				[ "$_e_hp" = "$_new_hp" ] && { _dup=1; break; }
+			done
+			[ "$_dup" = "1" ] && { printf '{"ok":false,"reason":"duplicate","detail":"%s already in list"}\n' "$_new_hp"; return; }
+			uci add_list podkop_bot.settings.fallback_socks="$_clean" 2>/dev/null
+			uci commit podkop_bot 2>/dev/null
+			printf '{"ok":true,"op":"add","value":%s}\n' "$(_json_str "$_clean")"
+			;;
+		edit)
+			[ -z "$_idx" ] && { printf '{"ok":false,"reason":"no_index"}\n'; return; }
+			_clean=$(printf '%s' "$_val" | tr -d '\r\n' | sed 's/[[:space:]]//g')
+			if ! printf '%s' "$_clean" | grep -qE '^socks5h?://[^:]+:[0-9]+$'; then
+				printf '{"ok":false,"reason":"bad_format","detail":"expected socks5://IP:PORT or socks5h://IP:PORT"}\n'; return
+			fi
+			_p=$(printf '%s' "$_clean" | sed 's|.*:||')
+			_valid_port "$_p" || { printf '{"ok":false,"reason":"bad_port","detail":"port must be 1-65535"}\n'; return; }
+			_new_hp=$(printf '%s' "$_clean" | sed 's|^socks5h\?://||')
+			# dedup against OTHER entries (not the one being edited)
+			_i=0; _dup=0
+			for _e in $(_fb_list); do
+				if [ "$_i" != "$_idx" ]; then
+					_e_hp=$(printf '%s' "$_e" | sed 's|^socks5h\?://||')
+					[ "$_e_hp" = "$_new_hp" ] && { _dup=1; break; }
+				fi
+				_i=$((_i+1))
+			done
+			[ "$_dup" = "1" ] && { printf '{"ok":false,"reason":"duplicate","detail":"%s already in list"}\n' "$_new_hp"; return; }
+			# rebuild list replacing entry at index
+			_i=0; _new=""
+			for _e in $(_fb_list); do
+				if [ "$_i" = "$_idx" ]; then _new="$_new$_clean
+"; else _new="$_new$_e
+"; fi
+				_i=$((_i+1))
+			done
+			printf '%s' "$_new" | _fb_rewrite
+			printf '{"ok":true,"op":"edit","index":%s,"value":%s}\n' "$_idx" "$(_json_str "$_clean")"
+			;;
+		delete)
+			[ -z "$_idx" ] && { printf '{"ok":false,"reason":"no_index"}\n'; return; }
+			_i=0; _new=""
+			for _e in $(_fb_list); do
+				[ "$_i" != "$_idx" ] && _new="$_new$_e
+"
+				_i=$((_i+1))
+			done
+			printf '%s' "$_new" | _fb_rewrite
+			printf '{"ok":true,"op":"delete","index":%s}\n' "$_idx"
+			;;
+		move_up|move_down)
+			[ -z "$_idx" ] && { printf '{"ok":false,"reason":"no_index"}\n'; return; }
+			# read into positional params
+			set -- $(_fb_list)
+			_n=$#
+			[ "$_n" -lt 2 ] && { printf '{"ok":true,"op":"%s","detail":"nothing to move"}\n' "$_op"; return; }
+			_target=$_idx
+			if [ "$_op" = "move_up" ]; then _swap=$((_idx-1)); else _swap=$((_idx+1)); fi
+			[ "$_swap" -lt 0 ] || [ "$_swap" -ge "$_n" ] && { printf '{"ok":true,"op":"%s","detail":"at boundary"}\n' "$_op"; return; }
+			# rebuild with target and swap exchanged
+			_i=0; _out=""
+			for _e in "$@"; do
+				if [ "$_i" = "$_target" ]; then _emit=$(eval "echo \${$((_swap+1))}")
+				elif [ "$_i" = "$_swap" ]; then _emit=$(eval "echo \${$((_target+1))}")
+				else _emit="$_e"; fi
+				_out="$_out$_emit
+"
+				_i=$((_i+1))
+			done
+			printf '%s' "$_out" | _fb_rewrite
+			printf '{"ok":true,"op":"%s","index":%s}\n' "$_op" "$_idx"
+			;;
+		*)
+			printf '{"ok":false,"reason":"bad_op","detail":"%s"}\n' "$_op"
+			;;
+	esac
+}
+
+# -- list_interfaces: real network interfaces from `ip link`, for the Direct WAN
+# bind_interface picker. The bot validates bind_interface with `ip link show`,
+# so offering the actual list (auto + tailscale0/awg0/etc as they appear) avoids
+# typos and matches the bot's rule.
+method_list_interfaces() {
+	_ifaces=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -v '^lo$')
+	_json="["; _first=1
+	for _i in $_ifaces; do
+		[ "$_first" = "1" ] && _first=0 || _json="$_json,"
+		_json="$_json$(_json_str "$_i")"
+	done
+	_json="$_json]"
+	_cur=$(uci -q get podkop_bot.settings.bind_interface 2>/dev/null)
+	printf '{"ok":true,"interfaces":%s,"current":%s}\n' "$_json" "$(_json_str "$_cur")"
+}
+
+# -- set_uci_field: write one of the simple transport UCI fields the Transport
+# tab edits (custom_proxy tier3, bind_interface tier4). Validates per field and
+# restarts the bot. Empty value clears the field (auto). Only these two fields
+# are writable here — never an arbitrary key.
+# -- set_tier1_port: manually set the Mixed Proxy port of the active section.
+# tier1's endpoint is podkop.<active_sec>.mixed_proxy_port — the SAME source the
+# bot reads. Auto-detection normally fills it, but if the user changed the port
+# in Podkop (port conflict) or detection failed, this lets them fix it. We write
+# to Podkop's own key (not a bot-only override) precisely so the bot sees it too;
+# this is the one Mixed-Proxy parameter we already manage for the bot's sake.
+method_set_tier1_port() {
+	_read_input
+	_val=$(_field value)
+	_clean=$(printf '%s' "$_val" | tr -d '\r\n' | sed 's/[[:space:]]//g')
+	if ! printf '%s' "$_clean" | grep -qE '^[0-9]+$' || ! _valid_port "$_clean"; then
+		printf '{"ok":false,"reason":"bad_port","detail":"port must be 1-65535"}\n'; return
+	fi
+	_variant=$(_cached_status | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+	_pkg=$(podkop_uci_pkg "${_variant:-podkop}")
+	# tier1 = the PRIMARY proxy section's Mixed Proxy, not the active runtime
+	# section. In a multi-section config the active section may be youtube/backup,
+	# but tier1 in Transport always refers to primary. Accept an explicit section;
+	# otherwise resolve primary (first proxy section), then fall back to active.
+	_sec=$(_field section)
+	if [ -z "$_sec" ]; then
+		for _cand in $(uci -q show "$_pkg" 2>/dev/null | sed -n "s/^${_pkg}\.\([^.]*\)=section$/\1/p"); do
+			if [ "$_variant" = "plus" ]; then _ct=$(uci -q get "$_pkg.$_cand.action" 2>/dev/null); [ -z "$_ct" ] && _ct="proxy"
+			else _ct=$(uci -q get "$_pkg.$_cand.connection_type" 2>/dev/null); [ -z "$_ct" ] && _ct="proxy"; fi
+			[ "$_ct" = "proxy" ] && { _sec="$_cand"; break; }
+		done
+		[ -z "$_sec" ] && _sec=$(_active_section)
+	fi
+	if [ -z "$_sec" ] || ! uci -q get "$_pkg.$_sec" >/dev/null 2>&1; then
+		printf '{"ok":false,"reason":"no_section","detail":"primary section not found"}\n'; return
+	fi
+	uci set "$_pkg.$_sec.mixed_proxy_port=$_clean" 2>/dev/null
+	uci set "$_pkg.$_sec.mixed_proxy_enabled=1" 2>/dev/null
+	if ! uci commit "$_pkg" 2>/dev/null; then
+		printf '{"ok":false,"reason":"commit_failed","detail":"uci commit %s failed"}\n' "$_pkg"; return
+	fi
+	[ -x "/etc/init.d/${_pkg}" ] && "/etc/init.d/${_pkg}" reload >/dev/null 2>&1
+	sleep 1
+	printf '{"ok":true,"section":"%s","port":%s}\n' "$_sec" "$_clean"
+}
+
+method_set_uci_field() {
+	_read_input
+	_field_name=$(_field field)
+	_val=$(_field value)
+	case "$_field_name" in
+		custom_proxy)
+			_clean=$(printf '%s' "$_val" | tr -d '\r\n' | sed 's/[[:space:]]//g')
+			if [ -n "$_clean" ] && ! printf '%s' "$_clean" | grep -qE '^(socks5h?|https?)://[^:]+:[0-9]+$'; then
+				printf '{"ok":false,"reason":"bad_format","detail":"socks5://, socks5h://, http:// or https:// IP:PORT"}\n'; return
+			fi
+			if [ -n "$_clean" ]; then
+				_p=$(printf '%s' "$_clean" | sed 's|.*:||')
+				_valid_port "$_p" || { printf '{"ok":false,"reason":"bad_port","detail":"port must be 1-65535"}\n'; return; }
+			fi
+			if [ -z "$_clean" ]; then uci -q delete podkop_bot.settings.custom_proxy 2>/dev/null
+			else uci set podkop_bot.settings.custom_proxy="$_clean" 2>/dev/null; fi
+			;;
+		bind_interface)
+			_clean=$(printf '%s' "$_val" | tr -d '\r\n' | sed 's/[[:space:]]//g')
+			if [ -n "$_clean" ] && [ "$_clean" != "auto" ]; then
+				if ! ip link show "$_clean" >/dev/null 2>&1; then
+					printf '{"ok":false,"reason":"no_iface","detail":"%s does not exist"}\n' "$_clean"; return
+				fi
+			fi
+			if [ -z "$_clean" ] || [ "$_clean" = "auto" ]; then uci -q delete podkop_bot.settings.bind_interface 2>/dev/null
+			else uci set podkop_bot.settings.bind_interface="$_clean" 2>/dev/null; fi
+			;;
+		*)
+			printf '{"ok":false,"reason":"bad_field","detail":"%s"}\n' "$_field_name"; return ;;
+	esac
+	uci commit podkop_bot 2>/dev/null
+	[ -x "$INIT_PATH" ] && "$INIT_PATH" restart >/dev/null 2>&1
+	sleep 1
+	printf '{"ok":true,"field":"%s","value":%s}\n' "$_field_name" "$(_json_str "$_clean")"
+}
+
+# Exact-match lookup in a "tag=value" cache file. Must NOT use grep "^tag=":
+# subscription server names routinely contain regex metacharacters ([](){}.+*|)
+# and emoji, which would break or mis-match a grep pattern. awk with a literal
+# string compare is safe.
+_cache_get() {
+	awk -v k="$2" 'index($0,"="){ key=substr($0,1,index($0,"=")-1); if(key==k){ print substr($0,index($0,"=")+1); exit } }' "$1" 2>/dev/null
+}
+
+# Recursively resolve a Clash proxy tag down to the real leaf outbound, mirroring
+# the bot's _resolve_leaf: Selector/URLTest/Fallback/LoadBalance follow .now, up
+# to 5 levels. Prevents returning an intermediate group tag instead of the server.
+_resolve_leaf_tag() {
+	_rl_cur="$1"; _rl_px="$2"; _rl_i=0
+	while [ "$_rl_i" -lt 5 ]; do
+		_rl_t=$(printf '%s' "$_rl_px" | jq -r --arg n "$_rl_cur" '.proxies[$n].type // empty' 2>/dev/null)
+		case "$_rl_t" in
+			Selector|URLTest|Fallback|LoadBalance)
+				_rl_nx=$(printf '%s' "$_rl_px" | jq -r --arg n "$_rl_cur" '.proxies[$n].now // empty' 2>/dev/null)
+				[ -n "$_rl_nx" ] && [ "$_rl_nx" != "$_rl_cur" ] && _rl_cur="$_rl_nx" || break ;;
+			*) break ;;
+		esac
+		_rl_i=$((_rl_i + 1))
+	done
+	printf '%s' "$_rl_cur"
+}
+
+# Last-resort address fallback straight from the sing-box config, independent of
+# the bot's runtime caches (which may be missing/stale). Returns "[type] host:port".
+_singbox_outbound_addr() {
+	jq -r --arg tag "$1" '
+		.outbounds[]? | select(.tag == $tag) | select(.server != null and .server != "")
+		| "[\(.type)] \(.server):\(.server_port)"' /etc/sing-box/config.json 2>/dev/null | head -1
+}
+
+# Decode a URL fragment from a proxy link (#Name) to UTF-8 text. awk is more
+# portable here than printf %b across BusyBox builds.
+_url_decode_fragment() {
+	printf '%s' "$1" | sed 's/+/ /g' | awk '
+		BEGIN{ for(i=0;i<256;i++) ord[sprintf("%02X",i)]=i }
+		{ s=$0; out="";
+		  while(length(s)>0){
+		    c=substr(s,1,1);
+		    if(c=="%" && length(s)>=3){
+		      hex=toupper(substr(s,2,2));
+		      if(hex ~ /^[0-9A-F][0-9A-F]$/){ out=out sprintf("%c",ord[hex]); s=substr(s,4); continue }
+		    }
+		    out=out c; s=substr(s,2);
+		  }
+		  printf "%s", out }' 2>/dev/null
+}
+
+# Output proxy links for a section from the known podkop/netshift/plus UCI fields.
+# Covers manual selector/urltest links, *_text fields, and single URL mode.
+_section_proxy_links() {
+	_pkg_l="$1"; _sec_l="$2"; _mode_l="$3"
+	case "$_mode_l" in
+		url|url_text)
+			uci -q get "$_pkg_l.$_sec_l.proxy_string" 2>/dev/null
+			;;
+		urltest|urltest_text)
+			uci -q show "$_pkg_l.$_sec_l.urltest_proxy_links" 2>/dev/null | cut -d= -f2- | tr "'" ' '
+			uci -q get "$_pkg_l.$_sec_l.urltest_proxy_links_text" 2>/dev/null
+			;;
+		*)
+			uci -q show "$_pkg_l.$_sec_l.selector_proxy_links" 2>/dev/null | cut -d= -f2- | tr "'" ' '
+			uci -q get "$_pkg_l.$_sec_l.selector_proxy_links_text" 2>/dev/null
+			;;
+	esac
+}
+
+# Variant-aware section mode. podkop-plus uses flags (urltest_enabled /
+# subscription_urls) instead of a proxy_config_type field, so a plain
+# proxy_config_type read (as elsewhere) mislabels Plus sections. Mirrors the bot.
+_section_mode() {
+	_sm_variant="$1"; _sm_pkg="$2"; _sm_sec="$3"
+	case "$_sm_variant" in
+		plus)
+			if [ "$(uci -q get "$_sm_pkg.$_sm_sec.urltest_enabled" 2>/dev/null)" = "1" ]; then
+				printf 'urltest'
+			elif [ "$(uci -q show "$_sm_pkg.$_sm_sec.subscription_urls" 2>/dev/null | grep -c '=')" -gt 0 ] 2>/dev/null; then
+				printf 'subscription'
+			else
+				printf 'selector'
+			fi
+			;;
+		*)
+			_sm_ct=$(uci -q get "$_sm_pkg.$_sm_sec.proxy_config_type" 2>/dev/null)
+			printf '%s' "${_sm_ct:-selector}"
+			;;
+	esac
+}
+
+ACTIVE_PROBE_CACHE="/tmp/podkop_bot/luci_active_probe.json"
+
+# get active section from the bot's own state file (TZ 4.2)
+_active_section() {
+	cat /tmp/podkop_bot/active_section 2>/dev/null || echo "main"
+}
+
+# -- runtime_sections: enumerate every proxy section of the active variant, with
+# its Mixed-Proxy port/endpoint and mode, so Runtime can probe each independently
+# (main:2080, youtube:2081, …). variant-aware type detection mirrors the bot's
+# get_section_type (connection_type/action + mode). Sections without Mixed Proxy
+# are listed as not runtime-capable with a reason, not hidden.
+method_runtime_sections() {
+	_variant=$(_cached_status | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+	[ -z "$_variant" ] && _variant="podkop"
+	_pkg=$(podkop_uci_pkg "$_variant")
+	_active=$(_active_section)
+	_lan=$(uci -q get network.lan.ipaddr 2>/dev/null); [ -z "$_lan" ] && _lan="192.168.1.1"
+
+	# degraded if the variant's UCI package doesn't exist (clean/migrating system)
+	if ! uci -q show "$_pkg" >/dev/null 2>&1; then
+		printf '{"ok":true,"available":false,"reason":"uci_missing","detail":"UCI package %s not found","action":"install_configure_podkop","variant":"%s","uci_pkg":"%s"}\n' \
+			"$_pkg" "$_variant" "$_pkg"
+		return
+	fi
+
+	# Build a port→listen_ip map in ONE jq pass over the sing-box config, instead
+	# of calling _resolve_proxy_ip (which re-parses the whole config with jq) once
+	# per section. On weak routers with several sections this avoids N× jq/flash
+	# I/O. Falls back to LAN IP per port when the config has no listen for it.
+	_port_ip_map=""
+	_cfg="/etc/sing-box/config.json"
+	if [ -f "$_cfg" ] && command -v jq >/dev/null 2>&1; then
+		_port_ip_map=$(jq -r '.inbounds[]? | select(.listen_port != null) | "\(.listen_port)=\(.listen // "")"' "$_cfg" 2>/dev/null)
+	fi
+	# resolve a port to its listen IP using the prebuilt map (fallback: LAN)
+	_ip_for_port() {
+		_ifp_ip=$(printf '%s\n' "$_port_ip_map" | awk -F= -v p="$1" '$1==p{print $2; exit}')
+		{ [ -z "$_ifp_ip" ] || [ "$_ifp_ip" = "0.0.0.0" ] || [ "$_ifp_ip" = "::" ]; } && _ifp_ip="$_lan"
+		printf '%s' "$_ifp_ip"
+	}
+
+	# primary = first proxy section (tier1 source), mirrors bot _resolve_primary_section
+	_primary=""
+	_secs_json=""
+	_first=1
+	for _s in $(uci -q show "$_pkg" 2>/dev/null | sed -n "s/^${_pkg}\.\([^.]*\)=section$/\1/p"); do
+		# determine connection/action type
+		if [ "$_variant" = "plus" ]; then
+			_ct=$(uci -q get "$_pkg.$_s.action" 2>/dev/null); [ -z "$_ct" ] && _ct="proxy"
+		else
+			_ct=$(uci -q get "$_pkg.$_s.connection_type" 2>/dev/null); [ -z "$_ct" ] && _ct="proxy"
+		fi
+		[ "$_ct" = "proxy" ] || continue   # only proxy sections are probeable
+
+		[ -z "$_primary" ] && _primary="$_s"
+		_mode=$(_section_mode "$_variant" "$_pkg" "$_s")
+		_mpe=$(uci -q get "$_pkg.$_s.mixed_proxy_enabled" 2>/dev/null)
+		_port=$(uci -q get "$_pkg.$_s.mixed_proxy_port" 2>/dev/null)
+		_role="extra"; [ "$_s" = "$_primary" ] && _role="primary"
+
+		if [ "$_mpe" = "1" ] && [ -n "$_port" ]; then
+			# same IP resolution as active_probe, so the shown endpoint matches the
+			# one actually probed (sing-box may listen on 127.0.0.1, not LAN)
+			_ep_ip=$(_ip_for_port "$_port")
+			_ep="socks5h://$_ep_ip:$_port"
+			_row=$(printf '{"name":%s,"role":"%s","type":"proxy","mode":"%s","mixed_proxy_enabled":true,"port":%s,"endpoint":%s,"enabled_for_runtime":true}' \
+				"$(_json_str "$_s")" "$_role" "$_mode" "$_port" "$(_json_str "$_ep")")
+		else
+			_row=$(printf '{"name":%s,"role":"%s","type":"proxy","mode":"%s","mixed_proxy_enabled":false,"port":"","endpoint":"","enabled_for_runtime":false,"reason":"mixed_proxy_disabled","action":"enable_mixed_proxy"}' \
+				"$(_json_str "$_s")" "$_role" "$_mode")
+		fi
+		[ "$_first" = "1" ] && _first=0 || _secs_json="$_secs_json,"
+		_secs_json="$_secs_json$_row"
+	done
+
+	printf '{"ok":true,"available":true,"variant":"%s","uci_pkg":"%s","active_section":%s,"primary_section":%s,"sections":[%s]}\n' \
+		"$_variant" "$_pkg" "$(_json_str "$_active")" "$(_json_str "$_primary")" "$_secs_json"
+}
+
+# -- podkop_update_check: check the installed Podkop/fork for a newer release.
+# Read-only. variant → repo map (mirrors the bot's PODKOP_GITHUB_REPO); current
+# version from install.sh status; latest via GitHub API with direct→SOCKS
+# fallback. Degraded-safe on any network failure. Overview reads this for a
+# compact badge; the Update tab for the full block.
+_podkop_repo_for() {
+	case "$1" in
+		plus)     printf 'ushan0v/podkop-plus' ;;
+		netshift) printf 'yandexru45/netshift' ;;
+		*)        printf 'itdoginfo/podkop' ;;
+	esac
+}
+_podkop_name_for() {
+	case "$1" in
+		plus)     printf 'Podkop Plus' ;;
+		netshift) printf 'NetShift' ;;
+		*)        printf 'Podkop' ;;
+	esac
+}
+method_podkop_update_check() {
+	_read_input
+	_status=$(_cached_status)
+	_variant=$(printf '%s' "$_status" | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p'); [ -z "$_variant" ] && _variant="podkop"
+	_cur=$(printf '%s' "$_status" | sed -n 's/.*"podkop_version":"\([^"]*\)".*/\1/p')
+	_repo=$(_podkop_repo_for "$_variant")
+	_name=$(_podkop_name_for "$_variant")
+	_repo_url="https://github.com/$_repo"
+	_rel_url="$_repo_url/releases"
+	_api="https://api.github.com/repos/$_repo/releases/latest"
+
+	_latest=""; _via="none"
+	if command -v curl >/dev/null 2>&1; then
+		_latest=$(curl -fsS --connect-timeout 3 --max-time 6 "$_api" 2>/dev/null | sed -n 's/.*"tag_name"[: ]*"\([^"]*\)".*/\1/p' | head -1)
+		[ -n "$_latest" ] && _via="direct"
+	fi
+	if [ -z "$_latest" ]; then
+		_pkg=$(podkop_uci_pkg "$_variant")
+		_psec=""
+		for _cand in $(uci -q show "$_pkg" 2>/dev/null | sed -n "s/^${_pkg}\.\([^.]*\)=section$/\1/p"); do
+			if [ "$_variant" = "plus" ]; then _ct=$(uci -q get "$_pkg.$_cand.action" 2>/dev/null); [ -z "$_ct" ] && _ct="proxy"
+			else _ct=$(uci -q get "$_pkg.$_cand.connection_type" 2>/dev/null); [ -z "$_ct" ] && _ct="proxy"; fi
+			[ "$_ct" = "proxy" ] && { _psec="$_cand"; break; }
+		done
+		_sp=$(uci -q get "$_pkg.$_psec.mixed_proxy_port" 2>/dev/null)
+		if [ -n "$_sp" ] && command -v curl >/dev/null 2>&1; then
+			_sip=$(_resolve_proxy_ip "$_sp")
+			_latest=$(curl -fsS --proxy "socks5h://$_sip:$_sp" --connect-timeout 4 --max-time 8 "$_api" 2>/dev/null | sed -n 's/.*"tag_name"[: ]*"\([^"]*\)".*/\1/p' | head -1)
+			[ -n "$_latest" ] && _via="socks"
+		fi
+	fi
+
+	_now=$(date +%s 2>/dev/null || echo 0)
+	if [ -z "$_latest" ]; then
+		printf '{"ok":true,"available":false,"reason":"github_unreachable","detail":"Could not check releases via direct or SOCKS","action":"retry_later","variant":"%s","name":"%s","repo":"%s","repo_url":"%s","releases_url":"%s","current":"%s"}\n' \
+			"$_variant" "$_name" "$_repo" "$_repo_url" "$_rel_url" "$_cur"
+		return
+	fi
+	# normalise for COMPARISON the way the bot does (podkop_bot.sh:3441): strip a
+	# leading v, an OpenWrt package revision (-rN), and anything after the first
+	# dash. So "0.9.2-r1" compares equal to "0.9.2" (same release, packaging rev).
+	# The full strings are still shown to the user; only the comparison is trimmed.
+	_curn=$(printf '%s' "$_cur" | sed 's/^v//; s/-r[0-9]*$//' | cut -d'-' -f1)
+	_latn=$(printf '%s' "$_latest" | sed 's/^v//; s/-r[0-9]*$//' | cut -d'-' -f1)
+	_avail=false
+	[ -n "$_curn" ] && [ "$_curn" != "$_latn" ] && _avail=true
+	printf '{"ok":true,"available":true,"variant":"%s","name":"%s","repo":"%s","repo_url":"%s","releases_url":"%s","current":"%s","latest":"%s","update_available":%s,"via":"%s","checked_at":%s}\n' \
+		"$_variant" "$_name" "$_repo" "$_repo_url" "$_rel_url" "$_cur" "$_latest" "$_avail" "$_via" "$_now"
+}
+
+# -- active_probe: the Runtime tab's core. Probes the USER's active outbound (the
+# tunnel) through the active section's Mixed Proxy and reports geo, per-service
+# reachability (Google/ChatGPT/Claude/YouTube/Telegram), download speed, and TSPU
+# block detection — diagnostics that podkop/plus and the Clash view do NOT show.
+# Reuses the bot's probe logic (TZ 4.2). Slow (downloads 1 MB, hits 6 services),
+# so it's run on demand and cached. {cached:true} returns the last cached result.
+method_active_probe() {
+	_read_input
+	_use_cache=$(_field cached)
+	_req_section=$(_field section)
+	mkdir -p /tmp/podkop_bot 2>/dev/null
+
+	# resolve active section + Mixed Proxy endpoint. Section precedence (roadmap 3):
+	# explicit request → active_section file → primary → main.
+	_variant=$(_cached_status | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+	_pkg=$(podkop_uci_pkg "${_variant:-podkop}")
+	if [ -n "$_req_section" ]; then
+		_sec="$_req_section"
+	else
+		_sec=$(_active_section)
+	fi
+	# resolver: requested → active → primary → main. Try each until one is a valid
+	# UCI section, so a stale active_section file or bad request degrades to a real
+	# section instead of probing a nonexistent one.
+	if ! uci -q get "$_pkg.$_sec" >/dev/null 2>&1; then
+		_sec=$(_active_section)
+		if ! uci -q get "$_pkg.$_sec" >/dev/null 2>&1; then
+			for _cand in $(uci -q show "$_pkg" 2>/dev/null | sed -n "s/^${_pkg}\.\([^.]*\)=section$/\1/p"); do
+				if [ "$_variant" = "plus" ]; then _ct=$(uci -q get "$_pkg.$_cand.action" 2>/dev/null); [ -z "$_ct" ] && _ct="proxy"
+				else _ct=$(uci -q get "$_pkg.$_cand.connection_type" 2>/dev/null); [ -z "$_ct" ] && _ct="proxy"; fi
+				[ "$_ct" = "proxy" ] && { _sec="$_cand"; break; }
+			done
+			uci -q get "$_pkg.$_sec" >/dev/null 2>&1 || _sec="main"
+		fi
+	fi
+	if ! uci -q get "$_pkg.$_sec" >/dev/null 2>&1; then
+		printf '{"ok":true,"available":false,"reason":"no_section","detail":"no valid proxy section found","action":"configure_podkop"}\n'
+		return
+	fi
+	_mp_en=$(uci -q get "$_pkg.$_sec.mixed_proxy_enabled" 2>/dev/null)
+	_port=$(uci -q get "$_pkg.$_sec.mixed_proxy_port" 2>/dev/null)
+
+	# per-section cache key (roadmap 4): section + port, so main/youtube/discord
+	# never share a cache entry.
+	_cache_key="${_sec}_${_port:-noport}"
+	_sec_cache="/tmp/podkop_bot/luci_active_probe_${_cache_key}.json"
+
+	# cache-only mode: cached:true returns the cached probe if present, else a
+	# no_cache degraded response — it must NEVER fall through to a fresh (heavy)
+	# probe. Fresh probes only run when cached is not "true" (explicit button).
+	if [ "$_use_cache" = "true" ]; then
+		if [ -f "$_sec_cache" ]; then
+			cat "$_sec_cache"; printf '\n'; return
+		fi
+		printf '{"ok":true,"available":false,"reason":"no_cache","section":"%s","port":%s,"cache_key":"%s","detail":"No cached probe for this section","action":"run_probe"}\n' \
+			"$_sec" "${_port:-0}" "$_cache_key"
+		return
+	fi
+
+	# prerequisites (TZ 12.4): proxy section + mixed_proxy on + port + sing-box up
+	if [ "$_mp_en" != "1" ] || [ -z "$_port" ]; then
+		printf '{"ok":true,"available":false,"reason":"mixed_proxy_off","detail":"Mixed Proxy not enabled on section %s","section":"%s","action":"enable Mixed Proxy"}\n' "$_sec" "$_sec"
+		return
+	fi
+	_ip=$(_resolve_proxy_ip "$_port")
+	_proxy="socks5h://$_ip:$_port"
+	_human_name=""
+
+	# --- geo of the exit (country / provider) via ipinfo through the tunnel ---
+	_geo=$(curl -s -k -x "$_proxy" --connect-timeout 6 --max-time 12 "https://ipinfo.io/json" 2>/dev/null)
+	_g_ip=$(printf '%s' "$_geo" | sed -n 's/.*"ip"[: ]*"\([^"]*\)".*/\1/p' | head -1)
+	_g_country=$(printf '%s' "$_geo" | sed -n 's/.*"country"[: ]*"\([^"]*\)".*/\1/p' | head -1)
+	_g_org=$(printf '%s' "$_geo" | sed -n 's/.*"org"[: ]*"\([^"]*\)".*/\1/p' | head -1)
+
+	# --- per-service reachability through the tunnel ---
+	# emits JSON array of {name, status, code}; status: ok|blocked|timeout|other
+	_svc_json="["
+	_svc_first=1
+	_probe_svc() {
+		_sname="$1"; _surl="$2"; _ok_codes="$3"; _geo_kind="$4"
+		# YouTube's sw.js_data returns the country YouTube thinks we're in; capture
+		# the body for those services so we can show "видит нас как: RU" (like the
+		# bot does for YouTube). Others probe headers-only.
+		if [ -n "$_geo_kind" ]; then
+			_resp=$(curl -s -k -o /tmp/podkop_luci_svc_${_sec}_$$.tmp -w '%{http_code} %{time_total}' -x "$_proxy" \
+				--connect-timeout 6 --max-time 12 "$_surl" 2>/dev/null)
+		else
+			_resp=$(curl -s -k -o /dev/null -w '%{http_code} %{time_total}' -x "$_proxy" \
+				--connect-timeout 6 --max-time 12 "$_surl" 2>/dev/null)
+		fi
+		_c=$(printf '%s' "$_resp" | awk '{print $1}')
+		_ct=$(printf '%s' "$_resp" | awk '{print $2}')
+		_cms=$(awk -v s="$_ct" 'BEGIN{ printf "%d", (s*1000) }' 2>/dev/null); [ -z "$_cms" ] && _cms=0
+		case " $_ok_codes " in
+			*" $_c "*)         _sstat="ok" ;;
+			*) case "$_c" in
+				''|000)        _sstat="timeout" ;;
+				403|451)       _sstat="blocked" ;;
+				*)             _sstat="other" ;;
+			   esac ;;
+		esac
+		# per-service detected country (currently YouTube only, via sw.js_data)
+		_sgeo=""
+		if [ "$_geo_kind" = "youtube" ] && [ "$_c" = "200" ] && [ -s /tmp/podkop_luci_svc_${_sec}_$$.tmp ]; then
+			_sgeo=$(tail -n +3 /tmp/podkop_luci_svc_${_sec}_$$.tmp 2>/dev/null | jq -r '.[0][2][0][0][1] // empty' 2>/dev/null)
+		fi
+		rm -f /tmp/podkop_luci_svc_${_sec}_$$.tmp 2>/dev/null
+		[ "$_svc_first" = "1" ] && _svc_first=0 || _svc_json="$_svc_json,"
+		_svc_json="$_svc_json{\"name\":$(_json_str "$_sname"),\"status\":\"$_sstat\",\"code\":\"${_c:-000}\",\"ms\":$_cms,\"geo\":$(_json_str "$_sgeo")}"
+	}
+	_probe_svc "Telegram API" "https://api.telegram.org" "200 302"
+	_probe_svc "GitHub"       "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" "200"
+	_probe_svc "ChatGPT"      "https://api.openai.com/v1/models" "200 401"
+	_probe_svc "Claude"       "https://api.anthropic.com/v1/models" "200 401"
+	_probe_svc "Gemini"       "https://gemini.google.com/app" "200"
+	_probe_svc "YouTube"      "https://www.youtube.com/sw.js_data" "200" "youtube"
+	_probe_svc "Discord"      "https://discord.com/api/v9/gateway" "200"
+	_svc_json="$_svc_json]"
+
+	# --- throughput + TSPU block detection (bot's two-stage test, TZ) ---
+	# Stage 1: 32 KB — РКН/ТСПУ drops after ~16 KB. ≤20 KB received = block16k.
+	_raw1=$(curl -s -k -x "$_proxy" --connect-timeout 6 --max-time 15 \
+		-H "Range: bytes=0-32767" -o /dev/null \
+		-w "%{size_download}" "https://speed.cloudflare.com/__down?bytes=32768" 2>/dev/null)
+	_s1=$(printf '%s' "$_raw1" | grep -oE '^[0-9]+' || echo 0); _s1="${_s1:-0}"
+	_s1kb=$(awk "BEGIN{printf \"%d\", ${_s1}/1024}")
+	_speed_status="ok"; _speed_mbps="0.00"
+	if [ "${_s1:-0}" -eq 0 ]; then
+		_speed_status="blocked"
+	elif [ "${_s1kb:-0}" -le 20 ]; then
+		_speed_status="block16k"
+	else
+		# Stage 2: 1 MB — accurate speed
+		_raw2=$(curl -s -k -x "$_proxy" --connect-timeout 6 --max-time 60 \
+			-H "Range: bytes=0-1048575" -o /dev/null \
+			-w "%{speed_download}" "https://speed.cloudflare.com/__down?bytes=1048576" 2>/dev/null)
+		_bps=$(printf '%s' "$_raw2" | grep -oE '^[0-9]+(\.[0-9]+)?' || echo 0)
+		_speed_mbps=$(awk "BEGIN{printf \"%.2f\", ${_bps:-0}*8/1000000}")
+	fi
+
+	# --- active server discovery + server count via Clash API (/proxies) ---
+	# Section-aware, mirrors the bot's get_selector_tag: exact section group →
+	# "<sec>-out" → "<sec>-1-out" → selector/urltest groups of THIS section →
+	# leaf outbounds of this section. Never the first global selector (that breaks
+	# multi-section configs). NetShift URL mode may have no Selector at all — the
+	# leaf outbound is commonly "<section>-out".
+	_srv_count=0
+	_srv_delay=""
+	_clash_addr=$(jq -r '.experimental.clash_api.external_controller // empty' /etc/sing-box/config.json 2>/dev/null)
+	[ -z "$_clash_addr" ] && _clash_addr="$(uci -q get network.lan.ipaddr 2>/dev/null):9090"
+	_clash_secret=$(uci -q get "$_pkg.settings.yacd_secret_key" 2>/dev/null)
+	_clash_hdr=""
+	[ -n "$_clash_secret" ] && _clash_hdr="Authorization: Bearer $_clash_secret"
+	_proxy_cfg_type=$(_section_mode "$_variant" "$_pkg" "$_sec"); [ -z "$_proxy_cfg_type" ] && _proxy_cfg_type="selector"
+	_proxies=$(curl -s --connect-timeout 3 --max-time 8 ${_clash_hdr:+-H "$_clash_hdr"} "http://${_clash_addr}/proxies" 2>/dev/null)
+	_proxy_name=""
+	if [ -n "$_proxies" ] && [ "$_proxies" != "null" ] && command -v jq >/dev/null 2>&1; then
+		_sel=$(printf '%s' "$_proxies" | jq -r --arg s "$_sec" '
+			.proxies as $p |
+			if ($p[$s] and (($p[$s].type == "Selector") or ($p[$s].type == "URLTest"))) then $s
+			elif $p[$s + "-out"] then ($s + "-out")
+			elif $p[$s + "-1-out"] then ($s + "-1-out")
+			else (
+				$p | to_entries
+				| map(select((.key | startswith($s)) and ((.value.type == "Selector") or (.value.type == "URLTest"))))
+				| sort_by((.value.all // []) | length) | last | .key
+			) // (
+				$p | to_entries
+				| map(select((.key | startswith($s)) and (.value.type != "Direct") and (.value.type != "Block") and (.value.type != "DNS")))
+				| .[0].key
+			) // empty
+			end' 2>/dev/null)
+		if [ -n "$_sel" ]; then
+			_sel_type=$(printf '%s' "$_proxies" | jq -r --arg s "$_sel" '.proxies[$s].type // empty' 2>/dev/null)
+			case "$_sel_type" in
+				Selector|URLTest)
+					_proxy_name=$(printf '%s' "$_proxies" | jq -r --arg s "$_sel" '.proxies[$s].now // empty' 2>/dev/null)
+					[ -z "$_proxy_name" ] && _proxy_name=$(printf '%s' "$_proxies" | jq -r --arg s "$_sel" '(.proxies[$s].all // [])[0] // empty' 2>/dev/null)
+					# recurse to the real leaf (nested selector→urltest→…→server)
+					[ -n "$_proxy_name" ] && _proxy_name=$(_resolve_leaf_tag "$_proxy_name" "$_proxies")
+					_c=$(printf '%s' "$_proxies" | jq -r --arg s "$_sel" '[(.proxies[$s].all // [])[] | ascii_downcase | select(.!="direct" and .!="block" and .!="dns-out")]|length' 2>/dev/null)
+					[ -n "$_c" ] && [ "$_c" -gt 0 ] 2>/dev/null && _srv_count="$_c"
+					;;
+				*)
+					_proxy_name="$_sel"
+					_srv_count=1
+					;;
+			esac
+		fi
+		# URL mode fallback: when no selector exists, try conventional leaf tags.
+		if [ -z "$_proxy_name" ] && [ "$_proxy_cfg_type" = "url" ]; then
+			for _cand in "$_sec-out" "$_sec-1-out"; do
+				_exists=$(printf '%s' "$_proxies" | jq -r --arg n "$_cand" 'if .proxies[$n] then "1" else "" end' 2>/dev/null)
+				if [ "$_exists" = "1" ]; then _proxy_name="$_cand"; _srv_count=1; break; fi
+			done
+		fi
+		# Delay to the active leaf (not service latency). Encode the path segment.
+		if [ -n "$_proxy_name" ]; then
+			_penc=$(printf '%s' "$_proxy_name" | jq -sRr @uri 2>/dev/null)
+			_dl=$(curl -s --connect-timeout 3 --max-time 8 ${_clash_hdr:+-H "$_clash_hdr"} \
+				"http://${_clash_addr}/proxies/${_penc}/delay?timeout=5000&url=http://www.gstatic.com/generate_204" 2>/dev/null)
+			_srv_delay=$(printf '%s' "$_dl" | jq -r '.delay // empty' 2>/dev/null)
+		fi
+	fi
+
+	# UCI fallback count. NetShift URL mode is a single proxy_string with no
+	# subscription cache — Clash-only counting returned 0 despite a live outbound.
+	if [ "$_srv_count" = "0" ]; then
+		case "$_proxy_cfg_type" in
+			url|url_text)
+				_pstr=$(uci -q get "$_pkg.$_sec.proxy_string" 2>/dev/null)
+				if [ -n "$_pstr" ]; then
+					_ucnt=$(printf '%s\n' "$_pstr" | grep -cE '^[a-zA-Z0-9+.-]+://')
+					[ -n "$_ucnt" ] && [ "$_ucnt" -gt 0 ] 2>/dev/null && _srv_count="$_ucnt" || _srv_count=1
+				fi
+				;;
+			*)
+				_lcnt=$(_section_proxy_links "$_pkg" "$_sec" "$_proxy_cfg_type" | grep -oE '[a-zA-Z0-9+.-]+://[^[:space:]]+' | wc -l | tr -d ' ')
+				[ -n "$_lcnt" ] && [ "$_lcnt" -gt 0 ] 2>/dev/null && _srv_count="$_lcnt"
+				;;
+		esac
+	fi
+	# If Clash didn't expose a URL-mode tag, still show the conventional tag so the
+	# frontend isn't blank; the human name can still come from proxy_string.
+	if [ -z "$_proxy_name" ] && [ "$_proxy_cfg_type" = "url" ]; then
+		_proxy_name="$_sec-out"
+	fi
+
+	# tag → human name, mirroring the bot's display_proxy_name resolver (TZ 4.2),
+	# with an added config-level fallback so LuCI degrades independently of the
+	# bot's runtime caches:
+	#   1. bot's tag_name_cache (covers selector/urltest/url, all modes)
+	#   2. #fragment of the matching UCI proxy link
+	#   3. bot's tag_uri_cache → "[type] host:port"
+	#   4. /etc/sing-box/config.json .outbounds[].tag → "[type] host:port"
+	#   5. raw tag (frontend adds "Сервер №N" cosmetics)
+	# Caches are "tag=value"; looked up by exact string (names may hold regex
+	# metacharacters/emoji), never grep "^tag=".
+	if [ -z "$_human_name" ] && [ -n "$_proxy_name" ] && [ -f /tmp/podkop_bot/tag_name_cache.txt ]; then
+		_human_name=$(_cache_get /tmp/podkop_bot/tag_name_cache.txt "$_proxy_name")
+	fi
+	if [ -z "$_human_name" ]; then
+		_idx=$(printf '%s' "$_proxy_name" | sed -n "s/^${_sec}-\([0-9][0-9]*\)-out$/\1/p")
+		[ "$_proxy_name" = "${_sec}-out" ] && _idx=1
+		[ -z "$_idx" ] && [ "$_proxy_cfg_type" = "url" ] && _idx=1
+		if [ -n "$_idx" ]; then
+			_zidx=$((_idx - 1))
+			_li=0
+			for _lnk in $(_section_proxy_links "$_pkg" "$_sec" "$_proxy_cfg_type"); do
+				if [ "$_li" = "$_zidx" ]; then
+					case "$_lnk" in
+						*#*) _human_name=$(_url_decode_fragment "${_lnk##*#}") ;;
+					esac
+					break
+				fi
+				_li=$((_li + 1))
+			done
+		fi
+	fi
+	# Fallback to "[type] host:port" — bot's tag_uri_cache, then sing-box config.
+	if [ -z "$_human_name" ] && [ -n "$_proxy_name" ] && [ -f /tmp/podkop_bot/tag_uri_cache.txt ]; then
+		_uri=$(_cache_get /tmp/podkop_bot/tag_uri_cache.txt "$_proxy_name")
+		if [ -n "$_uri" ] && [ "$_uri" != "N/A" ]; then
+			_utype=$(printf '%s' "$_uri" | cut -d: -f1)
+			_uhp=$(printf '%s' "${_uri%%#*}" | sed -n 's|^[^:]*://\([^@/?]*@\)\?\([^/?#]*\).*|\2|p')
+			[ -n "$_uhp" ] && _human_name="[$_utype] $_uhp"
+		fi
+	fi
+	# Config-level fallback: independent of bot caches (may be missing/stale).
+	if [ -z "$_human_name" ] && [ -n "$_proxy_name" ]; then
+		_cfg_addr=$(_singbox_outbound_addr "$_proxy_name")
+		[ -n "$_cfg_addr" ] && _human_name="$_cfg_addr"
+	fi
+
+	# --- IP type / reputation. Two honest, key-free signals:
+	# (1) datacenter heuristic from the exit org/ASN string (Kamatera, DigitalOcean,
+	#     AWS, OVH, Hetzner, …). Not fraud scoring — just "hosting vs residential".
+	#     (ip-api's proxy/hosting booleans are a PAID field, so not usable here.)
+	# (2) Google captcha / "unusual traffic" — behavioural: Google distrusts the IP.
+	_abuse="unknown"; _abuse_why=""
+	# (1) datacenter by org
+	if [ -n "$_g_org" ]; then
+		if printf '%s' "$_g_org" | grep -qiE 'kamatera|digitalocean|amazon|aws|google cloud|microsoft|azure|ovh|hetzner|linode|vultr|contabo|leaseweb|choopa|ihor|hosting|datacenter|data center|colo|server|cloud|m247|scaleway|oracle'; then
+			_abuse="flagged"; _abuse_why="datacenter"
+		fi
+	fi
+	# (2) Google captcha — write to temp file so curl's exit code stays intact and
+	# we don't hold hundreds of KB in a variable. Only sets clean if not flagged.
+	if [ "$_abuse" != "flagged" ]; then
+		_gtmp="/tmp/podkop_luci_google_${_sec}_$$.html"
+		curl -s -k -x "$_proxy" --connect-timeout 5 --max-time 8 --max-filesize 524288 \
+			-A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+			"https://www.google.com/search?q=ip" -o "$_gtmp" 2>/dev/null
+		if [ -s "$_gtmp" ]; then
+			if grep -m1 -qiE 'unusual traffic from|/sorry/|unaddressed abuse|our systems have detected' "$_gtmp"; then
+				_abuse="flagged"; _abuse_why="google_captcha"
+			else
+				_abuse="clean"
+			fi
+		fi
+		rm -f "$_gtmp" 2>/dev/null
+	fi
+
+	_now=$(date +%s 2>/dev/null || echo 0)
+	[ -z "$_srv_delay" ] && _srv_delay="null"
+	case "$_srv_delay" in ''|*[!0-9]*) _srv_delay="null" ;; esac
+	_out=$(printf '{"ok":true,"available":true,"section":"%s","port":%s,"cache_key":"%s","endpoint":%s,"proxy_name":%s,"proxy_human":%s,"server_delay":%s,"abuse":"%s","abuse_why":"%s","geo":{"ip":%s,"country":%s,"org":%s},"services":%s,"speed":{"status":"%s","mbps":"%s"},"servers":%s,"checked_at":%s}' \
+		"$_sec" "${_port:-0}" "$_cache_key" "$(_json_str "$_proxy")" "$(_json_str "$_proxy_name")" "$(_json_str "$_human_name")" "$_srv_delay" "$_abuse" "$_abuse_why" "$(_json_str "$_g_ip")" "$(_json_str "$_g_country")" "$(_json_str "$_g_org")" \
+		"$_svc_json" "$_speed_status" "$_speed_mbps" "$_srv_count" "$_now")
+	printf '%s' "$_out" > "$_sec_cache" 2>/dev/null
+	printf '%s\n' "$_out"
+}
+
+case "$1" in
+	list)
+		echo '{ "list": {}, "status": {}, "service": { "action": "start_bot" }, "installer": { "action": "status", "config_path": "x", "config_inline": "x" }, "logs": { "offset": 0 }, "bot_logs": { "lines": 200 }, "resources": {}, "transport_state": {}, "transport_probe": { "target": "x" }, "set_transport_policy": { "policy": "x" }, "fallback_crud": { "op": "x", "value": "x", "index": 0 }, "list_interfaces": {}, "set_uci_field": { "field": "x", "value": "x" }, "set_tier1_port": { "value": "x" }, "active_probe": { "cached": "x", "section": "x" }, "runtime_sections": {}, "podkop_update_check": {}, "app_info": {}, "singbox_info": {}, "check_update": { "force": "x" }, "update_paste": { "body": "x" }, "test_telegram": { "token": "x" }, "ensure_mixed_proxy": { "section": "x" }, "test_github": {} }'
+		;;
+	call)
+		case "$2" in
+			status)               method_status ;;
+			service)              method_service ;;
+			installer)            method_installer ;;
+			logs)                 method_logs ;;
+			bot_logs)             method_bot_logs ;;
+			resources)            method_resources ;;
+			transport_state)      method_transport_state ;;
+			transport_probe)      method_transport_probe ;;
+			set_transport_policy) method_set_transport_policy ;;
+			fallback_crud)        method_fallback_crud ;;
+			list_interfaces)      method_list_interfaces ;;
+			set_uci_field)        method_set_uci_field ;;
+			set_tier1_port)       method_set_tier1_port ;;
+			active_probe)         method_active_probe ;;
+			runtime_sections)     method_runtime_sections ;;
+			podkop_update_check)  method_podkop_update_check ;;
+			app_info)             method_app_info ;;
+			singbox_info)         method_singbox_info ;;
+			check_update)         method_check_update ;;
+			update_paste)         method_update_paste ;;
+			test_telegram)        method_test_telegram ;;
+			ensure_mixed_proxy)   method_ensure_mixed_proxy ;;
+			test_github)          method_test_github ;;
+			*) echo '{"error":"unknown method"}'; exit 1 ;;
+		esac
+		;;
+	*)
+		echo '{"error":"unknown command"}'; exit 1
+		;;
+esac

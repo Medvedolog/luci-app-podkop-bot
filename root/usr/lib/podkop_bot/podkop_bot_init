@@ -1,0 +1,91 @@
+#!/bin/sh /etc/rc.common
+# podkop_bot init.d — fixed to reliably stop a FORKING bot.
+#
+# The bot forks a health daemon + startup-notify child that keep their own
+# getUpdates poll. procd supervises only the main PID, so a plain procd stop
+# leaves those children alive → two getUpdates pollers on one token → Telegram
+# 409 Conflict, flapping routes, duplicated processes after every restart.
+#
+# Fix: an explicit stop_service that kills ALL podkop_bot processes (main +
+# forked children), plus a clean start that waits for the old ones to die.
+
+START=99
+STOP=10
+USE_PROCD=1
+PROG=/usr/bin/podkop_bot
+
+# Kill every running podkop_bot process (main + forked daemons).
+# Matches the interpreter line "/bin/sh /usr/bin/podkop_bot" — busybox shows the
+# process as {podkop_bot}, so killall by name does NOT work; we match cmdline.
+_kill_all_podkop_bot() {
+    local _pids _p
+    # Collect PIDs whose /proc/<pid>/cmdline contains the bot path, excluding self.
+    _pids=""
+    for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        [ "$_p" = "$$" ] && continue
+        if grep -qa 'podkop_bot' "/proc/$_p/cmdline" 2>/dev/null; then
+            # skip this init script itself (cmdline contains rc.common/init path)
+            grep -qa '/etc/init.d/podkop_bot\|rc.common' "/proc/$_p/cmdline" 2>/dev/null && continue
+            grep -qa '/usr/bin/podkop_bot' "/proc/$_p/cmdline" 2>/dev/null && _pids="$_pids $_p"
+        fi
+    done
+
+    [ -z "$_pids" ] && return 0
+
+    # Graceful TERM first
+    kill $_pids 2>/dev/null
+    # Wait up to 8s for them to exit
+    local _i=0
+    while [ "$_i" -lt 8 ]; do
+        local _alive=""
+        for _p in $_pids; do
+            [ -d "/proc/$_p" ] && _alive="$_alive $_p"
+        done
+        [ -z "$_alive" ] && break
+        sleep 1; _i=$((_i + 1))
+    done
+
+    # Force-kill any survivors
+    for _p in $_pids; do
+        [ -d "/proc/$_p" ] && kill -9 "$_p" 2>/dev/null
+    done
+
+    # Drop both PID files so the next start isn't blocked:
+    # podkop_bot.pid = single-instance lock (written by bot at startup)
+    # bot.pid        = main PID used by safe_stop_bot in the installer
+    rm -f /tmp/podkop_bot/podkop_bot.pid /tmp/podkop_bot/bot.pid 2>/dev/null
+}
+
+start_service() {
+    # If a healthy bot instance is already running under the lock file,
+    # skip the kill — avoid disrupting a running bot on redundant "start".
+    # Otherwise kill stale processes and clean the lock before starting fresh.
+    local _lock_pid
+    _lock_pid=$(cat /tmp/podkop_bot/podkop_bot.pid 2>/dev/null)
+    if [ -n "$_lock_pid" ] && [ -d "/proc/$_lock_pid" ] &&        grep -qa '/usr/bin/podkop_bot' "/proc/$_lock_pid/cmdline" 2>/dev/null; then
+        return 0  # healthy instance running — do not disturb it
+    else
+        _kill_all_podkop_bot
+        sleep 1
+        rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null
+    fi
+
+    procd_open_instance
+    procd_set_param command "$PROG"
+    # respawn: 3600s window, max 5 crashes, 10s delay.
+    procd_set_param respawn 3600 5 10
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}
+
+stop_service() {
+    # procd will signal the supervised main PID, but we must also reap the
+    # forked health/poll children that procd does not track.
+    _kill_all_podkop_bot
+}
+
+reload_service() {
+    stop
+    start
+}

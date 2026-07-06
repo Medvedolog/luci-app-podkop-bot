@@ -1,0 +1,86 @@
+/*
+ * luci-app-podkop-bot — shared responsive styles.
+ *
+ * The status/info rows throughout the app are label↔value pairs. On wide
+ * screens they sit on one line (label left, value right). On narrow phone
+ * viewports that layout forced long values (version strings, provider names)
+ * to wrap character-by-character and overlap the label. These classes replace
+ * the per-view inline flex styles: same look on desktop, a clean vertical
+ * stack on mobile.
+ *
+ * Naming: .pb- prefix namespaces the app so nothing here can leak into or be
+ * overridden by the active LuCI theme's own rules.
+ */
+
+.pb-row {
+	display: flex;
+	justify-content: space-between;
+	gap: 1em;
+	padding: 0.45em 0;
+	border-bottom: 1px solid rgba(127, 127, 127, 0.15);
+}
+
+/* Variant without the divider line (used by a few compact rows). */
+.pb-row--plain {
+	border-bottom: 0;
+	padding: 0.3em 0;
+}
+
+.pb-row-label {
+	color: #888;
+	/* Keep the label from being squeezed to one char per line before wrapping
+	   the value; it may still wrap on its own but stays readable. */
+	flex: 0 1 auto;
+	min-width: 0;
+}
+
+/*
+ * FONT-WEIGHT CONTRACT:
+ *   - Normal status-row values use font-weight:500 (this rule).
+ *   - Technical monospace values (SOCKS endpoints, URLs, tag/path) use
+ *     monospace + font-weight:400 (.pb-row-val--mono) for legibility — 500 on
+ *     monospace reads muddy on OpenWrt themes, especially on mobile.
+ *   Do NOT reintroduce per-element inline font-weight on value cells.
+ */
+.pb-row-val {
+	text-align: right;
+	font-weight: 500;
+	min-width: 0;
+	/* Long unbroken tokens (URLs, versions) wrap at sensible points instead of
+	   overflowing the card. */
+	overflow-wrap: anywhere;
+	word-break: break-word;
+}
+
+/* Value cells that hold a status dot + text shouldn't force the dot onto its
+   own line; let the inline content flow. */
+.pb-row-val > * {
+	vertical-align: middle;
+}
+
+/* Monospace values (endpoints, socks URLs). Slightly smaller to fit. */
+.pb-row-val--mono {
+	font-family: monospace;
+	font-size: 90%;
+	font-weight: 400;
+}
+
+/*
+ * Narrow viewport: stack label over value, both left-aligned. 480px matches the
+ * point where two-column rows start colliding on phones.
+ */
+@media (max-width: 480px) {
+	.pb-row,
+	.pb-row--plain {
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.15em;
+	}
+
+	.pb-row-val {
+		text-align: left;
+		/* Full width so multi-part values (e.g. "порт 2080 · main") wrap as a
+		   block under the label rather than hugging the right edge. */
+		width: 100%;
+	}
+}

@@ -179,7 +179,8 @@ return view.extend({
 					}, _('Открыть Мастер настройки'))
 				]));
 			}
-			if (data && data.action && data.action.label) {
+			var _hasInstallBanner = data && (data.reason === 'bot_not_installed' || data.reason === 'installer_missing');
+			if (data && data.action && data.action.label && !_hasInstallBanner) {
 				children.push(E('button', {
 					'class':'cbi-button cbi-button-action',
 					'click': ui.createHandlerFn(self, 'handleAction', data.action)

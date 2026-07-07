@@ -19,7 +19,7 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.17.0"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
+LUCI_APP_VERSION="0.17.2"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
 
 # -- degraded helper (18q.1) -------------------------------------------------
 emit_unavailable() {
@@ -135,6 +135,25 @@ bot_is_running() {
 # -- status method -----------------------------------------------------------
 method_status() {
 	if [ ! -f "$BOT_PATH" ]; then
+		# Bot not installed, but the Setup Wizard still needs the environment
+		# (OpenWrt/pkg manager/podkop variant+version/Mixed Proxy) to render
+		# steps 1–2. install.sh --action status fills those regardless of whether
+		# the bot exists, so surface them alongside the unavailable flag instead
+		# of returning a bare "bot_not_installed" (regression: wizard showed "—").
+		if [ -f "$INSTALLER_PATH" ]; then
+			_out=$(_cached_status)
+			case "$_out" in
+				\{*\})
+					_variant=$(printf '%s' "$_out" | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
+					[ -z "$_variant" ] && _variant="unknown"
+					_pkver=$(printf '%s' "$_out" | sed -n 's/.*"podkop_version":"\([^"]*\)".*/\1/p')
+					_mixed=$(emit_mixed_proxy "$_variant" "$_pkver")
+					_body=$(printf '%s' "$_out" | sed -e 's/^{//' -e 's/}$//')
+					printf '{"available":false,"reason":"bot_not_installed","detail":"Бот не установлен","action":{"label":"Установить","method":"installer","arg":"install"},%s,%s}\n' "$_mixed" "$_body"
+					return
+					;;
+			esac
+		fi
 		emit_unavailable "bot_not_installed" "Бот не установлен" "Установить" "installer" "install"
 		return
 	fi

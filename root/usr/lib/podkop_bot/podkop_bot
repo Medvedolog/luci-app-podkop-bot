@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.15.7
+# Podkop Telegram Bot v0.15.9
 # Variant-aware (original / evolution / netshift / plus), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.15.7"
+BOT_VERSION="0.15.9"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -648,6 +648,15 @@ SWITCH_LOG="${BOT_DIR}/switch_log"
 RAM_WEEK_FILE="${BOT_DIR}/ram_week"
 WEEKLY_TRAFFIC_BASE="${BOT_DIR}/weekly_traffic_base"
 WEEKLY_REPORT_LAST="${BOT_DIR}/weekly_report_last"
+# Persistent traffic accumulator: banked_dl|banked_ul|last_seen_dl|last_seen_ul.
+# Survives sing-box restarts (Clash API downloadTotal/uploadTotal are counters
+# since process start, not since boot) — updated every health_interval tick by
+# _traffic_accum_tick(), called from inside start_health_daemon()'s watchdog loop.
+TRAFFIC_ACCUM_FILE="${BOT_DIR}/traffic_accum"
+# One epoch timestamp per line, appended by _traffic_accum_tick() whenever it
+# detects a sing-box restart (Clash counter went backwards between two ticks).
+# Rotated to 8 days on each read, same convention as SWITCH_LOG.
+SB_RESTART_LOG="${BOT_DIR}/sb_restart_log"
 get_singbox_version_display() {
     # Skip cache if it contains a negative result — unknown must not be persisted.
     if [ -s "$SB_VER_CACHE" ]; then
@@ -1156,6 +1165,80 @@ _pkg_net_check() {
     [ "$_feed_rc" != "0" ] && _msg="${_msg} openwrt-feed"
     [ "$_gh_rc"   != "0" ] && _msg="${_msg} github-raw"
     printf '%s' "$_msg"; return 1
+}
+
+# _pkg_disk_check: overlay free-space pre-flight for podkop/plus updates.
+# podkop-plus's own install.sh only requires 15 MB free on /overlay
+# (REQUIRED_SPACE_KB=15360), but real-world reports put sing-box's actual
+# footprint at ~50 MB (bigger still for -extended builds with extra
+# protocols/Tailscale). On tight-flash devices (e.g. AX3000T, ~60 MB overlay)
+# the upstream check passes, opkg/apk starts removing the old sing-box and
+# unpacking the new one, and space runs out mid-install — leaving neither a
+# working old nor new binary, sing-box down, and the bot's own tunnel (and
+# thus its ability to report the failure) broken along with it.
+# Echoes a short human-readable verdict; returns 0 if enough space, 1 otherwise.
+_pkg_disk_check() {
+    local _MIN_OVERLAY_KB=51200   # 50 MB — matches real-world sing-box footprint
+    local _avail_kb
+    _avail_kb=$(df /overlay 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "$_avail_kb" ] || _avail_kb=$(df / 2>/dev/null | awk 'NR==2{print $4}')
+    case "$_avail_kb" in ''|*[!0-9]*) printf 'unknown'; return 1 ;; esac
+    if [ "$_avail_kb" -lt "$_MIN_OVERLAY_KB" ]; then
+        printf '%sMB free, ~50MB needed' "$((_avail_kb / 1024))"
+        return 1
+    fi
+    printf 'ok'; return 0
+}
+
+# _ver_is_newer OLD NEW -> returns 0 (true) only if NEW is a strictly greater
+# major.minor.patch than OLD. BusyBox ash safe (no bashisms, no arrays).
+# Guards against the case where a router is already running a locally-bumped
+# dev build ahead of what's currently published in version.txt on GitHub —
+# in that case NEW < OLD and this correctly returns 1 (not newer).
+_ver_is_newer() {
+    local _o="$1" _n="$2"
+    [ "$_o" = "$_n" ] && return 1
+    local _o1 _o2 _o3 _n1 _n2 _n3 _rest
+    _rest="$_o"; _o1="${_rest%%.*}"; _rest="${_rest#*.}"
+    _o2="${_rest%%.*}"; _o3="${_rest#*.}"
+    _rest="$_n"; _n1="${_rest%%.*}"; _rest="${_rest#*.}"
+    _n2="${_rest%%.*}"; _n3="${_rest#*.}"
+    _o1="${_o1%%[!0-9]*}"; _o2="${_o2%%[!0-9]*}"; _o3="${_o3%%[!0-9]*}"
+    _n1="${_n1%%[!0-9]*}"; _n2="${_n2%%[!0-9]*}"; _n3="${_n3%%[!0-9]*}"
+    _o1="${_o1:-0}"; _o2="${_o2:-0}"; _o3="${_o3:-0}"
+    _n1="${_n1:-0}"; _n2="${_n2:-0}"; _n3="${_n3:-0}"
+    [ "$_n1" -gt "$_o1" ] 2>/dev/null && return 0
+    [ "$_n1" -lt "$_o1" ] 2>/dev/null && return 1
+    [ "$_n2" -gt "$_o2" ] 2>/dev/null && return 0
+    [ "$_n2" -lt "$_o2" ] 2>/dev/null && return 1
+    [ "$_n3" -gt "$_o3" ] 2>/dev/null && return 0
+    return 1
+}
+
+# _bot_update_note: fetches Medvedolog/podkop_bot's version.txt + highlights.txt
+# (same source/parsing as cmd_check_update_bot) and, if a newer version is
+# published, echoes a ready-to-embed HTML line for report headers:
+#   "🆕 Доступно обновление бота: v0.16.0 — highlights text"
+# Echoes nothing (and returns 1) if up to date, unreachable, or on any parse
+# oddity — callers just skip the line, never block the report on this.
+_bot_update_note() {
+    local _bun_ver _bun_hl_raw _bun_hl
+    _bun_ver=$(_curl_via_best_socks 6 \
+        "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" \
+        | head -1 | tr -d '\r\n\t ')
+    case "$_bun_ver" in ''|null) return 1 ;; esac
+    _ver_is_newer "$BOT_VERSION" "$_bun_ver" || return 1
+    _bun_hl_raw=$(_curl_via_best_socks 6 \
+        "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/highlights.txt" \
+        | head -1 | tr -d '\r')
+    case "$_bun_hl_raw" in ''|'<'*|'{'*) _bun_hl="" ;; *) _bun_hl="$_bun_hl_raw" ;; esac
+    if [ -n "$_bun_hl" ]; then
+        printf '🆕 Доступно обновление бота: <b>v%s</b> — <i>%s</i>' \
+            "$(html_escape "$_bun_ver")" "$(html_escape "$_bun_hl")"
+    else
+        printf '🆕 Доступно обновление бота: <b>v%s</b>' "$(html_escape "$_bun_ver")"
+    fi
+    return 0
 }
 
 
@@ -2350,6 +2433,29 @@ get_urltest_proxy_links() {
     for link in "$@"; do printf '%s\n' "$link"; done
 }
 
+# NetShift selector_text/urltest_text: links live in a multiline SCALAR option
+# (selector_proxy_links_text / urltest_proxy_links_text), NOT a UCI list.
+# NetShift's own parser (_build_proxy_member_outbounds) word-splits this blob
+# on whitespace/newline, so as long as we write strictly one-link-per-line
+# with no embedded spaces, our line-splitting here matches NetShift's 1:1.
+_text_links_field() {
+    local sec="$1" t
+    t=$(get_section_type "$sec" 2>/dev/null)
+    if [ "$t" = "proxy:urltest_text" ]; then
+        printf 'urltest_proxy_links_text'
+    else
+        printf 'selector_proxy_links_text'
+    fi
+}
+
+get_text_proxy_links() {
+    local sec="$1" field raw
+    field=$(_text_links_field "$sec")
+    raw=$(uci -q get ${PODKOP_UCI}.${sec}.${field} 2>/dev/null)
+    [ -z "$raw" ] && return 0
+    printf '%s\n' "$raw" | tr -d '\r' | grep -v '^[[:space:]]*$'
+}
+
 get_uri_by_tag() {
     local _tag="$1" _uri
     # Rebuild if file missing OR empty (built too early after reload)
@@ -3190,6 +3296,52 @@ run_upstream_health_report() {
 #   last_ok=<last tier that worked>
 # ==============================================================================
 
+# _traffic_accum_tick — called on every health_interval tick from inside
+# start_health_daemon()'s watchdog loop (right after check_health). Banks
+# traffic into TRAFFIC_ACCUM_FILE so weekly/daily reports get a counter that
+# survives sing-box restarts (Clash API downloadTotal/uploadTotal reset to 0
+# whenever the sing-box process restarts — reload, watchdog action,
+# self-update, migration, manual restart, anything). Same tick also detects
+# the restart itself (signal: current counter < last-seen counter) and logs
+# it to SB_RESTART_LOG, so weekly report can count real restarts over 7 days
+# instead of the old logread-today-only hack.
+# Silent no-op (return 1) if Clash API is unreachable or returns junk — never
+# blocks the watchdog loop on this.
+_traffic_accum_tick() {
+    local _conn _cur_dl _cur_ul
+    _conn=$(clash_request "/connections" 2>/dev/null)
+    _cur_dl=$(printf '%s' "$_conn" | jq -r '.downloadTotal // empty' 2>/dev/null)
+    _cur_ul=$(printf '%s' "$_conn" | jq -r '.uploadTotal // empty' 2>/dev/null)
+    case "$_cur_dl" in ''|*[!0-9]*) return 1 ;; esac
+    case "$_cur_ul" in ''|*[!0-9]*) return 1 ;; esac
+
+    local _banked_dl=0 _banked_ul=0 _last_dl=0 _last_ul=0
+    if [ -s "$TRAFFIC_ACCUM_FILE" ]; then
+        _banked_dl=$(awk -F'|' '{print $1+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
+        _banked_ul=$(awk -F'|' '{print $2+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
+        _last_dl=$(awk -F'|' '{print $3+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
+        _last_ul=$(awk -F'|' '{print $4+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
+    fi
+
+    if [ "$_cur_dl" -ge "$_last_dl" ] 2>/dev/null && [ "$_cur_ul" -ge "$_last_ul" ] 2>/dev/null; then
+        _banked_dl=$(( _banked_dl + (_cur_dl - _last_dl) ))
+        _banked_ul=$(( _banked_ul + (_cur_ul - _last_ul) ))
+    else
+        # Either counter went backwards -> sing-box restarted between ticks.
+        # Checking dl alone missed the case where dl stays flat (e.g. 0) but
+        # ul drops — that let a negative delta silently corrupt banked_ul.
+        # cur already reflects traffic since the restart — bank it whole,
+        # and log the restart event itself.
+        _banked_dl=$(( _banked_dl + _cur_dl ))
+        _banked_ul=$(( _banked_ul + _cur_ul ))
+        printf '%s\n' "$(date +%s)" >> "$SB_RESTART_LOG" 2>/dev/null
+    fi
+    # tmp+mv — atomic state-file write (per project convention: never leave a
+    # partially-written accumulator file if power/process dies mid-write).
+    printf '%s|%s|%s|%s\n' "$_banked_dl" "$_banked_ul" "$_cur_dl" "$_cur_ul" > "${TRAFFIC_ACCUM_FILE}.tmp" 2>/dev/null \
+        && mv "${TRAFFIC_ACCUM_FILE}.tmp" "$TRAFFIC_ACCUM_FILE" 2>/dev/null
+}
+
 # check_health() — probes Telegram reachability via two independent paths.
 # Writes TWO keys to HEALTH_STATE_FILE (sourced by watchdog after call):
 #   tg_direct=ok|fail   — raw direct curl, no proxy (expected fail under RKN)
@@ -3460,13 +3612,19 @@ send_weekly_report() {
             d=int(s/86400);h=int((s%86400)/3600);m=int((s%3600)/60);
             if(d>0) printf "%dd %dh",d,h; else printf "%dh %dm",h,m}')
     fi
-    _today_log=$(date "+%b %e" 2>/dev/null | sed 's/  / /')
-    _sb_restarts=$(logread 2>/dev/null | grep "$_today_log" | \
-        grep -c 'sing-box.*start\|Starting sing-box' 2>/dev/null || echo 0)
+    # Рестарты sing-box за неделю — из SB_RESTART_LOG (пишет _traffic_accum_tick
+    # на каждом health-тике), а не logread (тот видит только сегодняшний буфер).
+    local _sbr_cutoff
+    _sbr_cutoff=$(( $(date +%s) - 604800 ))
+    _sb_restarts=$(awk -v c="$_sbr_cutoff" '$1>=c{n++} END{print n+0}' "$SB_RESTART_LOG" 2>/dev/null)
     case "$_sb_restarts" in ''|*[!0-9]*) _sb_restarts=0 ;; esac
-
-    # Route switches за 7 дней из switch_log
+    # Ротация лога — держим 8 дней, тот же принцип, что и SWITCH_LOG.
+    if [ -s "$SB_RESTART_LOG" ]; then
+        awk -v c=$(( $(date +%s) - 691200 )) '$1>=c' "$SB_RESTART_LOG" > "${SB_RESTART_LOG}.tmp" 2>/dev/null \
+            && mv "${SB_RESTART_LOG}.tmp" "$SB_RESTART_LOG" 2>/dev/null
+    fi
     local _sw_week_count _sw_last_line _sw_last_ago _sw_last_method
+    # Route switches за 7 дней из switch_log
     _sw_week_count=0
     if [ -f "$SWITCH_LOG" ]; then
         _sw_cutoff=$(( $(date +%s) - 604800 ))
@@ -3556,7 +3714,11 @@ send_weekly_report() {
         esac
     fi
 
-    # ── Трафик: delta за неделю ───────────────────────────────────────────────
+    # ── Трафик: delta за неделю (из persistent accumulator) ────────────────────
+    # TRAFFIC_ACCUM_FILE копится тик-в-тик в _traffic_accum_tick() и переживает
+    # рестарты sing-box — поэтому reset-detection (как было в half-fix) здесь
+    # больше не нужен: banked_dl/ul уже корректны независимо от того, сколько
+    # раз sing-box перезапускался за неделю.
     local _conn_data _total_dl _total_ul _curr_conn _dl_fmt _ul_fmt
     _conn_data=$(clash_request "/connections" 2>/dev/null)
     _curr_conn=$(printf '%s' "$_conn_data" | jq -r '.connections | length // 0' 2>/dev/null || echo 0)
@@ -3565,18 +3727,27 @@ send_weekly_report() {
     case "$_total_dl" in ''|*[!0-9]*) _total_dl=0 ;; esac
     case "$_total_ul" in ''|*[!0-9]*) _total_ul=0 ;; esac
 
-    # Weekly traffic delta
     local _week_dl _week_ul _dl_week_fmt _ul_week_fmt _avg_day_fmt _traffic_note=""
-    local _base_ts _base_dl _base_ul
-    _base_ts=$(awk -F'|' '{print $1}' "$WEEKLY_TRAFFIC_BASE" 2>/dev/null || echo 0)
-    _base_dl=$(awk -F'|' '{print $2}' "$WEEKLY_TRAFFIC_BASE" 2>/dev/null || echo 0)
-    _base_ul=$(awk -F'|' '{print $3}' "$WEEKLY_TRAFFIC_BASE" 2>/dev/null || echo 0)
-    case "$_base_dl" in ''|*[!0-9]*) _base_dl=0 ;; esac
-    case "$_base_ul" in ''|*[!0-9]*) _base_ul=0 ;; esac
+    local _base_ts _base_banked_dl _base_banked_ul _cur_banked_dl _cur_banked_ul
+    _base_ts=$(awk -F'|' '{print $1+0}' "$WEEKLY_TRAFFIC_BASE" 2>/dev/null)
+    _base_banked_dl=$(awk -F'|' '{print $2+0}' "$WEEKLY_TRAFFIC_BASE" 2>/dev/null)
+    _base_banked_ul=$(awk -F'|' '{print $3+0}' "$WEEKLY_TRAFFIC_BASE" 2>/dev/null)
+    case "$_base_ts" in ''|*[!0-9]*) _base_ts=0 ;; esac
+    case "$_base_banked_dl" in ''|*[!0-9]*) _base_banked_dl=0 ;; esac
+    case "$_base_banked_ul" in ''|*[!0-9]*) _base_banked_ul=0 ;; esac
+    _cur_banked_dl=$(awk -F'|' '{print $1+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
+    _cur_banked_ul=$(awk -F'|' '{print $2+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
+    case "$_cur_banked_dl" in ''|*[!0-9]*) _cur_banked_dl=0 ;; esac
+    case "$_cur_banked_ul" in ''|*[!0-9]*) _cur_banked_ul=0 ;; esac
 
-    if [ "${_base_ts:-0}" -gt 0 ] 2>/dev/null && [ "$_total_dl" -ge "$_base_dl" ] 2>/dev/null; then
-        _week_dl=$(( _total_dl - _base_dl ))
-        _week_ul=$(( _total_ul - _base_ul ))
+    if [ "${_base_ts:-0}" -gt 0 ] 2>/dev/null && [ -s "$TRAFFIC_ACCUM_FILE" ]; then
+        _week_dl=$(( _cur_banked_dl - _base_banked_dl ))
+        _week_ul=$(( _cur_banked_ul - _base_banked_ul ))
+        # banked_* растёт монотонно по построению — но подстрахуемся от
+        # чужеродного/устаревшего формата WEEKLY_TRAFFIC_BASE (миграция со
+        # старого ts|downloadTotal|uploadTotal, до внедрения accumulator'а).
+        [ "$_week_dl" -lt 0 ] 2>/dev/null && _week_dl=0
+        [ "$_week_ul" -lt 0 ] 2>/dev/null && _week_ul=0
         _days=$(awk -v ts="$_base_ts" "BEGIN{d=($(date +%s)-ts)/86400; printf \"%d\", d>0?d:1}")
         _dl_week_fmt=$(awk "BEGIN{b=${_week_dl};if(b>=1073741824)printf \"%.1f GB\",b/1073741824;
             else if(b>=1048576)printf \"%.1f MB\",b/1048576;else printf \"%.0f KB\",b/1024}")
@@ -3585,16 +3756,23 @@ send_weekly_report() {
         _avg_dl=$(( _week_dl / _days ))
         _avg_day_fmt=$(awk "BEGIN{b=${_avg_dl};if(b>=1073741824)printf \"%.1f GB\",b/1073741824;
             else if(b>=1048576)printf \"%.1f MB\",b/1048576;else printf \"%.0f KB\",b/1024}")
-        [ "$_sb_restarts" -gt 0 ] && _traffic_note=" <i>(частичные данные — были рестарты sing-box)</i>"
+        # Больше не "частичные данные" — accumulator уже учёл рестарты,
+        # цифры полные. Просто информационная пометка, если рестарты были.
+        [ "$_sb_restarts" -gt 0 ] 2>/dev/null && \
+            _traffic_note=" <i>(рестартов sing-box за неделю: ${_sb_restarts}, учтено)</i>"
     else
         _dl_week_fmt="н/д"
         _ul_week_fmt="н/д"
         _avg_day_fmt="н/д"
         _traffic_note=" <i>(первая неделя — baseline установлен)</i>"
     fi
-    # Save baseline if Clash API returned a valid JSON object (even if counters are 0)
-    if printf '%s' "$_conn_data" | jq -e 'has("downloadTotal") and has("uploadTotal")' >/dev/null 2>&1; then
-        printf '%s|%s|%s\n' "$(date +%s)" "$_total_dl" "$_total_ul" > "$WEEKLY_TRAFFIC_BASE" 2>/dev/null
+    # Baseline на следующую неделю — снимок banked-счётчика, а не сырых Clash
+    # totals. Если accumulator ещё не успел натикать (TRAFFIC_ACCUM_FILE
+    # пустой/нет — например сразу после установки бота), просто не пишем
+    # baseline: следующий отчёт снова покажет "первая неделя", один раз.
+    if [ -s "$TRAFFIC_ACCUM_FILE" ]; then
+        printf '%s|%s|%s\n' "$(date +%s)" "$_cur_banked_dl" "$_cur_banked_ul" > "${WEEKLY_TRAFFIC_BASE}.tmp" 2>/dev/null \
+            && mv "${WEEKLY_TRAFFIC_BASE}.tmp" "$WEEKLY_TRAFFIC_BASE" 2>/dev/null
     fi
 
     _dl_fmt=$(awk "BEGIN{b=${_total_dl};if(b>=1073741824)printf \"%.1f GB\",b/1073741824;
@@ -3663,12 +3841,15 @@ send_weekly_report() {
     _text="$(printf '🗓 <b>Weekly Report</b>\n<b>%s</b>\n%s–%s\n<code>────────────────────</code>' \
         "$_header" "$_week_start" "$_now_str")"
 
+    local _bun_note_w; _bun_note_w=$(_bot_update_note)
+    [ -n "$_bun_note_w" ] && _text="${_text}$(printf '\n%s' "$_bun_note_w")"
+
     _text="${_text}$(printf '\n\n🧩 <b>Версии</b>\nBot: <code>v%s</code> · %s · <code>%s</code>\nInit.d: %s\n%s v%s · Sing-box <code>%s</code>' \
         "$_bot_ver" "$_bot_mtime" "${_bot_hash:-?}" \
         "${_init_mtime}" \
         "$PODKOP_DISPLAY_NAME" "$(html_escape "${_p_ver:-?}")" "$(html_escape "$_sb_ver")")"
 
-    _text="${_text}$(printf '\n\n🩺 <b>Стабильность</b>\nBot uptime: <code>%s</code>\nTunnel uptime: <code>%s</code>\nsing-box restarts (сегодня): <code>%s</code>\nRoute switches (неделя): <code>%s</code>\nПоследний switch: %s\nTG: direct %s · tunnel %s' \
+    _text="${_text}$(printf '\n\n🩺 <b>Стабильность</b>\nBot uptime: <code>%s</code>\nTunnel uptime: <code>%s</code>\nsing-box restarts (неделя): <code>%s</code>\nRoute switches (неделя): <code>%s</code>\nПоследний switch: %s\nTG: direct %s · tunnel %s' \
         "$_bot_uptime" "$_sb_uptime" "$_sb_restarts" "$_sw_week_count" \
         "$_sw_disp" "$_tg_direct_icon" "$_tg_tunnel_icon")"
 
@@ -3794,6 +3975,14 @@ send_daily_report() {
             urltest) _switch_disp=" · 🤖 urltest ${_sw_ago}" ;;
         esac
     fi
+    # Кол-во переключений за 24 часа из switch_log
+    local _sw_day_count=0
+    if [ -f "$SWITCH_LOG" ]; then
+        local _sw_day_cutoff; _sw_day_cutoff=$(( $(date +%s) - 86400 ))
+        _sw_day_count=$(awk -F'|' -v c="$_sw_day_cutoff" '$1>=c{n++} END{print n+0}' "$SWITCH_LOG" 2>/dev/null || echo 0)
+    fi
+    [ "${_sw_day_count:-0}" -gt 0 ] 2>/dev/null && \
+        _switch_disp="${_switch_disp} (${_sw_day_count} за 24ч)"
     # Версии
     # Режим секции
     local _sec_mode _sec_mode_disp
@@ -3814,8 +4003,8 @@ send_daily_report() {
             proxy:selector)     _sec_mode_disp="Selector" ;;
             proxy:subscription) _sec_mode_disp="Subscription" ;;
             proxy:url)          _sec_mode_disp="Single URL" ;;
-            proxy:selector_text) _sec_mode_disp="Selector (text) — edit in LuCI" ;;
-            proxy:urltest_text)  _sec_mode_disp="URLTest (text) — edit in LuCI" ;;
+            proxy:selector_text) _sec_mode_disp="Selector (text)" ;;
+            proxy:urltest_text)  _sec_mode_disp="URLTest (text)" ;;
             vpn:*)              _sec_mode_disp="VPN" ;;
             *)                  _sec_mode_disp="$_sec_mode" ;;
         esac
@@ -3941,6 +4130,9 @@ send_daily_report() {
     local _text
     _text="$(printf '%s <b>Ежедневный отчёт</b>\n<b>%s</b>\n%s\n<code>────────────────────</code>' \
         "$E_SCAN" "$_header" "$_now_str")"
+
+    local _bun_note; _bun_note=$(_bot_update_note)
+    [ -n "$_bun_note" ] && _text="${_text}$(printf '\n%s' "$_bun_note")"
 
     _text="${_text}$(printf '\n\n🖥 <b>Система</b>\nUptime: <code>%s</code> · Load: <code>%s</code>\nRAM: <code>%s / %s MB (%s%%)</code>' \
         "$_uptime_str" "$_loadavg" "$_ram_used" "$_ram_total_mb" "$_ram_pct")"
@@ -4144,6 +4336,10 @@ start_health_daemon() {
             # ------------------------------------------------------------------
             check_health
             # check_health writes tg_direct= and tg_transport= to HEALTH_STATE_FILE.
+
+            # Bank traffic + detect sing-box restarts every tick (survives
+            # restarts unlike a raw Clash downloadTotal/uploadTotal snapshot).
+            _traffic_accum_tick
 
             # Periodically refresh emergency IPs via DoH (every 6h, or if never done)
             local _now_ts; _now_ts=$(date +%s)
@@ -5003,14 +5199,11 @@ PMURLEOF
                     *)                   _card_title="${E_GLOB} <b>Outbound Selector</b>" ;;
                 esac
             fi
-            # NetShift selector_text/urltest_text: links in multiline scalar,
-            # not UCI list — read-only in bot, user must edit in LuCI.
+            # NetShift selector_text/urltest_text: links live in a multiline
+            # scalar (not a UCI list) — full add/delete editor in _handle_text_links.
             case "$proxy_mode_cur" in
                 proxy:selector_text|proxy:urltest_text)
-                    send_or_edit "$mid" \
-                        "$(printf '%s <b>%s</b>\n[<code>%s</code>]\n\n%s\n\n<i>This section uses text-mode links (NetShift selector_text / urltest_text).\nLinks are stored as a multiline field — edit them in LuCI, not here.</i>' \
-                            "$E_INFO" "${_card_title}" "$sec" "$(printf 'Active: <code>%s</code>' "$current_proxy_display")")"\
-                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
+                    _handle_text_links "text_links_menu" "$mid" "" ""
                     return
                     ;;
             esac
@@ -5643,6 +5836,180 @@ EOF
             send_or_edit "$mid" \
                 "$(printf '%s <b>Outbound Config mode</b>\n\nThis mode requires editing raw sing-box JSON.\nEditing JSON via Telegram is error-prone and not supported by the bot.\n\n<b>Please use LuCI or console instead:</b>\n\n<b>LuCI:</b> <code>http://%s/cgi-bin/luci/admin/services/podkop</code>\n<b>SSH:</b> <code>uci set ${PODKOP_UCI}.%s.outbound_json=...</code>\n\n<i>After editing in LuCI/console, use Reload Podkop in the bot to apply.</i>' "$E_WARN" "$luci_ip" "$sec")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Reload Podkop\",\"callback_data\":\"ask_reload_podkop\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]]}"
+            ;;
+    esac
+}
+# ------------------------------------------------------------------------------
+# 9.2c: Text Links Handler (proxy_config_type=selector_text/urltest_text, NetShift)
+# Edits selector_proxy_links_text / urltest_proxy_links_text — a multiline
+# SCALAR option (NOT a UCI list), one proxy link per line. Mirrors
+# _handle_url_links' line-rejoin discipline for delete, but ADD here appends
+# a new line instead of replacing (selector_text/urltest_text hold many links).
+# Same proven pattern already used by proxy_string (url mode) above.
+# ------------------------------------------------------------------------------
+_handle_text_links() {
+    local cmd="$1" mid="$2" text="$3" state="$4"
+    local sec=$(get_active_section)
+    local field; field=$(_text_links_field "$sec")
+    local per_page=8
+
+    if [ "$cmd" = "STATE_INPUT" ]; then
+        rm -f "$STATE_FILE"
+        if [ "$state" = "wait_text_link" ]; then
+            delete_message "$mid"
+            local safe_link
+            safe_link=$(printf "%s" "$text" | tr -d '\r\n' | sed 's/[[:space:]]//g')
+            if [ -z "$safe_link" ]; then
+                send_message "$(printf '%s <b>Empty input.</b>' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"text_links_menu\"}]]}"
+            elif ! echo "$safe_link" | grep -qE '^(vless|vmess|ss|trojan|hy2|hysteria2|socks|socks4|socks4a|socks5)://'; then
+                send_message "$(printf '%s <b>Invalid protocol!</b>\n<i>vless, vmess, ss, trojan, hy2, socks5…</i>' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"text_links_menu\"}]]}"
+            elif get_text_proxy_links "$sec" | grep -qxF "$safe_link"; then
+                send_message "$(printf '%s <b>Duplicate!</b>\nThis link is already in the list.' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"text_links_menu\"}]]}"
+            else
+                local cur new_val
+                cur=$(uci -q get ${PODKOP_UCI}.${sec}.${field} 2>/dev/null)
+                if [ -z "$cur" ]; then
+                    new_val="$safe_link"
+                else
+                    new_val=$(printf '%s\n%s' "$cur" "$safe_link")
+                fi
+                uci set ${PODKOP_UCI}.${sec}.${field}="$new_val"
+                uci_commit_safe ${PODKOP_UCI}
+                send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
+                safe_reload_podkop "force"; sleep 1
+                _handle_text_links "text_links_menu" "" "" ""
+            fi
+        fi
+        return
+    fi
+
+    case "$cmd" in
+        text_links_menu|text_links_p_*)
+            rm -f "$STATE_FILE"
+            local page=0 link_list total total_pages
+            local start_idx end_idx rows list_text nav_row kb mode_label
+            local _sec_type
+
+            [ "$cmd" != "text_links_menu" ] && page="${cmd#text_links_p_}"
+            case "$page" in ''|*[!0-9]*) page=0 ;; esac
+
+            _sec_type=$(get_section_type "$sec" 2>/dev/null)
+            if [ "$_sec_type" = "proxy:urltest_text" ]; then
+                mode_label="URLTest (text)"
+            else
+                mode_label="Selector (text)"
+            fi
+
+            link_list=$(get_text_proxy_links "$sec")
+            if [ -z "$link_list" ]; then
+                total=0
+            else
+                total=$(printf '%s\n' "$link_list" | grep -c .)
+            fi
+
+            total_pages=$(( (total + per_page - 1) / per_page ))
+            [ "$total_pages" -eq 0 ] && total_pages=1
+            [ "$page" -ge "$total_pages" ] && page=$((total_pages - 1))
+            [ "$page" -lt 0 ] && page=0
+            start_idx=$(( page * per_page ))
+            end_idx=$(( start_idx + per_page ))
+            [ "$end_idx" -gt "$total" ] && end_idx="$total"
+
+            rows=""; list_text=""
+            local line_n=0
+            if [ "$total" -gt 0 ]; then
+                while IFS= read -r link; do
+                    [ -z "$link" ] && continue
+                    if [ "$line_n" -ge "$start_idx" ] && [ "$line_n" -lt "$end_idx" ]; then
+                        local disp proto host human
+                        proto=$(echo "$link" | cut -d: -f1)
+                        host=$(echo "$link" | sed 's|.*@||; s|/.*||; s|?.*||' | cut -c1-30)
+                        disp="${proto}://...${host}"
+                        human=$(json_escape "$disp")
+                        list_text=$(printf '%s\n<code>[%s]</code> %s' "$list_text" "$line_n" "$disp")
+                        rows="${rows}[{\"text\":\"${E_DEL} [${line_n}] ${human}\",\"callback_data\":\"ask_del_txt_${line_n}\"}],"
+                    fi
+                    line_n=$((line_n + 1))
+                done <<EOF
+$link_list
+EOF
+            fi
+
+            nav_row=""
+            if [ "$total_pages" -gt 1 ]; then
+                local prev_p next_p
+                prev_p=$(( page > 0 ? page - 1 : total_pages - 1 ))
+                next_p=$(( page < total_pages - 1 ? page + 1 : 0 ))
+                nav_row="[{\"text\":\"< Prev\",\"callback_data\":\"text_links_p_${prev_p}\"},{\"text\":\"$((page+1))/${total_pages}\",\"callback_data\":\"text_links_menu\"},{\"text\":\"Next >\",\"callback_data\":\"text_links_p_${next_p}\"}],"
+            fi
+
+            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Add Link\",\"callback_data\":\"cmd_text_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"text_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
+
+            [ -z "$list_text" ] && list_text="<i>No links yet.</i>"
+
+            text=$(cat <<EOF
+${E_INFO} <b>${mode_label} — ${total} link(s)</b> [<code>${sec}</code>]
+
+${list_text}
+
+<i>Tap [${E_DEL}] to remove a link. Stored newline-delimited (NetShift selector_text/urltest_text).</i>
+EOF
+)
+            send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        "cmd_text_link_add")
+            echo "wait_text_link" > "$STATE_FILE"
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Add Link</b>\n\nSend the proxy link:\n<i>(vless://, hy2://, ss://, trojan://, vmess://, socks://)</i>\n\nOne link per message.' "$E_EDIT")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"text_links_menu\"}]]}"
+            ;;
+
+        "ask_del_txt_"*)
+            local idx="${cmd#ask_del_txt_}" link_to_del="" ln=0 _item
+            while IFS= read -r _item; do
+                [ -z "$_item" ] && continue
+                [ "$ln" -eq "$idx" ] && { link_to_del="$_item"; break; }
+                ln=$((ln + 1))
+            done <<EOF
+$(get_text_proxy_links "$sec")
+EOF
+            if [ -z "$link_to_del" ]; then
+                send_or_edit "$mid" "$(printf '%s Entry not found.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"text_links_menu\"}]]}"
+                return
+            fi
+            local disp_link
+            disp_link=$(echo "$link_to_del" | cut -d: -f1)://...$(echo "$link_to_del" | sed 's|.*@||; s|/.*||; s|?.*||' | cut -c1-30)
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Remove this link?</b>\n\n<code>%s</code>\n\n[%s] from section <code>%s</code>' "$E_WARN" "$(html_escape "$disp_link")" "$idx" "$sec")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Remove\",\"callback_data\":\"do_del_txt_${idx}\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"text_links_menu\"}]]}"
+            ;;
+
+        "do_del_txt_"*)
+            local idx="${cmd#do_del_txt_}" ln=0 new_val="" link
+            while IFS= read -r link; do
+                [ -z "$link" ] && continue
+                if [ "$ln" -ne "$idx" ]; then
+                    if [ -z "$new_val" ]; then new_val="$link"
+                    else new_val=$(printf '%s\n%s' "$new_val" "$link"); fi
+                fi
+                ln=$((ln + 1))
+            done <<EOF
+$(get_text_proxy_links "$sec")
+EOF
+            send_or_edit "$mid" "$(printf '%s <b>Removed. Applying...</b>' "$E_RST")" ""
+            if [ -z "$new_val" ]; then
+                uci -q delete ${PODKOP_UCI}.${sec}.${field}
+            else
+                uci set ${PODKOP_UCI}.${sec}.${field}="$new_val"
+            fi
+            uci_commit_safe ${PODKOP_UCI}
+            safe_reload_podkop "force"; sleep 1
+            _handle_text_links "text_links_menu" "$mid" "" ""
             ;;
     esac
 }
@@ -9818,6 +10185,16 @@ EOF
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
                 return
             fi
+            # Pre-flight disk check — upstream install.sh's own threshold (15 MB)
+            # is too low for sing-box's real footprint (~50 MB). Catch it here,
+            # before opkg/apk removes the working binary and possibly kills our
+            # own tunnel along with it (see _pkg_disk_check for the full story).
+            local _disk_verdict; _disk_verdict=$(_pkg_disk_check)
+            if [ "$_disk_verdict" != "ok" ]; then
+                send_or_edit "$mid" "$(printf '%s <b>Not enough free flash space</b>\n\n<code>%s</code>\n\n<i>Upstream install.sh only requires 15 MB free, but sing-box needs ~50 MB in practice. Free up space first (opkg list-installed, remove unused packages/logs) — otherwise the update can fail mid-install and take the tunnel down with it.</i>' "$E_ERR" "$(html_escape "$_disk_verdict")")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
+                return
+            fi
             send_or_edit "$mid" "$(printf '%s Installing podkop...\n\n<i>Package network OK. This may take up to 60 seconds.</i>' "$E_TIME")" ""
             # opkg/apk inside install.sh resolve via the system resolver (musl),
             # which stalls on AAAA under podkop. Point the router's own resolver
@@ -9910,7 +10287,7 @@ EOF
 
             local changelog_link="https://github.com/Medvedolog/podkop_bot/blob/main/CHANGELOG.md"
 
-            if [ "$remote_ver" = "$BOT_VERSION" ]; then
+            if ! _ver_is_newer "$BOT_VERSION" "$remote_ver"; then
                 if [ -n "$highlights" ]; then
                     text=$(printf '%s Bot is up to date: <b>v%s</b>\n\n<i>%s</i>\n\n<a href="%s">Full changelog</a>%s' \
                         "$E_OK" "$BOT_VERSION" "$(html_escape "$highlights")" "$changelog_link" "$_via_note")
@@ -10012,7 +10389,11 @@ EOF
             if [ "$_init_outdated" = "1" ]; then
                 send_message "$(printf '%s <b>Updating init.d...</b> (outdated version detected)' "$E_TIME")" ""
                 if _curl_via_best_socks 15 -o "$_init_tmp" "$_init_url" 2>/dev/null && \
-                   head -1 "$_init_tmp" | grep -q "rc.common" 2>/dev/null; then
+                   head -1 "$_init_tmp" | grep -q "rc.common" 2>/dev/null && \
+                   grep -q "_kill_all_podkop_bot" "$_init_tmp" 2>/dev/null && \
+                   grep -q "stop_service" "$_init_tmp" 2>/dev/null && \
+                   grep -q "procd_set_param respawn" "$_init_tmp" 2>/dev/null && \
+                   busybox ash -n "$_init_tmp" 2>/dev/null; then
                     chmod +x "$_init_tmp"
                     cp -f "$_init_path" "${_init_path}.bak" 2>/dev/null || true
                     mv "$_init_tmp" "$_init_path"
@@ -10035,34 +10416,29 @@ EOF
             # Copy to legacy flat path — startup migration block picks it up.
             cp "$OFFSET_FILE" "/tmp/podkop_bot_offset" 2>/dev/null || true
 
-            # Step 1: Kill watchdog by saved PID (clean shutdown of health daemon)
+            # Kill watchdog (clean shutdown of health daemon)
             kill "$HEALTH_PID" 2>/dev/null
 
-            # Step 2: Full /proc reap — kill ALL surviving podkop_bot processes
-            # except ourselves. This catches orphaned subshells from previous
-            # restart cycles that procd's init restart does not clean up.
-            local _self_pid=$$ _reap_pid _reap_cmd
-            for _reap_pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-                [ "$_reap_pid" = "$_self_pid" ] && continue
-                _reap_cmd=$(cat "/proc/${_reap_pid}/cmdline" 2>/dev/null | tr '\0' ' ')
-                case "$_reap_cmd" in
-                    *"podkop_bot"*|*"podkop-bot"*)
-                        kill -9 "$_reap_pid" 2>/dev/null || true
-                        ;;
-                esac
-            done
-            sleep 1
-
             if [ -f "/etc/init.d/podkop_bot" ]; then
-                # procd path: procd queues the restart via ubus synchronously.
-                # We kill ourselves after restart is queued — procd respawns
-                # from the new binary with a clean slate.
-                local _upd_pid=$$
-                /etc/init.d/podkop_bot restart
-                kill -9 "$_upd_pid" 2>/dev/null || true
+                # procd path: just kill ourselves — procd respawns automatically
+                # via stop_service → _kill_all_podkop_bot in init.d, which already
+                # reaps orphaned subshells before the new instance starts.
+                # DO NOT do /proc reap here: it can kill the new procd-spawned
+                # instance racing with our own cleanup, causing an infinite
+                # respawn loop (see v0.15.6 do_restart_bot regression).
+                kill -9 $$ 2>/dev/null || true
             else
-                # No init.d: exec replaces current process with new binary.
-                # Process group already reaped above.
+                # No init.d: reap orphaned subshells, then exec new binary directly.
+                local _self_pid=$$ _reap_pid _reap_cmd
+                for _reap_pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+                    [ "$_reap_pid" = "$_self_pid" ] && continue
+                    _reap_cmd=$(cat "/proc/${_reap_pid}/cmdline" 2>/dev/null | tr '\0' ' ')
+                    case "$_reap_cmd" in
+                        *"podkop_bot"*|*"podkop-bot"*)
+                            kill -9 "$_reap_pid" 2>/dev/null || true ;;
+                    esac
+                done
+                sleep 1
                 exec "$BOT_PATH"
             fi
             exit 0
@@ -10162,6 +10538,8 @@ handle_command() {
             wait_dr_server|wait_badwan_ifaces|wait_badwan_delay|\
             wait_mixed_port|wait_outbound_iface|wait_vpn_iface|wait_utl_link)
                 _handle_section_extras "STATE_INPUT" "$mid" "$cmd" "$state" ;;
+            wait_text_link)
+                _handle_text_links "STATE_INPUT" "$mid" "$cmd" "$state" ;;
         esac
         return
     fi
@@ -10180,6 +10558,10 @@ handle_command() {
         cmd_url_link_add|ask_del_ul_*|do_del_ul_*|\
         outbound_info)
             _handle_url_links "$cmd" "$mid" "" "" ;;
+
+        text_links_menu|text_links_p_*|\
+        cmd_text_link_add|ask_del_txt_*|do_del_txt_*)
+            _handle_text_links "$cmd" "$mid" "" "" ;;
 
         sections_menu|set_sec_*|do_set_sec_*)
             _handle_sections "$cmd" "$mid" ;;
@@ -10575,22 +10957,21 @@ EOF
                 cp "$OFFSET_FILE" "/tmp/podkop_bot_offset" 2>/dev/null || true
 
                 kill "$HEALTH_PID" 2>/dev/null
-                _self_pid_doc=$$
-                for _reap_pid_doc in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-                    [ "$_reap_pid_doc" = "$_self_pid_doc" ] && continue
-                    _reap_cmd_doc=$(cat "/proc/${_reap_pid_doc}/cmdline" 2>/dev/null | tr '\0' ' ')
-                    case "$_reap_cmd_doc" in
-                        *"podkop_bot"*|*"podkop-bot"*)
-                            kill -9 "$_reap_pid_doc" 2>/dev/null || true ;;
-                    esac
-                done
-                sleep 1
 
                 if [ -f "/etc/init.d/podkop_bot" ]; then
-                    _upd_pid_doc=$$
-                    /etc/init.d/podkop_bot restart
-                    kill -9 "$_upd_pid_doc" 2>/dev/null || true
+                    # procd path: just kill ourselves — see do_update_bot_ for rationale
+                    kill -9 $$ 2>/dev/null || true
                 else
+                    _self_pid_doc=$$
+                    for _reap_pid_doc in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+                        [ "$_reap_pid_doc" = "$_self_pid_doc" ] && continue
+                        _reap_cmd_doc=$(cat "/proc/${_reap_pid_doc}/cmdline" 2>/dev/null | tr '\0' ' ')
+                        case "$_reap_cmd_doc" in
+                            *"podkop_bot"*|*"podkop-bot"*)
+                                kill -9 "$_reap_pid_doc" 2>/dev/null || true ;;
+                        esac
+                    done
+                    sleep 1
                     exec "$BOT_PATH"
                 fi
                 reset_chat_context; continue

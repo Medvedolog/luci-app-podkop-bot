@@ -18,6 +18,37 @@
 #   ash install.sh --unattended --action check
 #   See UNATTENDED CONFIG FORMAT comment below for the JSON schema.
 #
+# INSTALLER_VERSION="2.5.1"
+#
+# CHANGELOG v2.5.1:
+# - FIXED: _curl_socks_fallover now passes -L (follow redirects). GitHub
+#        release-asset URLs 302-redirect to objects.githubusercontent.com;
+#        without -L the download body was empty ("Downloaded file is empty"),
+#        so --action update-luci / --with-luci could never fetch the .ipk/.apk.
+#        Harmless for non-redirecting URLs (releases API, raw.githubusercontent).
+#
+# INSTALLER_VERSION="2.5.0"
+#
+# CHANGELOG v2.5.0:
+# - ADDED: `--action update-luci` and `--with-luci` flag. Installs/updates the
+#        luci-app-podkop-bot web UI: fetches the latest release asset for the
+#        active package manager (opkg->.ipk, apk->.apk) from GitHub with the
+#        usual direct->SOCKS fallback, then installs it DETACHED (setsid) so an
+#        rpcd restart triggered by the install can't abort it. Progress is
+#        written to /tmp/podkop_bot_luci_update.log (polled by the UI).
+# - ADDED: after a bot install/update, the script now offers to install the
+#        web UI too (interactive prompt; unattended via --with-luci). Single
+#        entry point for the whole stack.
+# - GUARD: update-luci fails loudly if curl is absent (bare system) instead of
+#        hanging; on a router with the bot installed curl is always present.
+#
+# INSTALLER_VERSION="2.4.2"
+#
+# CHANGELOG v2.4.2:
+# - Misc fixes carried from the luci-app work (log mojibake via printf
+#   placeholders, /proc scan race, section-aware paths). Version bump to keep
+#   the vendored copy in luci-app-podkop-bot in sync with the bot repo.
+#
 # INSTALLER_VERSION="2.4.1"
 #
 # CHANGELOG v2.4.1:
@@ -293,7 +324,7 @@ esac
 unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="2.5.0"
+INSTALLER_VERSION="2.5.1"
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
 VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
@@ -1423,14 +1454,17 @@ _curl_socks_fallover() {
     local _max="${1:-15}"; shift
     local _ct=6
     _last_socks_route=""
+    # -L is required: GitHub release-asset URLs 302-redirect to
+    # objects.githubusercontent.com; without following the redirect the body is
+    # empty (0-byte download). Harmless for non-redirecting URLs (API/raw).
     # 1. Direct
-    if curl -fsS --connect-timeout "$_ct" --max-time "$_max" "$@" 2>/dev/null; then
+    if curl -fsSL --connect-timeout "$_ct" --max-time "$_max" "$@" 2>/dev/null; then
         return 0
     fi
     # 2. SOCKS tiers
     local _ep
     for _ep in $(_get_socks_endpoints); do
-        if curl -fsS --connect-timeout "$_ct" --max-time "$_max" -x "$_ep" "$@" 2>/dev/null; then
+        if curl -fsSL --connect-timeout "$_ct" --max-time "$_max" -x "$_ep" "$@" 2>/dev/null; then
             _last_socks_route="$_ep"
             return 0
         fi

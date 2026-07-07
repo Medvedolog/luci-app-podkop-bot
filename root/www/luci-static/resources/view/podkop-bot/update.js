@@ -18,6 +18,8 @@
 
 var callCheckUpdate = rpc.declare({ object:'podkop_bot', method:'check_update', params:['force'] });
 var callLuciUpdate  = rpc.declare({ object:'podkop_bot', method:'luci_update_check', params:['force'] });
+var callLuciRun     = rpc.declare({ object:'podkop_bot', method:'luci_update_run' });
+var callLuciLog     = rpc.declare({ object:'podkop_bot', method:'luci_update_log', params:['offset'] });
 var callUpdatePaste = rpc.declare({ object:'podkop_bot', method:'update_paste', params:['body'] });
 var callInstaller   = rpc.declare({ object:'podkop_bot', method:'installer', params:['action','config_path','config_inline'] });
 var callStatus      = rpc.declare({ object:'podkop_bot', method:'status' });
@@ -26,8 +28,8 @@ var callLogs        = rpc.declare({ object:'podkop_bot', method:'logs', params:[
 
 var COLOURS = { green:'#33a02c', yellow:'#e8a33d', grey:'#888888', red:'#cc2b2b' };
 function dot(c, label) {
-	return E('span', { 'style':'display:inline-flex;align-items:center;gap:.4em;' }, [
-		E('span', { 'style':'width:.7em;height:.7em;border-radius:50%;display:inline-block;background:'+(COLOURS[c]||COLOURS.grey)+';' }),
+	return E('span', { 'style':'display:inline-flex;align-items:flex-start;gap:.4em;' }, [
+		E('span', { 'style':'width:.7em;height:.7em;border-radius:50%;display:inline-block;flex:none;margin-top:.28em;background:'+(COLOURS[c]||COLOURS.grey)+';' }),
 		E('span', {}, label)
 	]);
 }
@@ -226,7 +228,12 @@ return view.extend({
 	luciCard: function() {
 		var self = this;
 		var line = E('div', { 'style':'margin:.3em 0;' }, dot('grey', _('проверяю…')));
-		var actions = E('div', { 'style':'margin-top:.5em;' });
+		var actions = E('div', { 'style':'margin-top:.5em;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' });
+		var luciStatus = E('div', { 'style':'margin-top:.5em;' });
+		var luciLog = E('pre', {
+			'style':'display:none;margin-top:.5em;max-height:260px;overflow:auto;background:rgba(127,127,127,.08);padding:.6em;border-radius:6px;font-size:85%;white-space:pre-wrap;'
+		}, '');
+		this._luciNodes = { status: luciStatus, log: luciLog, line: line, actions: actions };
 		var recheck = E('button', {
 			'class':'cbi-button', 'style':'margin-top:.5em;',
 			'click': function() {
@@ -238,8 +245,36 @@ return view.extend({
 			.catch(function(){ dom.content(line, dot('grey', _('Не удалось проверить'))); });
 		return E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
 			E('h3', { 'style':'margin-top:0;' }, _('Веб-интерфейс (luci-app-podkop-bot)')),
-			line, actions, recheck
+			line, actions, recheck, luciStatus, luciLog
 		]);
+	},
+
+	/* Poll the LuCI self-update log until the installer writes a done/error
+	 * marker. Mirrors pollGhLog but for luci_update_log. */
+	pollLuciLog: function() {
+		var self = this;
+		var n = this._luciNodes; if (!n) return;
+		this._luciOffset = 0; this._luciLog = '';
+		n.log.style.display = 'block';
+		dom.content(n.status, dot('yellow', _('Установка идёт…')));
+		var tick = function() {
+			callLuciLog(self._luciOffset).then(function(r) {
+				if (r && r.chunk) { self._luciLog += r.chunk; n.log.textContent = self._luciLog; n.log.scrollTop = n.log.scrollHeight; }
+				if (r && typeof r.offset === 'number') self._luciOffset = r.offset;
+				if (r && r.done) {
+					if (/\[done\] exit 0/.test(self._luciLog)) {
+						dom.content(n.status, dot('green', _('Установка завершена. Обновите страницу (Ctrl/Cmd+Shift+R).')));
+					} else if (/\[!!\]/.test(self._luciLog)) {
+						dom.content(n.status, dot('red', _('Установка завершилась с ошибкой — см. лог.')));
+					} else {
+						dom.content(n.status, dot('green', _('Готово. Обновите страницу.')));
+					}
+					return;
+				}
+				setTimeout(tick, 1500);
+			}).catch(function(){ setTimeout(tick, 2000); });
+		};
+		tick();
 	},
 
 	fillLuci: function(line, actions, d) {
@@ -254,13 +289,25 @@ return view.extend({
 			: (d.via === 'direct' ? (' (' + _('напрямую') + ')') : '');
 		if (d.update_available) {
 			dom.content(line, dot('yellow', _('Доступно обновление: v') + d.current + ' → v' + d.latest + via));
-			dom.content(actions, E('a', {
-				'class':'cbi-button cbi-button-apply',
-				'href': d.releases_url || 'https://github.com/Medvedolog/luci-app-podkop-bot/releases',
-				'target':'_blank', 'rel':'noopener'
-			}, _('Скачать релиз')));
+			var self = this;
+			dom.content(actions, [
+				E('button', {
+					'class':'cbi-button cbi-button-apply',
+					'click': function() {
+						this.disabled = true;
+						callLuciRun().then(function(){ self.pollLuciLog(); })
+							.catch(function(){ self.pollLuciLog(); });
+					}
+				}, _('Обновить веб-интерфейс')),
+				E('a', {
+					'class':'cbi-button',
+					'href': d.releases_url || 'https://github.com/Medvedolog/luci-app-podkop-bot/releases',
+					'target':'_blank', 'rel':'noopener'
+				}, _('Скачать вручную'))
+			]);
 		} else {
-			dom.content(line, dot('green', _('Установлена последняя версия: v') + (d.current||'?') + via));
+			dom.content(line, dot('green', _('Установлено v') + (d.current||'?') + ' · ' +
+				_('в репозитории v') + (d.latest||'?') + ' — ' + _('актуально') + via));
 		}
 	},
 
@@ -270,12 +317,29 @@ return view.extend({
 	 * install.sh; updating Podkop itself is the fork's job, so we link to releases
 	 * rather than auto-installing (out of scope — TZ boundary). */
 	podkopUpdateCard: function() {
+		var self = this;
 		var holder = E('div', { 'id':'podkop-fork-update' },
 			E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
 				E('h3', { 'style':'margin-top:0;' }, _('Обновление Podkop')),
 				dot('grey', _('проверяю…'))
 			]));
-		callPodkopUpdate('').then(function(d) {
+		this.fillPodkop(holder, '');
+		return holder;
+	},
+
+	fillPodkop: function(holder, force) {
+		var self = this;
+		callPodkopUpdate(force).then(function(d) {
+			var recheck = E('button', {
+				'class':'cbi-button', 'style':'margin-top:.6em;',
+				'click': function() {
+					dom.content(holder, E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+						E('h3', { 'style':'margin-top:0;' }, _('Обновление Podkop')),
+						dot('grey', _('Проверка…'))
+					]));
+					self.fillPodkop(holder, 'true');
+				}
+			}, _('Проверить версию'));
 			var inner;
 			if (!d || !d.ok || d.available === false) {
 				inner = [
@@ -283,7 +347,8 @@ return view.extend({
 					dot('grey', _('Не удалось проверить (GitHub недоступен напрямую и через прокси).')),
 					(d && d.releases_url) ? E('div', { 'style':'margin-top:.5em;' }, [
 						E('a', { 'href': d.releases_url, 'target':'_blank', 'rel':'noopener' }, _('Открыть релизы'))
-					]) : E('span', {})
+					]) : E('span', {}),
+					recheck
 				];
 			} else {
 				var upd = d.update_available;
@@ -296,9 +361,9 @@ return view.extend({
 						E('span', { 'class':'pb-row-label' }, _('Установлено')), E('span', { 'class':'pb-row-val' }, d.current || '—')
 					]),
 					E('div', { 'class':'pb-row pb-row--plain' }, [
-						E('span', { 'class':'pb-row-label' }, _('Последняя')),
+						E('span', { 'class':'pb-row-label' }, _('В репозитории')),
 						E('span', { 'class':'pb-row-val' }, [
-							upd ? dot('yellow', d.latest + _(' — доступно')) : dot('green', (d.latest||'—') + _(' — актуально'))
+							upd ? dot('yellow', (d.latest||'—') + _(' — доступно')) : dot('green', (d.latest||'—') + _(' — актуально'))
 						])
 					]),
 					E('div', { 'class':'pb-row pb-row--plain' }, [
@@ -306,14 +371,14 @@ return view.extend({
 					]),
 					E('p', { 'style':'color:#888;font-size:88%;margin:.5em 0 0;' },
 						_('Обновление самого Podkop выполняется его средствами (не ботом). Ссылка ведёт на страницу релизов.')),
-					E('div', { 'style':'margin-top:.4em;' }, [
-						E('a', { 'class':'cbi-button', 'href': d.releases_url || d.repo_url, 'target':'_blank', 'rel':'noopener' }, _('Страница релизов'))
+					E('div', { 'style':'margin-top:.4em;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [
+						E('a', { 'class':'cbi-button', 'href': d.releases_url || d.repo_url, 'target':'_blank', 'rel':'noopener' }, _('Страница релизов')),
+						recheck
 					])
 				];
 			}
 			dom.content(holder, E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, inner));
 		}).catch(function(){});
-		return holder;
 	},
 
 	currentBlock: function() {
@@ -367,7 +432,8 @@ return view.extend({
 		if (d.update_available) {
 			return dot('yellow', _('Доступно обновление: v') + d.current + ' → v' + d.latest + via);
 		}
-		return dot('green', _('Установлена последняя версия: v') + (d.current||'?') + via);
+		return dot('green', _('Установлено v') + (d.current||'?') + ' · ' +
+			_('в репозитории v') + (d.latest||'?') + ' — ' + _('актуально') + via);
 	},
 
 	errText: function(r) {

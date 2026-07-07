@@ -22,6 +22,7 @@ var callResources = rpc.declare({ object: 'podkop_bot', method: 'resources' });
 var callCheckUpdate = rpc.declare({ object: 'podkop_bot', method: 'check_update', params: [ 'force' ] });
 var callSingboxInfo = rpc.declare({ object: 'podkop_bot', method: 'singbox_info' });
 var callAppInfo = rpc.declare({ object: 'podkop_bot', method: 'app_info' });
+var callLuciUpdate = rpc.declare({ object: 'podkop_bot', method: 'luci_update_check', params: [ 'force' ] });
 var callTestGithub = rpc.declare({ object: 'podkop_bot', method: 'test_github' });
 var callPodkopUpdate = rpc.declare({ object: 'podkop_bot', method: 'podkop_update_check' });
 
@@ -72,8 +73,8 @@ function visiblePoller(ms, tick) {
 var COLOURS = { green:'#33a02c', yellow:'#e8a33d', grey:'#888888', red:'#cc2b2b' };
 
 function dot(colour, label) {
-	return E('span', { 'style':'display:inline-flex;align-items:center;gap:.4em;' }, [
-		E('span', { 'style':'width:.7em;height:.7em;border-radius:50%;display:inline-block;flex:0 0 auto;background:'+(COLOURS[colour]||COLOURS.grey)+';' }),
+	return E('span', { 'style':'display:inline-flex;align-items:flex-start;gap:.4em;' }, [
+		E('span', { 'style':'width:.7em;height:.7em;border-radius:50%;display:inline-block;flex:0 0 auto;margin-top:.28em;background:'+(COLOURS[colour]||COLOURS.grey)+';' }),
 		E('span', {}, label)
 	]);
 }
@@ -313,7 +314,7 @@ return view.extend({
 			dom.content(cell, [
 				E('span', {}, (d.current || '—') + ' '),
 				mark,
-				d.update_available ? E('a', { 'style':'margin-left:.5em;font-size:88%;', 'href': d.releases_url || d.repo_url, 'target':'_blank', 'rel':'noopener' }, _('релизы')) : E('span', {})
+				d.update_available ? E('a', { 'style':'margin-left:.5em;font-size:88%;font-weight:600;color:#e8a33d;', 'href': d.releases_url || d.repo_url, 'target':'_blank', 'rel':'noopener', 'title': _('Доступна новая версия — открыть релизы') }, 'new') : E('span', {})
 			]);
 		}).catch(function(){});
 
@@ -359,10 +360,24 @@ return view.extend({
 		callAppInfo().then(function(a) {
 			var el = document.getElementById('podkop-app-ver');
 			if (el && a && a.ok) {
-				dom.content(el, [
+				var parts = [
 					E('span', {}, _('luci-app-podkop-bot v') + (a.luci_app_version||'?') + ' · '),
 					E('a', { 'href': a.repo || 'https://github.com/Medvedolog/luci-app-podkop-bot', 'target':'_blank', 'rel':'noopener' }, _('репозиторий'))
-				]);
+				];
+				dom.content(el, parts);
+				/* If a newer LuCI release exists, append a compact clickable "new"
+				 * badge (same convention as the Podkop indicator). Network check
+				 * with direct→SOCKS fallback; silent on failure. */
+				callLuciUpdate('false').then(function(d) {
+					if (d && d.ok && d.update_available) {
+						el.appendChild(E('a', {
+							'style':'margin-left:.5em;font-weight:600;color:#e8a33d;',
+							'href': d.releases_url || 'https://github.com/Medvedolog/luci-app-podkop-bot/releases',
+							'target':'_blank', 'rel':'noopener',
+							'title': _('Доступна новая версия v') + d.latest + ' — открыть релизы'
+						}, 'new'));
+					}
+				}).catch(function(){});
 			}
 		}).catch(function(){});
 

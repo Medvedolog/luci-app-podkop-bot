@@ -23,8 +23,8 @@ var callEnsureMixedProxy = rpc.declare({ object:'podkop_bot', method:'ensure_mix
 
 var COLOURS = { green:'#33a02c', yellow:'#e8a33d', grey:'#888888', red:'#cc2b2b' };
 function dot(c, label) {
-	return E('span', { 'style':'display:inline-flex;align-items:center;gap:.4em;' }, [
-		E('span', { 'style':'width:.7em;height:.7em;border-radius:50%;display:inline-block;flex:none;background:'+(COLOURS[c]||COLOURS.grey)+';' }),
+	return E('span', { 'style':'display:inline-flex;align-items:flex-start;gap:.4em;' }, [
+		E('span', { 'style':'width:.7em;height:.7em;border-radius:50%;display:inline-block;flex:none;margin-top:.28em;background:'+(COLOURS[c]||COLOURS.grey)+';' }),
 		E('span', {}, label)
 	]);
 }
@@ -286,7 +286,10 @@ return view.extend({
 						var ms = (s.ms != null && s.ms > 0) ? (' · ' + s.ms + _(' мс')) : '';
 						var geo = (s.geo && s.geo.trim()) ? (' · ' + s.geo) : '';
 						var label = s.name + (s.code && s.code !== '000' ? (' ' + s.code) : '') + ms + geo;
-						return E('div', {}, dot(c, label));
+						/* justify-content:flex-start keeps the dot hugging its label
+						 * instead of the grid cell stretching them to opposite edges
+						 * on narrow screens. */
+						return E('div', { 'style':'justify-self:start;' }, dot(c, label));
 					}))
 			]),
 

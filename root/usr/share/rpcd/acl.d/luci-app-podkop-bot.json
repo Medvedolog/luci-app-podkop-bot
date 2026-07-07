@@ -19,7 +19,7 @@
           "active_probe",
           "app_info",
           "runtime_sections",
-          "podkop_update_check"
+          "podkop_update_check","luci_update_log"
         ]
       },
       "uci": [
@@ -36,7 +36,7 @@
           "set_transport_policy",
           "fallback_crud",
           "set_uci_field",
-          "set_tier1_port"
+          "set_tier1_port","luci_update_run"
         ]
       },
       "uci": [

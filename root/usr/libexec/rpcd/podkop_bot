@@ -19,7 +19,7 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.16.83-1"   # kept in sync with the package Version at build
+LUCI_APP_VERSION="0.17.0"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
 
 # -- degraded helper (18q.1) -------------------------------------------------
 emit_unavailable() {
@@ -706,6 +706,38 @@ method_luci_update_check() {
 	printf '%s\n' "$_out"
 }
 
+# luci_update_run: launch the LuCI web UI self-update via install.sh, detached.
+# install.sh --action update-luci fetches the latest release asset for the
+# active package manager and installs it in a further-detached process, so the
+# rpcd restart that the install itself triggers can't abort it. We just kick it
+# off and return; the UI polls luci_update_log for progress.
+LUCI_UPDATE_LOG="/tmp/podkop_bot_luci_update.log"
+method_luci_update_run() {
+	if [ ! -f "$INSTALLER_PATH" ]; then
+		printf '{"ok":false,"reason":"installer_missing","detail":"%s"}\n' "$INSTALLER_PATH"; return
+	fi
+	: > "$LUCI_UPDATE_LOG" 2>/dev/null
+	setsid sh "$INSTALLER_PATH" --unattended --action update-luci >> "$LUCI_UPDATE_LOG" 2>&1 &
+	printf '{"ok":true,"started":true,"log":"%s"}\n' "$LUCI_UPDATE_LOG"
+}
+
+# luci_update_log: stream new bytes of the LuCI self-update log from an offset,
+# mirroring method_logs. "done" is detected by the "[done]"/"[!!]" markers the
+# installer writes, so the UI can stop polling.
+method_luci_update_log() {
+	_read_input
+	_off=$(_field_num offset); [ -z "$_off" ] && _off=0
+	if [ ! -f "$LUCI_UPDATE_LOG" ]; then
+		printf '{"ok":true,"offset":0,"chunk":"","done":false}\n'; return
+	fi
+	_size=$(wc -c < "$LUCI_UPDATE_LOG" 2>/dev/null | tr -d ' '); [ -z "$_size" ] && _size=0
+	[ "$_off" -gt "$_size" ] 2>/dev/null && _off=0
+	_chunk=$(dd if="$LUCI_UPDATE_LOG" bs=1 skip="$_off" 2>/dev/null)
+	_done=false
+	printf '%s' "$_chunk" | grep -qE '\[done\]|\[!!\]' && _done=true
+	printf '{"ok":true,"offset":%s,"chunk":%s,"done":%s}\n' "$_size" "$(_json_str "$_chunk")" "$_done"
+}
+
 # update_paste: install a pasted bot script with the same validation as the
 # bot's Upload Bot Script (shebang + BOT_VERSION + syntax), backup, restart.
 method_update_paste() {
@@ -1354,8 +1386,20 @@ _podkop_name_for() {
 }
 method_podkop_update_check() {
 	_read_input
+	_force=$(_field force)
+	_now=$(date +%s 2>/dev/null || echo 0)
 	_status=$(_cached_status)
 	_variant=$(printf '%s' "$_status" | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p'); [ -z "$_variant" ] && _variant="podkop"
+	# Per-variant cache: podkop/plus/netshift hit different repos, so keying by
+	# variant avoids a stale answer after the variant changes. Same TTL as the
+	# bot/LuCI update checks, so reopening the tab doesn't hammer the GitHub API.
+	_pc_cache="/tmp/podkop_bot_podkop_update_${_variant}.json"
+	if [ "$_force" != "true" ] && [ -f "$_pc_cache" ]; then
+		_ts=$(sed -n 's/.*"checked_at":\([0-9]*\).*/\1/p' "$_pc_cache")
+		if [ -n "$_ts" ] && [ "$((_now - _ts))" -lt "$UPDATE_CACHE_TTL" ] 2>/dev/null; then
+			cat "$_pc_cache"; printf '\n'; return
+		fi
+	fi
 	_cur=$(printf '%s' "$_status" | sed -n 's/.*"podkop_version":"\([^"]*\)".*/\1/p')
 	_repo=$(_podkop_repo_for "$_variant")
 	_name=$(_podkop_name_for "$_variant")
@@ -1396,10 +1440,18 @@ method_podkop_update_check() {
 	# The full strings are still shown to the user; only the comparison is trimmed.
 	_curn=$(printf '%s' "$_cur" | sed 's/^v//; s/-r[0-9]*$//' | cut -d'-' -f1)
 	_latn=$(printf '%s' "$_latest" | sed 's/^v//; s/-r[0-9]*$//' | cut -d'-' -f1)
+	# update_available only when latest is strictly newer than current. Mirrors
+	# check_update / luci_update_check: a plain "!=" would show a false "new"
+	# both when current is unknown (unknown != 0.7.x) and when the installed
+	# build is AHEAD of the latest release tag.
 	_avail=false
-	[ -n "$_curn" ] && [ "$_curn" != "$_latn" ] && _avail=true
-	printf '{"ok":true,"available":true,"variant":"%s","name":"%s","repo":"%s","repo_url":"%s","releases_url":"%s","current":"%s","latest":"%s","update_available":%s,"via":"%s","checked_at":%s}\n' \
-		"$_variant" "$_name" "$_repo" "$_repo_url" "$_rel_url" "$_cur" "$_latest" "$_avail" "$_via" "$_now"
+	if [ -n "$_curn" ] && [ "$_curn" != "unknown" ] && [ -n "$_latn" ] && [ "$_latn" != "unknown" ]; then
+		_ver_gt "$_latn" "$_curn" && _avail=true
+	fi
+	_out=$(printf '{"ok":true,"available":true,"variant":"%s","name":"%s","repo":"%s","repo_url":"%s","releases_url":"%s","current":"%s","latest":"%s","update_available":%s,"via":"%s","checked_at":%s}' \
+		"$_variant" "$_name" "$_repo" "$_repo_url" "$_rel_url" "$_cur" "$_latest" "$_avail" "$_via" "$_now")
+	[ "$_latest" != "unknown" ] && [ -n "$_latest" ] && printf '%s' "$_out" > "$_pc_cache" 2>/dev/null
+	printf '%s\n' "$_out"
 }
 
 # -- active_probe: the Runtime tab's core. Probes the USER's active outbound (the
@@ -1717,7 +1769,7 @@ method_active_probe() {
 
 case "$1" in
 	list)
-		echo '{ "list": {}, "status": {}, "service": { "action": "start_bot" }, "installer": { "action": "status", "config_path": "x", "config_inline": "x" }, "logs": { "offset": 0 }, "bot_logs": { "lines": 200 }, "resources": {}, "transport_state": {}, "transport_probe": { "target": "x" }, "set_transport_policy": { "policy": "x" }, "fallback_crud": { "op": "x", "value": "x", "index": 0 }, "list_interfaces": {}, "set_uci_field": { "field": "x", "value": "x" }, "set_tier1_port": { "value": "x" }, "active_probe": { "cached": "x", "section": "x" }, "runtime_sections": {}, "podkop_update_check": {}, "app_info": {}, "singbox_info": {}, "check_update": { "force": "x" }, "luci_update_check": { "force": "x" }, "update_paste": { "body": "x" }, "test_telegram": { "token": "x" }, "ensure_mixed_proxy": { "section": "x" }, "test_github": {} }'
+		echo '{ "list": {}, "status": {}, "service": { "action": "start_bot" }, "installer": { "action": "status", "config_path": "x", "config_inline": "x" }, "logs": { "offset": 0 }, "bot_logs": { "lines": 200 }, "resources": {}, "transport_state": {}, "transport_probe": { "target": "x" }, "set_transport_policy": { "policy": "x" }, "fallback_crud": { "op": "x", "value": "x", "index": 0 }, "list_interfaces": {}, "set_uci_field": { "field": "x", "value": "x" }, "set_tier1_port": { "value": "x" }, "active_probe": { "cached": "x", "section": "x" }, "runtime_sections": {}, "podkop_update_check": {}, "app_info": {}, "singbox_info": {}, "check_update": { "force": "x" }, "luci_update_check": { "force": "x" }, "luci_update_run": {}, "luci_update_log": { "offset": "x" }, "update_paste": { "body": "x" }, "test_telegram": { "token": "x" }, "ensure_mixed_proxy": { "section": "x" }, "test_github": {} }'
 		;;
 	call)
 		case "$2" in
@@ -1741,6 +1793,8 @@ case "$1" in
 			singbox_info)         method_singbox_info ;;
 			check_update)         method_check_update ;;
 			luci_update_check)    method_luci_update_check ;;
+			luci_update_run)      method_luci_update_run ;;
+			luci_update_log)      method_luci_update_log ;;
 			update_paste)         method_update_paste ;;
 			test_telegram)        method_test_telegram ;;
 			ensure_mixed_proxy)   method_ensure_mixed_proxy ;;

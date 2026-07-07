@@ -293,7 +293,7 @@ esac
 unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="2.4.2"
+INSTALLER_VERSION="2.5.0"
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
 VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
@@ -321,12 +321,14 @@ _PROXY_BOOTSTRAPPED=0
 UNATTENDED=0
 UA_ACTION=""
 UA_CONFIG=""
+UA_WITH_LUCI=0
 LANG_FORCED=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --unattended)     UNATTENDED=1; shift ;;
         --action)         UA_ACTION="$2"; shift 2 ;;
+        --with-luci)      UA_WITH_LUCI=1; shift ;;
         --config)         UA_CONFIG="$2"; shift 2 ;;
         --lang)           LANG_FORCED="$2"; shift 2 ;;
         -h|--help)
@@ -344,9 +346,9 @@ done
 
 if [ "$UNATTENDED" = "1" ]; then
     case "$UA_ACTION" in
-        install|update|uninstall|status|check|check-token) ;;
+        install|update|uninstall|status|check|check-token|update-luci) ;;
         *)
-            echo "ERROR: --unattended requires --action install|update|uninstall|status|check|check-token"
+            echo "ERROR: --unattended requires --action install|update|uninstall|status|check|check-token|update-luci"
             exit 2
             ;;
     esac
@@ -1436,7 +1438,91 @@ _curl_socks_fallover() {
     return 1
 }
 
-# ── User-supplied proxy bootstrap (fresh-install only) ──────────────────────
+# ── LuCI web UI (luci-app-podkop-bot) install/update ────────────────────────
+# The web UI is a SEPARATE package from the bot. This installs or updates it by
+# fetching the latest release asset from GitHub and handing it to the system
+# package manager. Two things make it non-trivial:
+#   1. The asset kind depends on the package manager: opkg wants the .ipk,
+#      apk (OpenWrt 24+/25+) wants the .apk.
+#   2. The web UI ships the rpcd backend that may itself be driving this very
+#      update. So the actual package-manager call is DETACHED (setsid/nohup) and
+#      logs to a file the UI polls — if rpcd restarts mid-install, the install
+#      still completes and the log survives.
+LUCI_REPO="Medvedolog/luci-app-podkop-bot"
+LUCI_UPDATE_LOG="/tmp/podkop_bot_luci_update.log"
+
+# _update_luci_app: fetch latest LuCI release asset and install it detached.
+# Honors the same direct→SOCKS fallover as everything else. Writes progress to
+# LUCI_UPDATE_LOG. Returns 0 once the install has been *launched* (not finished
+# — it's detached on purpose); non-zero if we couldn't even fetch the asset.
+_update_luci_app() {
+    : > "$LUCI_UPDATE_LOG" 2>/dev/null
+    _lu_log() { echo "$1" | tee -a "$LUCI_UPDATE_LOG" 2>/dev/null; }
+
+    # This path needs curl (via _curl_socks_fallover). On a router with the bot
+    # already installed, curl is always present. Only a manual --action
+    # update-luci on a bare system could hit this — fail loudly, don't hang.
+    if ! command -v curl >/dev/null 2>&1; then
+        _lu_log "[!!] curl not found. Install the bot first (it pulls curl), or install curl manually."
+        return 1
+    fi
+
+    # pkg manager → asset suffix
+    local _pm=""
+    if command -v apk >/dev/null 2>&1; then _pm="apk"
+    elif command -v opkg >/dev/null 2>&1; then _pm="opkg"
+    else _lu_log "[!!] Neither apk nor opkg found"; return 1; fi
+    local _suffix; [ "$_pm" = "apk" ] && _suffix="_noarch.apk" || _suffix="_all.ipk"
+    _lu_log "[OK] Package manager: $_pm (asset *$_suffix)"
+
+    # latest release metadata
+    local _api="https://api.github.com/repos/${LUCI_REPO}/releases/latest"
+    _lu_log "  Fetching latest release info…"
+    local _json; _json=$(_curl_socks_fallover 15 "$_api")
+    if [ -z "$_json" ]; then _lu_log "[!!] Could not reach GitHub API (direct or SOCKS)"; return 1; fi
+    [ -n "$_last_socks_route" ] && _lu_log "  (via $_last_socks_route)" || _lu_log "  (direct)"
+
+    local _tag; _tag=$(printf '%s' "$_json" | sed -n 's/.*"tag_name"[: ]*"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$_tag" ] && _lu_log "[OK] Latest release: $_tag"
+
+    # asset download URL matching our suffix
+    local _url
+    _url=$(printf '%s' "$_json" \
+        | tr ',' '\n' \
+        | grep -oE '"browser_download_url"[: ]*"[^"]*'"$_suffix"'"' \
+        | sed -n 's/.*"\(https[^"]*\)".*/\1/p' | head -1)
+    if [ -z "$_url" ]; then _lu_log "[!!] No $_suffix asset in latest release"; return 1; fi
+    _lu_log "  Asset: $_url"
+
+    # download to /tmp
+    local _dst="/tmp/luci-app-podkop-bot${_suffix}"
+    rm -f "$_dst" 2>/dev/null
+    _lu_log "  Downloading…"
+    if ! _curl_socks_fallover 60 -o "$_dst" "$_url"; then
+        _lu_log "[!!] Download failed"; return 1
+    fi
+    [ -s "$_dst" ] || { _lu_log "[!!] Downloaded file is empty"; return 1; }
+    _lu_log "[OK] Downloaded $(wc -c < "$_dst" 2>/dev/null) bytes → $_dst"
+
+    # build the detached install command per package manager
+    local _cmd
+    if [ "$_pm" = "apk" ]; then
+        _cmd="apk add --allow-untrusted '$_dst'"
+    else
+        _cmd="opkg install --force-reinstall '$_dst'"
+    fi
+
+    _lu_log "  Installing via $_pm (detached — the web UI may restart)…"
+    # Detach so a mid-install rpcd restart doesn't kill the package manager.
+    # setsid if available, else nohup+&; append to the same log.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh -c "{ $_cmd; echo \"[done] exit \$?\"; } >> '$LUCI_UPDATE_LOG' 2>&1" >/dev/null 2>&1 &
+    else
+        nohup sh -c "{ $_cmd; echo \"[done] exit \$?\"; } >> '$LUCI_UPDATE_LOG' 2>&1" >/dev/null 2>&1 &
+    fi
+    _lu_log "  Launched. Watch this log for completion."
+    return 0
+}
 # On a brand-new install there is no podkop Mixed Proxy guaranteed to be
 # enabled yet and no podkop_bot fallback_socks (that config doesn't exist
 # until this installer writes it at the end). If GitHub/raw.githubusercontent
@@ -1815,6 +1901,18 @@ case "$UA_ACTION" in
     status|check|check-token) : ;;   # read-only, no lock
     *) _acquire_lock ;;
 esac
+
+# ── Unattended: update the LuCI web UI, then exit ──────────────────────────────
+# Self-contained: fetch the latest release asset and launch a detached install.
+# Runs before the bot-oriented OS/dependency machinery because it targets a
+# different package and must survive an rpcd restart triggered by its own
+# install. The rpcd backend invokes this as: --unattended --action update-luci
+if [ "$UNATTENDED" = "1" ] && [ "$UA_ACTION" = "update-luci" ]; then
+    _update_luci_app
+    _rc=$?
+    _release_lock 2>/dev/null || true
+    exit $_rc
+fi
 
 # ── Pure-output guard for status/check (Fix 1) ─────────────────────────────────
 # luci-app-podkop-bot's rpcd backend pipes `--action status` straight into a
@@ -2984,6 +3082,43 @@ else
     fi
     echo ""
     echo "GitHub: https://github.com/Medvedolog/podkop_bot"
+fi
+
+# ── Offer to install/update the LuCI web UI ────────────────────────────────────
+# The bot works entirely from Telegram, but most users also want the web panel.
+# Only offered after a bot install/update (not status/check/uninstall). In
+# unattended mode it's opt-in via --with-luci; interactively we ask.
+if [ "$UA_ACTION" = "install" ] || [ "$UA_ACTION" = "update" ] || [ "$UNATTENDED" != "1" ]; then
+    _do_luci=0
+    if [ "$UNATTENDED" = "1" ]; then
+        [ "${UA_WITH_LUCI:-0}" = "1" ] && _do_luci=1
+    else
+        echo ""
+        if [ "$UI_LANG" = "ru" ]; then
+            printf "  Установить/обновить веб-интерфейс (LuCI)? [Y/n]: "
+        else
+            printf "  Install/update the LuCI web UI? [Y/n]: "
+        fi
+        read -r _ans
+        case "$_ans" in n|N|no|No|NO) _do_luci=0 ;; *) _do_luci=1 ;; esac
+    fi
+    if [ "$_do_luci" = "1" ]; then
+        echo ""
+        if [ "$UI_LANG" = "ru" ]; then echo "  Устанавливаю веб-интерфейс…"; else echo "  Installing the web UI…"; fi
+        if _update_luci_app; then
+            if [ "$UI_LANG" = "ru" ]; then
+                echo "  Запущено (в фоне). Лог: $LUCI_UPDATE_LOG"
+            else
+                echo "  Launched (background). Log: $LUCI_UPDATE_LOG"
+            fi
+        else
+            if [ "$UI_LANG" = "ru" ]; then
+                echo "  [!!] Не удалось получить пакет веб-интерфейса. Поставьте вручную из релизов."
+            else
+                echo "  [!!] Could not fetch the web UI package. Install manually from Releases."
+            fi
+        fi
+    fi
 fi
 
 _release_lock

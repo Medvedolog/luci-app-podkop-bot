@@ -19,7 +19,7 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.17.2"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
+LUCI_APP_VERSION="0.17.6"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
 
 # -- degraded helper (18q.1) -------------------------------------------------
 emit_unavailable() {
@@ -1541,56 +1541,196 @@ method_active_probe() {
 	_proxy="socks5h://$_ip:$_port"
 	_human_name=""
 
-	# --- geo of the exit (country / provider) via ipinfo through the tunnel ---
-	_geo=$(curl -s -k -x "$_proxy" --connect-timeout 6 --max-time 12 "https://ipinfo.io/json" 2>/dev/null)
-	_g_ip=$(printf '%s' "$_geo" | sed -n 's/.*"ip"[: ]*"\([^"]*\)".*/\1/p' | head -1)
-	_g_country=$(printf '%s' "$_geo" | sed -n 's/.*"country"[: ]*"\([^"]*\)".*/\1/p' | head -1)
-	_g_org=$(printf '%s' "$_geo" | sed -n 's/.*"org"[: ]*"\([^"]*\)".*/\1/p' | head -1)
+	# --- geo of the exit (ip / country / provider) through the tunnel ---
+	# Multi-source fallback (ipregion's approach): if one geo provider is down,
+	# rate-limited, or blocked, try the next. Each has a different JSON shape, so
+	# normalize into _g_ip / _g_country (ISO-2) / _g_org. First source that
+	# yields a non-empty IP wins. This matters because _g_country also drives the
+	# Gemini region check and the datacenter/hosting heuristic below.
+	_g_ip=""; _g_country=""; _g_org=""
+	_geo_try() {
+		[ -n "$_g_ip" ] && return 0
+		_gurl="$1"; _gkind="$2"; _ghdr="$3"
+		_gj=$(curl -s -k -x "$_proxy" ${_ghdr:+-H "$_ghdr"} --connect-timeout 5 --max-time 10 "$_gurl" 2>/dev/null)
+		[ -z "$_gj" ] && return 1
+		case "$_gkind" in
+			ipinfo)  _g_ip=$(printf '%s' "$_gj" | jq -r '.ip // empty' 2>/dev/null)
+			         _g_country=$(printf '%s' "$_gj" | jq -r '.country // empty' 2>/dev/null)
+			         _g_org=$(printf '%s' "$_gj" | jq -r '.org // empty' 2>/dev/null) ;;
+			ipapi)   _g_ip=$(printf '%s' "$_gj" | jq -r '.ip // empty' 2>/dev/null)
+			         _g_country=$(printf '%s' "$_gj" | jq -r '.country // empty' 2>/dev/null)
+			         _g_org=$(printf '%s' "$_gj" | jq -r '.org // empty' 2>/dev/null) ;;
+			ipwho)   _g_ip=$(printf '%s' "$_gj" | jq -r '.ip // empty' 2>/dev/null)
+			         _g_country=$(printf '%s' "$_gj" | jq -r '.country_code // empty' 2>/dev/null)
+			         _g_org=$(printf '%s' "$_gj" | jq -r '(.connection.org // .connection.isp) // empty' 2>/dev/null) ;;
+			ipapicom) _g_ip=$(printf '%s' "$_gj" | jq -r '.query // empty' 2>/dev/null)
+			         _g_country=$(printf '%s' "$_gj" | jq -r '.countryCode // empty' 2>/dev/null)
+			         _g_org=$(printf '%s' "$_gj" | jq -r '(.org // .isp // .as) // empty' 2>/dev/null) ;;
+		esac
+		[ -n "$_g_ip" ] && return 0 || return 1
+	}
+	_geo_try "https://ipinfo.io/json" "ipinfo"
+	_geo_try "https://ipapi.co/json/" "ipapi"
+	_geo_try "https://ipwho.is/" "ipwho"
+	_geo_try "http://ip-api.com/json/?fields=query,countryCode,org,isp,as" "ipapicom"
 
-	# --- per-service reachability through the tunnel ---
-	# emits JSON array of {name, status, code}; status: ok|blocked|timeout|other
-	_svc_json="["
-	_svc_first=1
-	_probe_svc() {
-		_sname="$1"; _surl="$2"; _ok_codes="$3"; _geo_kind="$4"
-		# YouTube's sw.js_data returns the country YouTube thinks we're in; capture
-		# the body for those services so we can show "видит нас как: RU" (like the
-		# bot does for YouTube). Others probe headers-only.
+	# --- per-service reachability through the tunnel (PARALLEL) ---
+	# Each probe runs in the background and writes ONE line to its own file:
+	#   status|code|ms|geo
+	# The parent fans them out, waits up to _SVC_DEADLINE seconds total, then
+	# joins whatever finished. Anything still missing/empty becomes status "na"
+	# (N/A) so the UI never blocks on a single slow/hung service. This replaces
+	# the old sequential loop whose worst case was ~N×12s.
+	_SVC_DEADLINE=15
+	_svc_dir="/tmp/podkop_luci_svc_${_sec}_$$"
+	rm -rf "$_svc_dir" 2>/dev/null; mkdir -p "$_svc_dir" 2>/dev/null
+
+	# Public web-client keys (not secrets — from each service's own web app, same
+	# as ipregion). May rotate upstream; refresh if a geo stops resolving.
+	_K_CHATGPT="client-zUdXdSTygXJdzoE0sWTkP8GKTVsUMF2IRM7ShVO2JAG"
+	_K_NETFLIX="YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm"
+	_K_SPOTIFY="142b583129b2df829de3656f9eb484e6"
+	_K_SPOTIFY_CID="9a8d2f0ce77a4e248bb71fefcb557637"
+	_K_TWITCH="kimne78kx3ncx6brgo4mv6wki5h1ko"
+
+	# _probe_one <slot> <url> <ok_codes> <geo_kind> <method> <header>
+	# Writes "status|code|ms|geo" to $_svc_dir/<slot>. Runs in background.
+	_probe_one() {
+		_slot="$1"; _surl="$2"; _ok_codes="$3"; _geo_kind="$4"; _method="${5:-GET}"; _hdr="$6"; _data="$7"
+		_bodyf="$_svc_dir/.body_$_slot"
 		if [ -n "$_geo_kind" ]; then
-			_resp=$(curl -s -k -o /tmp/podkop_luci_svc_${_sec}_$$.tmp -w '%{http_code} %{time_total}' -x "$_proxy" \
-				--connect-timeout 6 --max-time 12 "$_surl" 2>/dev/null)
+			_resp=$(curl -s -k -o "$_bodyf" -w '%{http_code} %{time_total}' -x "$_proxy" \
+				${_method:+-X "$_method"} ${_hdr:+-H "$_hdr"} ${_data:+--data "$_data"} \
+				--connect-timeout 5 --max-time 12 "$_surl" 2>/dev/null)
 		else
 			_resp=$(curl -s -k -o /dev/null -w '%{http_code} %{time_total}' -x "$_proxy" \
-				--connect-timeout 6 --max-time 12 "$_surl" 2>/dev/null)
+				--connect-timeout 5 --max-time 12 "$_surl" 2>/dev/null)
 		fi
 		_c=$(printf '%s' "$_resp" | awk '{print $1}')
 		_ct=$(printf '%s' "$_resp" | awk '{print $2}')
 		_cms=$(awk -v s="$_ct" 'BEGIN{ printf "%d", (s*1000) }' 2>/dev/null); [ -z "$_cms" ] && _cms=0
 		case " $_ok_codes " in
-			*" $_c "*)         _sstat="ok" ;;
+			*" $_c "*)   _sstat="ok" ;;
 			*) case "$_c" in
-				''|000)        _sstat="timeout" ;;
-				403|451)       _sstat="blocked" ;;
-				*)             _sstat="other" ;;
+				''|000)  _sstat="timeout" ;;
+				403|451) _sstat="blocked" ;;
+				*)       _sstat="other" ;;
 			   esac ;;
 		esac
-		# per-service detected country (currently YouTube only, via sw.js_data)
 		_sgeo=""
-		if [ "$_geo_kind" = "youtube" ] && [ "$_c" = "200" ] && [ -s /tmp/podkop_luci_svc_${_sec}_$$.tmp ]; then
-			_sgeo=$(tail -n +3 /tmp/podkop_luci_svc_${_sec}_$$.tmp 2>/dev/null | jq -r '.[0][2][0][0][1] // empty' 2>/dev/null)
+		if [ -n "$_geo_kind" ] && [ -s "$_bodyf" ]; then
+			case "$_geo_kind" in
+				youtube) _sgeo=$(tail -n +3 "$_bodyf" 2>/dev/null | jq -r '.[0][2][0][0][1] // empty' 2>/dev/null) ;;
+				chatgpt) _sgeo=$(jq -r '.derived_fields.country // empty' "$_bodyf" 2>/dev/null) ;;
+				netflix) _sgeo=$(jq -r '.client.location.country // empty' "$_bodyf" 2>/dev/null) ;;
+				spotify) _sgeo=$(jq -r '.country // empty' "$_bodyf" 2>/dev/null) ;;
+				tiktok)  _sgeo=$(jq -r '.body.appProps.region // empty' "$_bodyf" 2>/dev/null) ;;
+				twitch)  _sgeo=$(jq -r '.[0].data.requestInfo.countryCode // empty' "$_bodyf" 2>/dev/null) ;;
+				apple)   _sgeo=$(head -c 8 "$_bodyf" 2>/dev/null | tr -dc 'A-Za-z' | cut -c1-2 | tr 'a-z' 'A-Z') ;;
+			esac
 		fi
-		rm -f /tmp/podkop_luci_svc_${_sec}_$$.tmp 2>/dev/null
-		[ "$_svc_first" = "1" ] && _svc_first=0 || _svc_json="$_svc_json,"
-		_svc_json="$_svc_json{\"name\":$(_json_str "$_sname"),\"status\":\"$_sstat\",\"code\":\"${_c:-000}\",\"ms\":$_cms,\"geo\":$(_json_str "$_sgeo")}"
+		rm -f "$_bodyf" 2>/dev/null
+		printf '%s|%s|%s|%s' "$_sstat" "${_c:-000}" "$_cms" "$_sgeo" > "$_svc_dir/$_slot" 2>/dev/null
 	}
-	_probe_svc "Telegram API" "https://api.telegram.org" "200 302"
-	_probe_svc "GitHub"       "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" "200"
-	_probe_svc "ChatGPT"      "https://api.openai.com/v1/models" "200 401"
-	_probe_svc "Claude"       "https://api.anthropic.com/v1/models" "200 401"
-	_probe_svc "Gemini"       "https://gemini.google.com/app" "200"
-	_probe_svc "YouTube"      "https://www.youtube.com/sw.js_data" "200" "youtube"
-	_probe_svc "Discord"      "https://discord.com/api/v9/gateway" "200"
+
+	# Gemini "supported in this region?" (ipregion approach, simplified): the
+	# exit country is already known from ipinfo above ($_g_country, an ISO code).
+	# We fetch Google's official available-regions list (country NAMES) and check
+	# membership. A tiny code→name map covers the common cases; unknown codes
+	# fall back to "na". Runs in the background like the others.
+	_probe_gemini() {
+		_gcode="$_g_country"
+		[ -z "$_gcode" ] && { printf 'na|000|0|' > "$_svc_dir/gemini"; return; }
+		# minimal ISO-3166 alpha-2 → English name map for the countries most
+		# relevant to podkop users; extend as needed.
+		case "$_gcode" in
+			US) _gname="United States" ;; GB) _gname="United Kingdom" ;;
+			DE) _gname="Germany" ;;       FR) _gname="France" ;;
+			NL) _gname="Netherlands" ;;   SE) _gname="Sweden" ;;
+			FI) _gname="Finland" ;;       PL) _gname="Poland" ;;
+			ES) _gname="Spain" ;;         IT) _gname="Italy" ;;
+			CH) _gname="Switzerland" ;;   AT) _gname="Austria" ;;
+			CA) _gname="Canada" ;;        JP) _gname="Japan" ;;
+			SG) _gname="Singapore" ;;     TR) _gname="Turkey" ;;
+			AE) _gname="United Arab Emirates" ;; KZ) _gname="Kazakhstan" ;;
+			RU) _gname="Russia" ;;        UA) _gname="Ukraine" ;;
+			*)  _gname="" ;;
+		esac
+		if [ -z "$_gname" ]; then printf 'na|000|0|%s' "$_gcode" > "$_svc_dir/gemini"; return; fi
+		_gm=$(curl -s -k -x "$_proxy" --connect-timeout 5 --max-time 12 \
+			"https://ai.google.dev/gemini-api/docs/available-regions.md.txt" 2>/dev/null)
+		if [ -z "$_gm" ]; then printf 'na|000|0|%s' "$_gcode" > "$_svc_dir/gemini"; return; fi
+		if printf '%s' "$_gm" | grep -qiE "^- ${_gname}$"; then
+			printf 'ok|200|0|%s ✓' "$_gcode" > "$_svc_dir/gemini"
+		else
+			printf 'blocked|200|0|%s ✗' "$_gcode" > "$_svc_dir/gemini"
+		fi
+	}
+
+	# Fan out (slot names double as display labels via _svc_label below).
+	# Collect PIDs explicitly — `jobs -p` is empty in a non-interactive shell,
+	# so we can't rely on it to reap stragglers.
+	_pids=""
+	_probe_one "TelegramAPI" "https://api.telegram.org" "200 302" & _pids="$_pids $!"
+	_probe_one "GitHub"      "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" "200" & _pids="$_pids $!"
+	_probe_one "Claude"      "https://api.anthropic.com/v1/models" "200 401" & _pids="$_pids $!"
+	_probe_one "YouTube"     "https://www.youtube.com/sw.js_data" "200" "youtube" & _pids="$_pids $!"
+	_probe_one "ChatGPT"     "https://ab.chatgpt.com/v1/initialize" "200 401" "chatgpt" "POST" "Statsig-Api-Key: $_K_CHATGPT" & _pids="$_pids $!"
+	_probe_one "Netflix"     "https://api.fast.com/netflix/speedtest/v2?https=true&token=$_K_NETFLIX&urlCount=1" "200" "netflix" & _pids="$_pids $!"
+	_probe_one "Spotify"     "https://spclient.wg.spotify.com/signup/public/v1/account/?validate=1&key=$_K_SPOTIFY" "200" "spotify" "GET" "X-Client-Id: $_K_SPOTIFY_CID" & _pids="$_pids $!"
+	_probe_one "TikTok"      "https://www.tiktok.com/api/v1/web-cookie-privacy/config?appId=1988" "200" "tiktok" & _pids="$_pids $!"
+	_TWITCH_GQL='[{"operationName":"VerifyEmail_CurrentUser","variables":{},"extensions":{"persistedQuery":{"version":1,"sha256Hash":"f9e7dcdf7e99c314c82d8f7f725fab5f99d1df3d7359b53c9ae122deec590198"}}}]'
+	_probe_one "Twitch"      "https://gql.twitch.tv/gql" "200" "twitch" "POST" "Client-Id: $_K_TWITCH" "$_TWITCH_GQL" & _pids="$_pids $!"
+	_probe_one "Apple"       "https://gspe1-ssl.ls.apple.com/pep/gcc" "200" "apple" & _pids="$_pids $!"
+	_probe_one "Discord"     "https://discord.com/api/v9/gateway" "200" & _pids="$_pids $!"
+	_probe_gemini & _pids="$_pids $!"
+
+	# Wait with a hard deadline: poll for all slot files, but never exceed
+	# _SVC_DEADLINE seconds. Then reap stragglers so no background curl lingers.
+	_deadline=$(( $(date +%s 2>/dev/null || echo 0) + _SVC_DEADLINE ))
+	_expected="TelegramAPI GitHub Claude YouTube ChatGPT Netflix Spotify TikTok Twitch Apple Discord gemini"
+	while :; do
+		_missing=0
+		for _e in $_expected; do [ -f "$_svc_dir/$_e" ] || _missing=1; done
+		[ "$_missing" = "0" ] && break
+		[ "$(date +%s 2>/dev/null || echo 0)" -ge "$_deadline" ] 2>/dev/null && break
+		sleep 1
+	done
+	# Reap any stragglers by PID (each curl also has its own --max-time).
+	for _p in $_pids; do kill "$_p" 2>/dev/null; done
+	wait 2>/dev/null
+
+	# Join slot files into the JSON array, in a stable display order. Missing or
+	# empty files → status "na". _svc_label maps slot → human name.
+	_svc_label() {
+		case "$1" in
+			TelegramAPI) echo "Telegram API" ;;
+			gemini)      echo "Gemini" ;;
+			*)           echo "$1" ;;
+		esac
+	}
+	# Gemini slot file is lowercase; the join loop reads it as-is.
+	_svc_json="["
+	_svc_first=1
+	for _slot in TelegramAPI GitHub Claude YouTube ChatGPT gemini Netflix Spotify TikTok Twitch Apple Discord; do
+		_f="$_svc_dir/$_slot"
+		if [ -s "$_f" ]; then
+			_line=$(cat "$_f" 2>/dev/null)
+			_sstat=$(printf '%s' "$_line" | cut -d'|' -f1)
+			_c=$(printf '%s' "$_line" | cut -d'|' -f2)
+			_cms=$(printf '%s' "$_line" | cut -d'|' -f3)
+			_sgeo=$(printf '%s' "$_line" | cut -d'|' -f4-)
+		else
+			_sstat="na"; _c="000"; _cms=0; _sgeo=""
+		fi
+		[ -z "$_sstat" ] && _sstat="na"
+		[ -z "$_cms" ] && _cms=0
+		_lbl=$(_svc_label "$_slot")
+		[ "$_svc_first" = "1" ] && _svc_first=0 || _svc_json="$_svc_json,"
+		_svc_json="$_svc_json{\"name\":$(_json_str "$_lbl"),\"status\":\"$_sstat\",\"code\":\"${_c:-000}\",\"ms\":${_cms:-0},\"geo\":$(_json_str "$_sgeo")}"
+	done
 	_svc_json="$_svc_json]"
+	rm -rf "$_svc_dir" 2>/dev/null
 
 	# --- throughput + TSPU block detection (bot's two-stage test, TZ) ---
 	# Stage 1: 32 KB — РКН/ТСПУ drops after ~16 KB. ≤20 KB received = block16k.
@@ -1605,11 +1745,27 @@ method_active_probe() {
 	elif [ "${_s1kb:-0}" -le 20 ]; then
 		_speed_status="block16k"
 	else
-		# Stage 2: 1 MB — accurate speed
+		# Stage 2: 3 MB — larger sample lets TCP finish slow-start so fast links
+		# (100+ Mbit/s, where 1 MB completes before the window opens up) aren't
+		# under-reported. curl's %{speed_download} reflects the actual achieved
+		# rate even if --max-time cuts a slow link short, so this stays bounded.
 		_raw2=$(curl -s -k -x "$_proxy" --connect-timeout 6 --max-time 60 \
-			-H "Range: bytes=0-1048575" -o /dev/null \
-			-w "%{speed_download}" "https://speed.cloudflare.com/__down?bytes=1048576" 2>/dev/null)
+			-H "Range: bytes=0-3145727" -o /dev/null \
+			-w "%{speed_download}" "https://speed.cloudflare.com/__down?bytes=3145728" 2>/dev/null)
 		_bps=$(printf '%s' "$_raw2" | grep -oE '^[0-9]+(\.[0-9]+)?' || echo 0)
+		# Fallback: if Cloudflare's endpoint is unreachable (0 bytes/s) but the
+		# tunnel itself works (stage 1 passed), retry against a fast.com CDN URL
+		# so a single provider outage doesn't zero out the speed reading.
+		if [ "$(awk "BEGIN{print (${_bps:-0} <= 0)}")" = "1" ]; then
+			_furl=$(curl -s -k -x "$_proxy" --connect-timeout 5 --max-time 10 \
+				"https://api.fast.com/netflix/speedtest/v2?https=true&token=$_K_NETFLIX&urlCount=1" 2>/dev/null \
+				| jq -r '.targets[0].url // empty' 2>/dev/null)
+			if [ -n "$_furl" ]; then
+				_raw2b=$(curl -s -k -x "$_proxy" --connect-timeout 6 --max-time 60 \
+					-r 0-3145727 -o /dev/null -w "%{speed_download}" "$_furl" 2>/dev/null)
+				_bps=$(printf '%s' "$_raw2b" | grep -oE '^[0-9]+(\.[0-9]+)?' || echo 0)
+			fi
+		fi
 		_speed_mbps=$(awk "BEGIN{printf \"%.2f\", ${_bps:-0}*8/1000000}")
 	fi
 

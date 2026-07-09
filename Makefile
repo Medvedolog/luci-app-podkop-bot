@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-podkop-bot
-PKG_VERSION:=0.17.2
+PKG_VERSION:=0.17.6
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Medvedolog

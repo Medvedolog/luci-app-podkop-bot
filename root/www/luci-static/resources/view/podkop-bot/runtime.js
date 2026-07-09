@@ -282,10 +282,15 @@ return view.extend({
 					(d.services || []).map(function(s) {
 						var c = (s.status === 'ok') ? 'green'
 							: (s.status === 'blocked') ? 'yellow'
+							: (s.status === 'na') ? 'grey'
 							: (s.status === 'timeout') ? 'grey' : 'yellow';
 						var ms = (s.ms != null && s.ms > 0) ? (' · ' + s.ms + _(' мс')) : '';
 						var geo = (s.geo && s.geo.trim()) ? (' · ' + s.geo) : '';
-						var label = s.name + (s.code && s.code !== '000' ? (' ' + s.code) : '') + ms + geo;
+						/* N/A = probe didn't finish within the deadline; show it
+						 * plainly instead of a misleading code/latency. */
+						var label = (s.status === 'na')
+							? (s.name + ' · N/A')
+							: (s.name + (s.code && s.code !== '000' ? (' ' + s.code) : '') + ms + geo);
 						/* justify-content:flex-start keeps the dot hugging its label
 						 * instead of the grid cell stretching them to opposite edges
 						 * on narrow screens. */

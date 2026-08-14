@@ -15,6 +15,29 @@
  */
 
 var callState   = rpc.declare({ object:'podkop_bot', method:'transport_state' });
+
+/* Auto-run the full-chain test once per page session on first open of the
+ * Transport tab (like Runtime's active probe). After that, results + the check
+ * time are kept in-module and shown from cache until the user hits the button
+ * again. Reset on full page reload. */
+var _chainTestedThisSession = false;
+var _chainCache = {};      // chainKey(t) -> { html, colour, active }
+var _chainCheckedAt = 0;   // epoch seconds of last full-chain run
+
+/* Cache key includes the endpoint, not just the tier slot id — so if tier2_1
+ * changes from proxy A to proxy B, the old cached result no longer matches and
+ * won't be shown on the new row. tier4 has no endpoint, keyed by 'direct'. */
+function chainKey(t) {
+	var ep = (t.id === 'tier4') ? 'direct' : fbEndpoint(t.endpoint || '');
+	return t.id + '|' + ep;
+}
+/* Drop all cached probe results + force a fresh auto-test next render. Called
+ * after any mutation of the chain (add/edit/delete/move/port/custom/iface). */
+function clearChainProbeCache() {
+	_chainCache = {};
+	_chainCheckedAt = 0;
+	_chainTestedThisSession = false;
+}
 var callProbe   = rpc.declare({ object:'podkop_bot', method:'transport_probe', params:['target'] });
 var callEnsureMP = rpc.declare({ object:'podkop_bot', method:'ensure_mixed_proxy' });
 var callSetPolicy = rpc.declare({ object:'podkop_bot', method:'set_transport_policy', params:['policy'] });
@@ -23,6 +46,56 @@ var callListIfaces = rpc.declare({ object:'podkop_bot', method:'list_interfaces'
 var callSetField = rpc.declare({ object:'podkop_bot', method:'set_uci_field', params:['field','value'] });
 var callSetTier1Port = rpc.declare({ object:'podkop_bot', method:'set_tier1_port', params:['value','section'] });
 var callRuntimeSections = rpc.declare({ object:'podkop_bot', method:'runtime_sections' });
+
+/* Fallback-proxy display helpers, matching the bot/rpcd contract. A record is
+ * scheme://[user:pass@]host:port[#mnemonic]. For display we mask the password
+ * and prefer the mnemonic; the raw value is kept for editing. */
+function fbEndpoint(s) { return String(s || '').split('#')[0]; }
+function fbMnemonic(s) { var i = String(s || '').indexOf('#'); return i < 0 ? '' : String(s).slice(i + 1); }
+function fbMask(s) { return String(s || '').replace(/(:\/\/[^:@/]+:)[^@/]*@/, '$1***@'); }
+
+/* Parse a fallback record scheme://[user:pass@]host:port[#name] into fields for
+ * the edit form. Splits mnemonic first (order matters), then scheme, then
+ * optional user[:pass]@, then host:port. */
+function fbParse(s) {
+	var out = { scheme:'socks5h', user:'', pass:'', host:'', port:'', mnemonic:'' };
+	var raw = String(s || '').trim();
+	if (!raw) return out;
+	out.mnemonic = fbMnemonic(raw);
+	var ep = fbEndpoint(raw);
+	var m = ep.match(/^([a-z0-9]+):\/\/(.*)$/i);
+	if (!m) return out;
+	out.scheme = m[1].toLowerCase();
+	var rest = m[2];
+	var at = rest.lastIndexOf('@');
+	if (at >= 0) {
+		var creds = rest.slice(0, at);
+		rest = rest.slice(at + 1);
+		var ci = creds.indexOf(':');
+		if (ci >= 0) { out.user = creds.slice(0, ci); out.pass = creds.slice(ci + 1); }
+		else { out.user = creds; }
+	}
+	/* host:port — split on the last colon. IPv6 in brackets is NOT supported
+	 * (backend regex rejects it); hosts are IPv4 or names. */
+	var pc = rest.lastIndexOf(':');
+	if (pc >= 0) { out.host = rest.slice(0, pc); out.port = rest.slice(pc + 1); }
+	else { out.host = rest; }
+	return out;
+}
+
+/* Build scheme://[user[:pass]@]host:port[#name] from form field values. */
+function fbBuild(f) {
+	var auth = f.user ? (f.user + (f.pass ? ':' + f.pass : '') + '@') : '';
+	var mn = f.mnemonic ? ('#' + f.mnemonic) : '';
+	return f.scheme + '://' + auth + f.host + ':' + f.port + mn;
+}
+function fbDisplay(s) {
+	/* Show BOTH the mnemonic (if any) and the masked address — a mnemonic is a
+	 * label, not a replacement for seeing which proxy it is. */
+	var m = fbMnemonic(s);
+	var ep = fbMask(fbEndpoint(s));
+	return m ? (m + ' — ' + ep) : ep;
+}
 
 var COLOURS = { green:'#33a02c', yellow:'#e8a33d', grey:'#888888', red:'#cc2b2b' };
 function dot(c, label) {
@@ -86,32 +159,50 @@ return view.extend({
 		this.chainBox = chainBox;
 		this.tiers = tiers;
 
+		var addBtn = E('button', {
+			'class':'cbi-button cbi-button-add',
+			'click': ui.createHandlerFn(this, function(){ return self.fbForm(-1, ''); })
+		}, _('Добавить резервный прокси'));
+
 		var testAllBtn = E('button', {
 			'class':'cbi-button cbi-button-action',
 			'click': ui.createHandlerFn(this, 'testFullChain')
 		}, _('Тест всей цепочки'));
+		this._testAllBtn = testAllBtn;
 
 		var reloadBtn = E('button', {
 			'class':'cbi-button',
-			'style':'margin-left:.5em;',
 			'click': ui.createHandlerFn(this, function() {
-				return callState().then(function(d){
-					self.state = d;
-					self.tiers = self.buildTiers(d);
-					dom.content(self.chainBox, self.renderTiers(self.tiers, d));
-				});
+				return self.refreshState();
 			})
 		}, _('Обновить состояние'));
+		/* all three actions share one flex row: equal gap, wrap on narrow
+		 * screens, each button full-width on mobile via .pb-action-row (CSS). */
+		var actionRow = E('div', { 'class':'pb-action-row', 'style':'margin-top:1em;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ addBtn, testAllBtn, reloadBtn ]);
+		this._chainMeta = E('div', { 'style':'margin-top:.5em;color:#888;font-size:85%;' });
+		/* First open this session → auto-run the chain test (lamps + ping) so the
+		 * user sees live state without pressing anything; afterwards show cached
+		 * results + date until they hit "Тест всей цепочки" again. Also re-run if
+		 * the cache is older than the TTL, so a long-open session still refreshes.
+		 * Deferred so the DOM (result nodes) exists first. */
+		var _CHAIN_TTL = 600; // seconds (10 min)
+		var _stale = (Math.floor(Date.now()/1000) - _chainCheckedAt) > _CHAIN_TTL;
+		if (!_chainTestedThisSession || _stale) {
+			window.setTimeout(function(){ self.testFullChain(); }, 60);
+		} else {
+			window.setTimeout(function(){ self.applyChainCache(); }, 60);
+		}
 
 		return E('div', {}, [
 			E('h2', {}, _('Транспорт бота')),
-			E('p', { 'style':'color:#888;' }, _('Как бот связывается с api.telegram.org, если прямой доступ заблокирован. Активный путь подсвечен.')),
+			E('p', { 'class':'pb-muted' }, _('Как бот связывается с api.telegram.org, если прямой доступ заблокирован. Активный путь подсвечен.')),
 			this.botTransportCard(data),
-			E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+			E('div', { 'class':'cbi-section pb-card' }, [
 				E('h3', { 'style':'margin-top:0;' }, _('Цепочка fallback')),
 				chainBox,
 				this.addFbRow(),
-				E('div', { 'style':'margin-top:1em;' }, [ testAllBtn, reloadBtn ])
+				actionRow,
+				this._chainMeta
 			]),
 			this.sectionSocksCard(),
 			pbFooter()
@@ -135,7 +226,7 @@ return view.extend({
 			return s.name !== primary && s.enabled_for_runtime && s.endpoint;
 		});
 		if (!extras.length) return E('span', {});
-		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+		return E('div', { 'class':'cbi-section pb-card' }, [
 			E('h3', { 'style':'margin-top:0;' }, _('Дополнительные SOCKS секций Podkop')),
 			E('p', { 'style':'color:#888;font-size:90%;margin-top:0;' },
 				_('Mixed Proxy других секций. Бот автоматически добавляет их в цепочку как дополнительные пути к Telegram (каждая секция на своём порту — независимый выход). Задаются в Podkop, здесь не редактируются.')),
@@ -163,7 +254,7 @@ return view.extend({
 
 		/* Editable transport policy: a select + Save. socks/direct narrow how the
 		 * bot reaches Telegram and can strand it under blocking, so warn. */
-		var sel = E('select', { 'class':'cbi-input-select', 'style':'padding:.15em .4em;font-size:90%;height:auto;line-height:1.3;margin-right:.4em;' }, [
+		var sel = E('select', { 'class':'cbi-input-select', 'style':'padding:.15em .4em;font-size:90%;height:auto;line-height:1.3;max-width:100%;min-width:0;' }, [
 			E('option', { 'value':'auto' }, _('auto (direct → SOCKS)')),
 			E('option', { 'value':'socks' }, _('только SOCKS')),
 			E('option', { 'value':'direct' }, _('только direct'))
@@ -188,14 +279,14 @@ return view.extend({
 			})
 		}, _('Сохранить'));
 
-		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;' }, [
+		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
 			E('h3', { 'style':'margin-top:0;' }, _('Состояние')),
 			this.row(_('Активный маршрут'), dot(routeColour, routeLabel)),
 			this.row(_('Telegram напрямую'), dot(directColour, d.tg_direct === 'fail' ? _('заблокирован (ожидаемо)') : (d.tg_direct||'unknown'))),
 			this.row(_('Telegram через транспорт'), dot(transportColour, d.tg_transport||'unknown')),
-			E('div', { 'style':'display:flex;align-items:center;padding:.3em 0;gap:.5em;' }, [
+			E('div', { 'style':'display:flex;align-items:center;padding:.3em 0;gap:.5em;flex-wrap:wrap;' }, [
 				E('span', { 'style':'color:#888;flex:none;' }, _('Политика транспорта')),
-				E('span', { 'style':'flex:1;display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;' }, [ sel, saveBtn, policyStatus ])
+				E('span', { 'style':'display:flex;align-items:center;gap:.4em;flex-wrap:wrap;' }, [ sel, saveBtn, policyStatus ])
 			]),
 			warnNode
 		]);
@@ -210,7 +301,7 @@ return view.extend({
 			endpoint: t1.endpoint || '',
 			note: t1.mixed_proxy_enabled ? (t1.section ? (_('секция ')+t1.section) : '') : _('Mixed Proxy выключен') });
 		(d.tier2_fallback_socks || []).forEach(function(fb, i) {
-			t.push({ id:'tier2_'+(i+1), name:_('Резервный SOCKS')+' #'+(i+1)+' (tier2.'+(i+1)+')', configured:true, endpoint:fb, note:'', _fbIndex:i });
+			t.push({ id:'tier2_'+(i+1), name:_('Резервный прокси')+' #'+(i+1)+' (tier2.'+(i+1)+')', configured:true, endpoint:fb, note:'', _fbIndex:i });
 		});
 		t.push({ id:'tier3', name:_('Свой прокси (tier3)'),
 			configured: !!(d.tier3_custom_proxy && d.tier3_custom_proxy.length),
@@ -242,7 +333,7 @@ return view.extend({
 			var probeBtn = (t.endpoint && t.endpoint !== '')
 				? E('button', {
 					'class':'cbi-button',
-					'style':'padding:.1em .6em;font-size:90%;margin-left:.5em;',
+					'style':'padding:.1em .6em;font-size:90%;',
 					'click': ui.createHandlerFn(self, 'probeOne', t)
 				}, _('Тест'))
 				: E('span', {});
@@ -255,13 +346,13 @@ return view.extend({
 			 * tier4 (Direct WAN): bind_interface picker → gear. */
 			var extraBtn = E('span', {});
 			if (t.id === 'tier1') {
-				extraBtn = E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;margin-left:.5em;', 'title':_('изменить порт Mixed Proxy'),
+				extraBtn = E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('изменить порт Mixed Proxy'),
 					'click': ui.createHandlerFn(self, 'editTier1Port', t.endpoint) }, '✎');
 			} else if (t.id === 'tier3') {
-				extraBtn = E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;margin-left:.5em;', 'title':_('задать/изменить custom proxy'),
+				extraBtn = E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('задать/изменить custom proxy'),
 					'click': ui.createHandlerFn(self, 'editCustomProxy', t.endpoint) }, '✎');
 			} else if (t.id === 'tier4') {
-				extraBtn = E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;margin-left:.5em;', 'title':_('выбрать интерфейс привязки'),
+				extraBtn = E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('выбрать интерфейс привязки'),
 					'click': ui.createHandlerFn(self, 'editBindIface') }, '⚙');
 			}
 
@@ -270,14 +361,14 @@ return view.extend({
 			 * buildTiers). */
 			var crudBtns = E('span', {});
 			if (t.id.indexOf('tier2_') === 0 && t._fbIndex != null) {
-				crudBtns = E('span', { 'style':'margin-left:.5em;' }, [
+				crudBtns = E('span', { 'style':'display:inline-flex;gap:.2em;' }, [
 					E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('редактировать'),
 						'click': ui.createHandlerFn(self, 'fbEdit', t._fbIndex, t.endpoint) }, '✎'),
-					E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;margin-left:.2em;', 'title':_('выше в очереди'),
+					E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('выше в очереди'),
 						'click': ui.createHandlerFn(self, 'fbMove', t._fbIndex, 'move_up') }, '↑'),
-					E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;margin-left:.2em;', 'title':_('ниже в очереди'),
+					E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('ниже в очереди'),
 						'click': ui.createHandlerFn(self, 'fbMove', t._fbIndex, 'move_down') }, '↓'),
-					E('button', { 'class':'cbi-button cbi-button-remove', 'style':'padding:.1em .4em;font-size:85%;margin-left:.2em;', 'title':_('удалить'),
+					E('button', { 'class':'cbi-button cbi-button-remove', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('удалить'),
 						'click': ui.createHandlerFn(self, 'fbDelete', t._fbIndex, t.endpoint) }, '✕')
 				]);
 			}
@@ -286,12 +377,12 @@ return view.extend({
 			return E('div', {
 				'style':'padding:.5em .2em;border-bottom:1px solid rgba(127,127,127,.12);' + (isActive ? 'background:rgba(51,160,44,.06);' : '')
 			}, [
-				E('div', { 'style':'display:flex;align-items:center;flex-wrap:wrap;' }, [
-					dotWrap,
-					probeBtn, probeResult, extraBtn, crudBtns
+				E('div', { 'style':'display:flex;align-items:center;flex-wrap:wrap;gap:.3em;' }, [
+					dotWrap, probeBtn, extraBtn, crudBtns
 				]),
+				probeResult,
 				(t.endpoint && t.endpoint !== 'direct')
-					? E('div', { 'style':'color:#888;font-size:85%;margin-left:1.1em;font-family:monospace;' }, t.endpoint)
+					? E('div', { 'style':'color:#888;font-size:85%;margin-left:1.1em;font-family:monospace;word-break:break-all;' }, fbDisplay(t.endpoint))
 					: (t.note ? E('div', { 'style':'color:#888;font-size:85%;margin-left:1.1em;' }, t.note) : E('span', {})),
 				(t.id === 'tier1' && !t.configured)
 					? E('button', {
@@ -304,8 +395,13 @@ return view.extend({
 		}));
 	},
 
-	refreshState: function() {
+	refreshState: function(mutated) {
 		var self = this;
+		/* mutated=true → the chain changed (add/edit/delete/move/port/custom/
+		 * iface): drop probe cache so stale results can't land on new rows, and
+		 * the next render auto-re-tests. Plain refresh → re-apply cached results
+		 * and keep the "Проверено:" date so lamps don't blank out. */
+		if (mutated) clearChainProbeCache();
 		return Promise.all([
 			callState(),
 			callRuntimeSections().catch(function(){ return self.sectionsData; })
@@ -317,6 +413,8 @@ return view.extend({
 			dom.content(self.chainBox, self.renderTiers(self.tiers, d));
 			var holder = document.getElementById('podkop-section-socks');
 			if (holder) dom.content(holder, self.sectionSocksInner());
+			if (mutated) window.setTimeout(function(){ self.testFullChain(); }, 60);
+			else window.setTimeout(function(){ self.applyChainCache(); }, 60);
 		});
 	},
 
@@ -326,22 +424,22 @@ return view.extend({
 		if (!v) { dom.content(status, _('введите адрес')); return; }
 		dom.content(status, _('добавление…'));
 		return callFbCrud('add', v, 0).then(function(r) {
-			if (r && r.ok) { input.value = ''; dom.content(status, _('добавлено')); return self.refreshState(); }
-			var m = { bad_format:_('неверный формат (socks5://IP:PORT)'), duplicate:_('уже в списке') };
+			if (r && r.ok) { input.value = ''; dom.content(status, _('добавлено')); return self.refreshState(true); }
+			var m = { bad_format:_('неверный формат (scheme://[логин:пароль@]IP:PORT[#имя])'), bad_port:_('порт вне диапазона 1–65535'), duplicate:_('уже в списке') };
 			dom.content(status, _('ошибка: ') + (m[r && r.reason] || (r && r.detail) || '?'));
 		}).catch(function(){ dom.content(status, _('ошибка вызова')); });
 	},
 
 	fbDelete: function(index, endpoint) {
 		var self = this;
-		ui.showModal(_('Удалить резервный SOCKS'), [
+		ui.showModal(_('Удалить резервный прокси'), [
 			E('p', {}, _('Удалить ') + (endpoint||'') + '?'),
 			E('div', { 'class':'right' }, [
 				E('button', { 'class':'cbi-button', 'click': ui.hideModal }, _('Отмена')),
 				' ',
 				E('button', { 'class':'cbi-button cbi-button-negative', 'click': ui.createHandlerFn(this, function(){
 					ui.hideModal();
-					return callFbCrud('delete', '', index).then(function(){ return self.refreshState(); });
+					return callFbCrud('delete', '', index).then(function(){ return self.refreshState(true); });
 				}) }, _('Удалить'))
 			])
 		]);
@@ -349,62 +447,89 @@ return view.extend({
 
 	fbMove: function(index, op) {
 		var self = this;
-		return callFbCrud(op, '', index).then(function(){ return self.refreshState(); });
+		return callFbCrud(op, '', index).then(function(){ return self.refreshState(true); });
 	},
 
-	fbEdit: function(index, current) {
+	/* Shared add/edit form with separate fields (scheme/host/port/user/pass/
+	 * mnemonic) — same ergonomics as the Runtime manual-proxy form. For edit,
+	 * prefill by parsing the existing record; index<0 means add. */
+	fbForm: function(index, current) {
 		var self = this;
-		var input = E('input', {
-			'type':'text', 'class':'cbi-input-text',
-			'style':'width:100%;font-family:monospace;',
-			'value': current || ''
-		});
+		var f = fbParse(current);
+		var scheme = E('select', { 'class':'cbi-input-select' }, [
+			E('option', { 'value':'socks5h', 'selected': f.scheme==='socks5h'?'':null }, 'socks5h — DNS через прокси'),
+			E('option', { 'value':'socks5', 'selected': f.scheme==='socks5'?'':null }, 'socks5 — DNS локально'),
+			E('option', { 'value':'http', 'selected': f.scheme==='http'?'':null }, 'http'),
+			E('option', { 'value':'https', 'selected': f.scheme==='https'?'':null }, 'https')
+		]);
+		var host = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('хост / IP'), 'value': f.host });
+		var port = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('порт'), 'value': f.port });
+		var user = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('логин, необязательно'), 'value': f.user });
+		var pass = E('input', { 'type':'password', 'class':'cbi-input-text pb-mono', 'placeholder':_('пароль, необязательно'), 'value': f.pass });
+		var mnem = E('input', { 'type':'text', 'class':'cbi-input-text', 'placeholder':_('мнемоника (имя), необязательно'), 'value': f.mnemonic });
 		var err = E('div', { 'style':'color:#cc2b2b;font-size:90%;margin-top:.4em;' });
-		ui.showModal(_('Редактировать резервный SOCKS'), [
-			E('p', {}, _('Адрес SOCKS (socks5:// или socks5h://):')),
-			input, err,
+
+		var submit = function() {
+			var vf = {
+				scheme: scheme.value || 'socks5h',
+				host: (host.value||'').trim(),
+				port: (port.value||'').trim(),
+				user: (user.value||'').trim(),
+				pass: (pass.value||''),
+				mnemonic: (mnem.value||'').trim()
+			};
+			if (['socks5h','socks5','http','https'].indexOf(vf.scheme) < 0) { dom.content(err, _('недопустимый тип')); return; }
+			if (!vf.host) { dom.content(err, _('укажите хост или IP')); return; }
+			if (/\s/.test(vf.host)) { dom.content(err, _('в хосте нельзя использовать пробелы')); return; }
+			var pnum = parseInt(vf.port, 10);
+			if (!/^[0-9]+$/.test(vf.port) || pnum < 1 || pnum > 65535) { dom.content(err, _('порт должен быть числом 1–65535')); return; }
+			if (vf.pass && !vf.user) { dom.content(err, _('пароль указан без логина')); return; }
+			/* variant A: keep the raw URI unambiguous — no whitespace, and no
+			 * @ : / # in credentials (percent-encoding deferred). */
+			if (/[\s@/#]/.test(vf.user)) { dom.content(err, _('в логине недопустимы пробел, @, /, #')); return; }
+			if (/[\s@/#]/.test(vf.pass)) { dom.content(err, _('в пароле недопустимы пробел, @, /, #')); return; }
+			if (/[\s#]/.test(vf.mnemonic)) { dom.content(err, _('в мнемонике нельзя пробел и #')); return; }
+			var value = fbBuild(vf);
+			var op = (index < 0) ? 'add' : 'edit';
+			return callFbCrud(op, value, index < 0 ? 0 : index).then(function(r){
+				if (r && r.ok) { ui.hideModal(); return self.refreshState(true); }
+				var m = { bad_format:_('неверный формат'), bad_port:_('порт вне диапазона 1–65535'), duplicate:_('такой прокси уже есть') };
+				dom.content(err, m[r && r.reason] || (r && r.detail) || _('ошибка'));
+			}).catch(function(){ dom.content(err, _('ошибка вызова')); });
+		};
+
+		ui.showModal((index < 0) ? _('Добавить резервный прокси') : _('Редактировать резервный прокси'), [
+			E('div', { 'class':'pb-manual-proxy-card', 'style':'border:none;padding:0;max-width:none;' }, [
+				E('div', { 'class':'pb-manual-proxy-grid' }, [ scheme, host, port ]),
+				E('div', { 'class':'pb-manual-proxy-auth' }, [ user, pass ]),
+				E('div', { 'style':'margin-top:10px;' }, [ mnem ])
+			]),
+			E('p', { 'style':'color:#888;font-size:85%;margin-top:.6em;' }, _('Логин/пароль и мнемоника — необязательны. Пароль хранится в конфиге открытым текстом (доступен root).')),
+			err,
 			E('div', { 'class':'right', 'style':'margin-top:.6em;' }, [
 				E('button', { 'class':'cbi-button', 'click': ui.hideModal }, _('Отмена')),
 				' ',
-				E('button', { 'class':'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, function(){
-					var v = (input.value||'').trim();
-					return callFbCrud('edit', v, index).then(function(r){
-						if (r && r.ok) { ui.hideModal(); return self.refreshState(); }
-						var m = { bad_format:_('неверный формат (socks5://IP:PORT)'), duplicate:_('такой адрес уже есть') };
-						dom.content(err, m[r && r.reason] || (r && r.detail) || _('ошибка'));
-					}).catch(function(){ dom.content(err, _('ошибка вызова')); });
-				}) }, _('Сохранить'))
+				E('button', { 'class':'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, submit) }, _('Сохранить'))
 			])
 		]);
 	},
 
+	fbEdit: function(index, current) { return this.fbForm(index, current); },
+
 	addFbRow: function() {
-		var self = this;
-		var input = E('input', {
-			'type':'text', 'class':'cbi-input-text',
-			'style':'flex:1;min-width:220px;font-family:monospace;',
-			'placeholder':'socks5h://192.168.2.238:18088'
-		});
-		var status = E('span', { 'style':'margin-left:.6em;color:#888;font-size:90%;' });
-		var btn = E('button', {
-			'class':'cbi-button cbi-button-add',
-			'style':'margin-left:.5em;',
-			'click': ui.createHandlerFn(this, function(){ return self.fbAdd(input, status); })
-		}, _('Добавить'));
 		return E('div', { 'style':'margin-top:.8em;padding-top:.8em;border-top:1px solid rgba(127,127,127,.12);' }, [
 			E('div', { 'style':'color:#888;font-size:85%;margin-bottom:.8em;line-height:1.7;' }, [
 				E('div', { 'style':'margin-bottom:.3em;' }, _('Редактирование доступно не для всех уровней:')),
 				E('div', { 'style':'padding-left:.6em;' }, [
 					E('div', {}, _('• Podkop SOCKS5 (tier1): ✎ изменить порт Mixed Proxy — если вы сменили его в Podkop или автоопределение не сработало')),
-					E('div', {}, _('• Резервные SOCKS (tier2): ✎ изменить · ↑ ↓ порядок перебора · ✕ удалить')),
+					E('div', {}, _('• Резервные прокси (tier2): ✎ изменить · ↑ ↓ порядок перебора · ✕ удалить')),
 					E('div', {}, _('• Свой прокси (tier3): ✎ задать или изменить')),
 					E('div', {}, _('• Прямой выход WAN (tier4): ⚙ выбрать интерфейс привязки (auto, wan, tailscale0, awg0…)')),
 					E('div', {}, _('• Аварийные IP Telegram (tier5) не редактируются — заданы в боте'))
 				])
 			]),
-			E('div', { 'style':'color:#888;font-size:90%;margin-bottom:.4em;' },
-				_('Добавить резервный SOCKS. Формат: socks5:// или socks5h:// (рекомендуется socks5h — DNS резолвится через прокси):')),
-			E('div', { 'style':'display:flex;align-items:center;flex-wrap:wrap;' }, [ input, btn, status ])
+			E('div', { 'class':'pb-hint-90' },
+				_('Резервный прокси. Тип, хост, порт, логин, пароль и мнемоника вводятся отдельными полями.'))
 		]);
 	},
 
@@ -418,7 +543,7 @@ return view.extend({
 		var err = E('div', { 'style':'color:#cc2b2b;font-size:90%;margin-top:.4em;' });
 		ui.showModal(_('Порт Mixed Proxy (tier1)'), [
 			E('p', {}, _('Обычно порт определяется автоматически. Задайте вручную, если вы изменили порт Mixed Proxy в Podkop (например, из-за конфликта портов) или автоопределение не сработало.')),
-			E('p', { 'style':'color:#888;font-size:90%;' }, _('Значение записывается в активную секцию Podkop — тот же источник, из которого порт читает сам бот.')),
+			E('p', { 'class':'pb-hint-90' }, _('Значение записывается в активную секцию Podkop — тот же источник, из которого порт читает сам бот.')),
 			input, err,
 			E('div', { 'class':'right', 'style':'margin-top:.6em;' }, [
 				E('button', { 'class':'cbi-button', 'click': ui.hideModal }, _('Отмена')),
@@ -426,7 +551,7 @@ return view.extend({
 				E('button', { 'class':'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, function(){
 					var v = (input.value||'').trim();
 					return callSetTier1Port(v, (self.sectionsData && self.sectionsData.primary_section) ? self.sectionsData.primary_section : '').then(function(r){
-						if (r && r.ok) { ui.hideModal(); return self.refreshState(); }
+						if (r && r.ok) { ui.hideModal(); return self.refreshState(true); }
 						var mm = { bad_port:_('порт должен быть в диапазоне 1–65535'), no_section:_('активная секция не найдена'), commit_failed:_('ошибка записи конфигурации') };
 						dom.content(err, mm[r && r.reason] || (r && r.detail) || _('ошибка'));
 					}).catch(function(){ dom.content(err, _('ошибка вызова')); });
@@ -437,21 +562,54 @@ return view.extend({
 
 	editCustomProxy: function(current) {
 		var self = this;
-		var input = E('input', { 'type':'text', 'class':'cbi-input-text', 'style':'width:100%;font-family:monospace;', 'value': current || '', 'placeholder':'socks5h://host:port (пусто = убрать)' });
+		var f = fbParse(current);
+		var scheme = E('select', { 'class':'cbi-input-select' }, [
+			E('option', { 'value':'socks5h', 'selected': f.scheme==='socks5h'?'':null }, 'socks5h — DNS через прокси'),
+			E('option', { 'value':'socks5', 'selected': f.scheme==='socks5'?'':null }, 'socks5 — DNS локально'),
+			E('option', { 'value':'http', 'selected': f.scheme==='http'?'':null }, 'http'),
+			E('option', { 'value':'https', 'selected': f.scheme==='https'?'':null }, 'https')
+		]);
+		var host = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('хост / IP'), 'value': f.host });
+		var port = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('порт'), 'value': f.port });
+		var user = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('логин, необязательно'), 'value': f.user });
+		var pass = E('input', { 'type':'password', 'class':'cbi-input-text pb-mono', 'placeholder':_('пароль, необязательно'), 'value': f.pass });
+		var mnem = E('input', { 'type':'text', 'class':'cbi-input-text', 'placeholder':_('мнемоника (имя), необязательно'), 'value': f.mnemonic });
 		var err = E('div', { 'style':'color:#cc2b2b;font-size:90%;margin-top:.4em;' });
-		ui.showModal(_('Custom proxy (tier3)'), [
-			E('p', {}, _('socks5://, socks5h://, http:// или https:// IP:PORT. Пусто — убрать tier3.')),
-			input, err,
+		var save = function(clear) {
+			var value = '';
+			if (!clear) {
+				var vf = { scheme: scheme.value||'socks5h', host:(host.value||'').trim(), port:(port.value||'').trim(),
+					user:(user.value||'').trim(), pass:(pass.value||''), mnemonic:(mnem.value||'').trim() };
+				if (!vf.host) { dom.content(err, _('укажите хост или IP')); return; }
+				if (/\s/.test(vf.host)) { dom.content(err, _('в хосте нельзя пробелы')); return; }
+				var pnum = parseInt(vf.port, 10);
+				if (!/^[0-9]+$/.test(vf.port) || pnum < 1 || pnum > 65535) { dom.content(err, _('порт 1–65535')); return; }
+				if (vf.pass && !vf.user) { dom.content(err, _('пароль без логина')); return; }
+				if (/[\s@/#]/.test(vf.user)) { dom.content(err, _('в логине недопустимы пробел, @, /, #')); return; }
+				if (/[\s@/#]/.test(vf.pass)) { dom.content(err, _('в пароле недопустимы пробел, @, /, #')); return; }
+				if (/[\s#]/.test(vf.mnemonic)) { dom.content(err, _('в мнемонике нельзя пробел и #')); return; }
+				value = fbBuild(vf);
+			}
+			return callSetField('custom_proxy', value).then(function(r){
+				if (r && r.ok) { ui.hideModal(); return self.refreshState(true); }
+				var m = { bad_format:_('неверный формат'), bad_port:_('порт вне диапазона') };
+				dom.content(err, m[r && r.reason] || (r && r.detail) || _('ошибка'));
+			}).catch(function(){ dom.content(err, _('ошибка вызова')); });
+		};
+		ui.showModal(_('Свой прокси (tier3)'), [
+			E('div', { 'class':'pb-manual-proxy-card', 'style':'border:none;padding:0;max-width:none;' }, [
+				E('div', { 'class':'pb-manual-proxy-grid' }, [ scheme, host, port ]),
+				E('div', { 'class':'pb-manual-proxy-auth' }, [ user, pass ]),
+				E('div', { 'style':'margin-top:10px;' }, [ mnem ])
+			]),
+			E('p', { 'style':'color:#888;font-size:85%;margin-top:.6em;' }, _('Логин/пароль и мнемоника — необязательны. Пароль хранится в конфиге открытым текстом (доступен root).')),
+			err,
 			E('div', { 'class':'right', 'style':'margin-top:.6em;' }, [
+				E('button', { 'class':'cbi-button cbi-button-negative', 'click': ui.createHandlerFn(this, function(){ return save(true); }) }, _('Убрать tier3')),
+				' ',
 				E('button', { 'class':'cbi-button', 'click': ui.hideModal }, _('Отмена')),
 				' ',
-				E('button', { 'class':'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, function(){
-					return callSetField('custom_proxy', (input.value||'').trim()).then(function(r){
-						if (r && r.ok) { ui.hideModal(); return self.refreshState(); }
-						var m = { bad_format:_('неверный формат') };
-						dom.content(err, m[r && r.reason] || (r && r.detail) || _('ошибка'));
-					}).catch(function(){ dom.content(err, _('ошибка вызова')); });
-				}) }, _('Сохранить'))
+				E('button', { 'class':'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, function(){ return save(false); }) }, _('Сохранить'))
 			])
 		]);
 	},
@@ -477,7 +635,7 @@ return view.extend({
 					' ',
 					E('button', { 'class':'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(self, function(){
 						return callSetField('bind_interface', sel.value).then(function(r){
-							if (r && r.ok) { ui.hideModal(); return self.refreshState(); }
+							if (r && r.ok) { ui.hideModal(); return self.refreshState(true); }
 							dom.content(err, (r && r.detail) || _('ошибка'));
 						}).catch(function(){ dom.content(err, _('ошибка вызова')); });
 					}) }, _('Сохранить'))
@@ -490,23 +648,25 @@ return view.extend({
 		var node = t._resultNode;
 		var self = this;
 		dom.content(node, _('проверка…'));
-		var target = (t.id === 'tier4') ? 'direct' : t.endpoint;
+		var target = (t.id === 'tier4') ? 'direct' : fbEndpoint(t.endpoint);
 		function recolour(c) {
 			if (t._dotWrap) dom.content(t._dotWrap, [ dot(c, t.name + (t._active ? '  ✓ '+_('активен') : '')) ]);
 		}
+		function store(html, colour) { _chainCache[chainKey(t)] = { html: html, colour: colour, active: !!t._active }; }
 		return callProbe(target).then(function(r) {
 			if (r && r.result === 'ok') {
 				var ms = (r.latency_ms != null && r.latency_ms > 0) ? (' · ' + r.latency_ms + ' мс') : '';
-				dom.content(node, '✓ ok' + (r.http ? (' ('+r.http+')') : '') + ms);
-				recolour('green');
+				var html = '✓ ok' + (r.http ? (' ('+r.http+')') : '') + ms;
+				dom.content(node, html); recolour('green'); store(html, 'green');
 			}
-			else if (r && r.result === 'unknown') { dom.content(node, '— ' + (r.reason || 'unknown')); }
+			else if (r && r.result === 'unknown') { var h = '— ' + (r.reason || 'unknown'); dom.content(node, h); store(h, 'grey'); }
 			else {
-				dom.content(node, '✗ fail' + (r && r.http ? (' ('+r.http+')') : ''));
+				var hf = '✗ fail' + (r && r.http ? (' ('+r.http+')') : '');
+				dom.content(node, hf);
 				/* configured but unreachable → yellow (a real, actionable problem) */
-				recolour('yellow');
+				recolour('yellow'); store(hf, 'yellow');
 			}
-		}).catch(function(){ dom.content(node, '✗ ' + _('ошибка')); recolour('yellow'); });
+		}).catch(function(){ var he = '✗ ' + _('ошибка'); dom.content(node, he); recolour('yellow'); store(he, 'yellow'); });
 	},
 
 	testFullChain: function() {
@@ -514,12 +674,42 @@ return view.extend({
 		/* Probe every tier with an endpoint, sequentially, top to bottom. */
 		var seq = this.tiers.filter(function(t){ return t.endpoint && t.endpoint !== ''; });
 		var i = 0;
+		if (this._testAllBtn) this._testAllBtn.disabled = true;
+		function finish() {
+			_chainCheckedAt = Math.floor(Date.now()/1000);
+			_chainTestedThisSession = true;
+			self.renderChainMeta();
+			if (self._testAllBtn) self._testAllBtn.disabled = false;
+		}
 		function next() {
-			if (i >= seq.length) return Promise.resolve();
+			if (i >= seq.length) { finish(); return Promise.resolve(); }
 			return self.probeOne(seq[i]).then(function(){ i++; return next(); });
 		}
 		ui.addNotification(null, E('p', {}, _('Проверяю цепочку сверху вниз…')), 'info');
-		return next();
+		return next().catch(function(){ if (self._testAllBtn) self._testAllBtn.disabled = false; });
+	},
+
+	/* Re-apply cached probe results (html + dot colour) to the freshly rendered
+	 * tier rows, so switching back to the tab shows the last run without
+	 * re-probing. */
+	applyChainCache: function() {
+		var self = this;
+		(this.tiers || []).forEach(function(t){
+			var c = _chainCache[chainKey(t)];
+			if (!c) return;
+			if (t._resultNode) dom.content(t._resultNode, c.html);
+			if (t._dotWrap) dom.content(t._dotWrap, [ dot(c.colour, t.name + (c.active ? '  ✓ '+_('активен') : '')) ]);
+		});
+		this.renderChainMeta();
+	},
+
+	/* "Проверено: <date>" line under the action row. */
+	renderChainMeta: function() {
+		if (!this._chainMeta) return;
+		if (!_chainCheckedAt) { dom.content(this._chainMeta, ''); return; }
+		var d = new Date(_chainCheckedAt * 1000);
+		var s = d.toLocaleString();
+		dom.content(this._chainMeta, _('Проверено: ') + s);
 	},
 
 	enableMixedProxy: function() {

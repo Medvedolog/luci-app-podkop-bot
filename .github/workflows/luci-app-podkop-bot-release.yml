@@ -5,7 +5,7 @@
 #
 # Trigger:
 #   1. Push tag "0.16.*" or "0.[2-9]*" or "[1-9]*"
-#   2. Manual dispatch: enter version string (e.g. "0.16.82" or "0.16.82-1")
+#   2. Manual dispatch: enter version string (e.g. "0.17.13" or "0.17.13-1")
 #
 # The four-file exec contract (rpcd script, install.sh, podkop_bot,
 # podkop_bot_init at 0755) is enforced by nfpm.yaml file_info and re-verified
@@ -24,9 +24,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Package version (e.g. 0.16.82 or 0.16.82-1)'
+        description: 'Package version (e.g. 0.17.13 or 0.17.13-1)'
         required: true
-        default: '0.16.82'
+        default: '0.17.13'
 
 jobs:
   release:
@@ -125,15 +125,68 @@ jobs:
           fi
           echo "OK: no stale duplicate"
 
+      - name: Verify vendored bot checksum
+        run: |
+          set -e
+          cd root/usr/lib/podkop_bot
+          sha256sum -c vendor.sha256
+          grep -q '^BOT_VERSION="0.19.2"' podkop_bot
+
+      - name: RPC contract check (list, dispatch, definitions, ACL)
+        run: |
+          set -e
+          python3 - <<'PYCONTRACT'
+          import json, pathlib, re, sys
+          root = pathlib.Path('.')
+          rpc = (root / 'root/usr/libexec/rpcd/podkop_bot').read_text()
+          acl = json.loads((root / 'root/usr/share/rpcd/acl.d/luci-app-podkop-bot.json').read_text())['luci-app-podkop-bot']
+          m = re.search(r"case \"\$1\" in\s*list\)\s*echo '(\{.*?\})'", rpc, re.S)
+          if not m:
+              raise SystemExit('list JSON not found')
+          listed = set(json.loads(m.group(1))) - {'list'}
+          defs = set(re.findall(r'^method_([a-zA-Z0-9_]+)\(\)', rpc, re.M))
+          pairs = re.findall(r'^\s*([a-zA-Z0-9_]+)\)\s+method_([a-zA-Z0-9_]+)\s*;;', rpc, re.M)
+          dispatch = {a for a,b in pairs if a == b}
+          bad_pairs = [(a,b) for a,b in pairs if a != b]
+          aclm = set(acl['read']['ubus']['podkop_bot']) | set(acl['write']['ubus']['podkop_bot'])
+          js = '\n'.join(p.read_text() for p in (root / 'root/www/luci-static/resources/view/podkop-bot').glob('*.js'))
+          frontend = set(re.findall(r"object:\s*'podkop_bot'\s*,\s*method:\s*'([^']+)'", js, re.S))
+          errors = []
+          for label, missing in [
+              ('listed without definition', listed-defs),
+              ('dispatched without definition', dispatch-defs),
+              ('listed without dispatch', listed-dispatch),
+              ('dispatch missing from list', dispatch-listed),
+              ('listed missing from ACL', listed-aclm),
+              ('frontend method missing from list', frontend-listed),
+          ]:
+              if missing: errors.append(f"{label}: {sorted(missing)}")
+          if bad_pairs:
+              errors.append(f"dispatch name mismatch: {bad_pairs}")
+          if errors:
+              print('\n'.join(errors)); sys.exit(1)
+          print(f'RPC contract OK: {len(listed)} methods')
+          PYCONTRACT
+
       # ─────────────────────────────────────────────────────────────────────────
       # 7. Patch nfpm.yaml version with the resolved VERSION
       # ─────────────────────────────────────────────────────────────────────────
       - name: Patch version in nfpm.yaml
         run: |
           PKG_VER="${{ env.VERSION }}"
-          echo "Updating nfpm.yaml version → ${PKG_VER}"
+          echo "Updating all version sources → ${PKG_VER}"
+          # Keep every version source in lock-step so a manual dispatch can't
+          # reintroduce the 0.18.0/0.18.1 desync between package and UI.
           sed -i "s/^version:.*$/version: \"${PKG_VER}\"/" nfpm.yaml
-          grep "^version:" nfpm.yaml
+          [ -f Makefile ] && sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${PKG_VER}/" Makefile
+          printf '%s\n' "${PKG_VER}" > version.txt
+          if [ -f root/usr/libexec/rpcd/podkop_bot ]; then
+            sed -i "s/^LUCI_APP_VERSION=\"[^\"]*\"/LUCI_APP_VERSION=\"${PKG_VER}\"/" root/usr/libexec/rpcd/podkop_bot
+          fi
+          echo "nfpm:    $(grep '^version:' nfpm.yaml)"
+          echo "Makefile:$(grep '^PKG_VERSION' Makefile 2>/dev/null)"
+          echo "rpcd:    $(grep -m1 LUCI_APP_VERSION root/usr/libexec/rpcd/podkop_bot 2>/dev/null)"
+          echo "txt:     $(cat version.txt)"
 
       # ─────────────────────────────────────────────────────────────────────────
       # 8. Build IPK package (OpenWrt opkg) — arch "all" = noarch

@@ -98,7 +98,7 @@ function row(label, valueNode) {
 }
 
 function card(children) {
-	return E('div', { 'class':'cbi-section', 'style':'max-width:600px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;' },
+	return E('div', { 'class':'cbi-section', 'style':'max-width:600px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' },
 		children);
 }
 
@@ -238,7 +238,7 @@ return view.extend({
 		if (!r || r.ok === false) {
 			/* Use the resources layout (not card(), which hardcodes a "Podkop
 			 * Bot" h3) so the placeholder/error reads "Ресурсы", not a 2nd card. */
-			return E('div', { 'class':'cbi-section', 'style':'max-width:600px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+			return E('div', { 'class':'cbi-section', 'style':'max-width:600px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));margin-top:1em;' }, [
 				E('h3', { 'style':'margin-top:0;' }, _('Ресурсы')),
 				row(_('Состояние'), dot('grey', _('недоступно')))
 			]);
@@ -255,7 +255,7 @@ return view.extend({
 			(ram.avail_mb != null ? ram.avail_mb : '?') + ' / ' + (ram.total_mb != null ? ram.total_mb : '?')
 			+ ' MB ' + _('свободно') + (ram.used_pct != null ? (' · ' + ram.used_pct + '% занято') : ''));
 
-		return E('div', { 'class':'cbi-section', 'style':'max-width:600px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+		return E('div', { 'class':'cbi-section', 'style':'max-width:600px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));margin-top:1em;' }, [
 			E('h3', { 'style':'margin-top:0;' }, _('Ресурсы')),
 			row('sing-box', sbNode),
 			row(_('Оперативная память'), ramNode)

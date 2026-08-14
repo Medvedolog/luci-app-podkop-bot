@@ -17,8 +17,9 @@
  * runs a fresh probe.
  */
 
-var callActiveProbe = rpc.declare({ object:'podkop_bot', method:'active_probe', params:['cached','section'] });
+var callActiveProbe = rpc.declare({ object:'podkop_bot', method:'active_probe', params:['cached','section','proxy','label'] });
 var callRuntimeSections = rpc.declare({ object:'podkop_bot', method:'runtime_sections' });
+var callTransportState = rpc.declare({ object:'podkop_bot', method:'transport_state' });
 var callEnsureMixedProxy = rpc.declare({ object:'podkop_bot', method:'ensure_mixed_proxy', params:['section'] });
 
 var COLOURS = { green:'#33a02c', yellow:'#e8a33d', grey:'#888888', red:'#cc2b2b' };
@@ -65,7 +66,8 @@ return view.extend({
 		/* sections list + cached probe of the active section for instant display */
 		return Promise.all([
 			callRuntimeSections().catch(function(){ return null; }),
-			callActiveProbe('true', '').catch(function(){ return null; })
+			callActiveProbe('true', '', '', '').catch(function(){ return null; }),
+			callTransportState().catch(function(){ return null; })
 		]);
 	},
 
@@ -73,10 +75,39 @@ return view.extend({
 		var self = this;
 		var sectionsData = data[0];
 		var probeData = data[1];
+		var transportData = data[2];
 		/* selected section: active by default; user can switch */
 		this.sections = (sectionsData && sectionsData.sections) ? sectionsData.sections : [];
 		this.selectedSection = (sectionsData && sectionsData.active_section) ? sectionsData.active_section : '';
 		this.sectionsMeta = sectionsData || {};
+
+		/* transport-tier proxies from the Transport tab: tier1 Mixed Proxy,
+		 * tier2 fallback_socks list, tier3 custom_proxy. Each becomes a probe
+		 * target (endpoint + label) alongside the Podkop sections. */
+		this.tierProxies = [];
+		if (transportData && transportData.available) {
+			var t1 = transportData.tier1;
+			/* readable labels — raw socks5h://host:port is noise for a human.
+			 * tier1 is the active section's Mixed Proxy; tier2/3 show host only. */
+			if (t1 && t1.endpoint) {
+				var t1host = t1.endpoint.replace(/^socks5h?:\/\//, '');
+				this.tierProxies.push({ endpoint: t1.endpoint, label: _('tier1 · Mixed Proxy') + ' — ' + t1host });
+			}
+			(transportData.tier2_fallback_socks || []).forEach(function(ep, i){
+				if (ep) {
+					var h = ep.replace(/^socks5h?:\/\//, '').replace(/^[^@]*@/, '');
+					self.tierProxies.push({ endpoint: ep, label: _('tier2 · резерв #') + (i+1) + ' — ' + h });
+				}
+			});
+			if (transportData.tier3_custom_proxy) {
+				var t3 = transportData.tier3_custom_proxy;
+				var t3h = t3.replace(/^socks5h?:\/\//, '').replace(/^[^@]*@/, '');
+				this.tierProxies.push({ endpoint: t3, label: _('tier3 · свой прокси') + ' — ' + t3h });
+			}
+		}
+		/* current selection state: either a section name or a proxy endpoint */
+		this.selectedProxy = '';   // '' = use section; otherwise endpoint
+		this.selectedProxyLabel = '';
 
 		var body = E('div', { 'id':'podkop-runtime-body' }, this.renderProbe(probeData));
 		this.body = body;
@@ -84,40 +115,124 @@ return view.extend({
 		var runBtn = E('button', {
 			'class':'cbi-button cbi-button-action',
 			'click': ui.createHandlerFn(this, 'runProbe')
-		}, (this.sections.length > 1) ? _('Проверить выбранную') : _('Проверить сейчас'));
+		}, (this.sections.length > 1 || this.tierProxies.length > 0) ? _('Проверить выбранный') : _('Проверить сейчас'));
 		this.runBtn = runBtn;
 
-		/* section selector — only shown when there's more than one proxy section */
+		/* combined selector: two optgroups — Podkop sections, then transport
+		 * proxies. Shown when there's more than one thing to choose. */
 		var selectorRow = E('span', {});
-		if (this.sections.length > 1) {
-			var sel = E('select', { 'class':'cbi-input-select', 'style':'margin-right:.5em;',
-				'change': ui.createHandlerFn(this, 'onSectionChange')
-			}, this.sections.map(function(s){
-				return E('option', { 'value': s.name, 'selected': (s.name === self.selectedSection) ? '' : null },
+		var totalChoices = this.sections.length + this.tierProxies.length;
+		if (totalChoices > 1) {
+			var optSections = this.sections.map(function(s){
+				return E('option', { 'value': 'sec:' + s.name, 'selected': (s.name === self.selectedSection && !self.selectedProxy) ? '' : null },
 					s.name + (s.enabled_for_runtime ? '' : _(' (без Mixed Proxy)')));
-			}));
-			this.sectionSelect = sel;
-			selectorRow = E('span', { 'style':'margin-right:.5em;' }, [
-				E('span', { 'style':'color:#888;margin-right:.4em;' }, _('Секция:')), sel
+			});
+			var groups = [ E('optgroup', { 'label': _('Маршруты Podkop') }, optSections) ];
+			if (this.tierProxies.length > 0) {
+				var optProxies = this.tierProxies.map(function(p){
+					return E('option', { 'value': 'proxy:' + p.endpoint, 'data-label': p.label }, p.label);
+				});
+				groups.push(E('optgroup', { 'label': _('Транспортные маршруты') }, optProxies));
+			}
+			var sel = E('select', { 'class':'cbi-input-select', 'style':'width:100%;max-width:420px;box-sizing:border-box;',
+				'change': ui.createHandlerFn(this, 'onTargetChange')
+			}, groups);
+			this.targetSelect = sel;
+			/* label ON TOP of a full-width select: on a phone an inline label +
+			 * select collide; stacking keeps both readable. */
+			selectorRow = E('div', { 'style':'margin-bottom:.5em;' }, [
+				E('label', { 'style':'display:block;color:#888;font-size:90%;margin-bottom:.2em;' }, _('Маршрут проверки')),
+				sel
 			]);
 		}
 
 		var batchBtn = E('span', {});
-		if (this.sections.length > 1) {
+		if (this.sections.length > 1 || this.tierProxies.length > 0) {
 			batchBtn = E('button', {
-				'class':'cbi-button', 'style':'margin-left:.5em;',
+				'class':'cbi-button',
 				'click': ui.createHandlerFn(this, 'runAllProbes')
-			}, _('Проверить все секции'));
+			}, _('Проверить все маршруты'));
 			this.batchBtn = batchBtn;
 		}
 
+		/* Collapsible custom-proxy form: probe an arbitrary SOCKS/HTTP proxy
+		 * (with optional auth) without saving it to Transport. Credentials are
+		 * used for this one probe only — backend never caches or echoes them. */
+		var cpHost = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('хост / IP') });
+		var cpPort = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('порт') });
+		var cpUser = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('логин, необязательно') });
+		var cpPass = E('input', { 'type':'password', 'class':'cbi-input-text pb-mono', 'placeholder':_('пароль, необязательно') });
+		var cpType = E('select', { 'class':'cbi-input-select' }, [
+			E('option', { 'value':'socks5h' }, 'socks5h — DNS через прокси'),
+			E('option', { 'value':'socks5' }, 'socks5 — DNS локально'),
+			E('option', { 'value':'http' }, 'http'),
+			E('option', { 'value':'https' }, 'https')
+		]);
+		this._cp = { host: cpHost, port: cpPort, user: cpUser, pass: cpPass, type: cpType };
+		/* grid card — host/port no longer drift to opposite edges, collapses to
+		 * one column under 600px (see .pb-manual-proxy-* in podkop-bot.css). */
+		var cpForm = E('div', { 'class':'pb-manual-proxy-card', 'style':'display:none;' }, [
+			E('h3', { 'style':'margin:0 0 .6em;' }, _('Ручной прокси')),
+			E('div', { 'class':'pb-manual-proxy-grid' }, [ cpType, cpHost, cpPort ]),
+			E('div', { 'class':'pb-manual-proxy-auth' }, [ cpUser, cpPass ]),
+			E('div', { 'class':'pb-manual-proxy-actions' }, [
+				E('button', { 'class':'cbi-button cbi-button-action',
+					'click': ui.createHandlerFn(this, 'runCustomProxy') }, _('Проверить через этот прокси'))
+			]),
+			E('p', { 'class':'pb-manual-proxy-note' }, _('Логин и пароль используются только для этой проверки — не сохраняются, не кэшируются, в результате пароль маскируется. Тип — это протокол прокси (curl -x), а не «проверить HTTPS-сайт».'))
+		]);
+		this.cpForm = cpForm;
+		var cpToggle = E('button', {
+			'class':'cbi-button',
+			'click': function() {
+				var open = cpForm.style.display !== 'none';
+				cpForm.style.display = open ? 'none' : 'block';
+				this.textContent = open ? _('Ручной прокси ▸') : _('Ручной прокси ▾');
+			}
+		}, _('Ручной прокси ▸'));
+
 		return E('div', {}, [
 			E('h2', {}, _('Runtime — активный сервер')),
-			E('p', { 'style':'color:#888;' }, _('Проверка туннеля через Mixed Proxy выбранной секции: страна и провайдер выхода, доступность сервисов, скорость, признаки блокировок ТСПУ. Проверка занимает 10–30 секунд (загружается около 1 МБ).')),
-			E('div', { 'style':'margin:.6em 0;display:flex;align-items:center;flex-wrap:wrap;' }, [ selectorRow, runBtn, batchBtn ]),
+			E('p', { 'class':'pb-muted' }, _('Проверка туннеля: страна и провайдер выхода, доступность 12 сервисов и их регионы, скорость, признаки блокировок ТСПУ. Маршрут — это через что идёт проверка: секция Podkop, транспортный или ручной прокси.')),
+			E('p', { 'style':'color:#c60;font-size:90%;margin-top:-.4em;' }, _('⚠ Полная проверка идёт 15–40 секунд и нагружает роутер (параллельные запросы + загрузка ~3 МБ через туннель). Тест транспорт-прокси гоняет тот же полный набор.')),
+			selectorRow,
+			E('div', { 'style':'margin:.6em 0;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ runBtn, batchBtn, cpToggle ]),
+			cpForm,
 			body,
 			pbFooter()
 		]);
+	},
+
+	/* Build an endpoint from the custom-proxy form and probe through it. Never
+	 * persists — the endpoint (with creds) is passed once to active_probe. */
+	runCustomProxy: function() {
+		var self = this;
+		var host = (this._cp.host.value || '').trim();
+		var port = (this._cp.port.value || '').trim();
+		var user = (this._cp.user.value || '').trim();
+		var pass = (this._cp.pass.value || '');
+		var type = this._cp.type.value || 'socks5h';
+		var warn = function(msg){
+			dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, dot('yellow', msg)));
+		};
+		if (['socks5h','socks5','http','https'].indexOf(type) < 0) { warn(_('Недопустимый тип прокси.')); return; }
+		if (!host) { warn(_('Укажите хост или IP.')); return; }
+		var pnum = parseInt(port, 10);
+		if (!/^[0-9]+$/.test(port) || pnum < 1 || pnum > 65535) { warn(_('Порт должен быть числом 1–65535.')); return; }
+		if (pass && !user) { warn(_('Пароль указан без логина — уберите пароль или добавьте логин.')); return; }
+		var auth = user ? (encodeURIComponent(user) + (pass ? ':' + encodeURIComponent(pass) : '') + '@') : '';
+		var endpoint = type + '://' + auth + host + ':' + port;
+		var label = type + '://' + (user ? (user + ':***@') : '') + host + ':' + port;
+		this.runBtn.disabled = true;
+		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' }, dot('grey', _('Проверка ручного прокси… (15–40 секунд)'))));
+		return callActiveProbe('', '', endpoint, label).then(function(d) {
+			dom.content(self.body, self.renderProbe(d));
+		}).catch(function(e){
+			dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, [
+				dot('red', _('Проба не завершилась (превышено время или ошибка вызова).')),
+				E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (e && e.message) ? String(e.message) : '')
+			]));
+		}).finally(function(){ self.runBtn.disabled = false; });
 	},
 
 	/* Enable Mixed Proxy for a section (explicit user action from the degraded
@@ -125,7 +240,7 @@ return view.extend({
 	 * sections list and run a fresh probe of the now-enabled section. */
 	enableMixedProxy: function(section) {
 		var self = this;
-		dom.content(this.body, E('div', { 'class':'cbi-section', 'style':'max-width:820px;' },
+		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' },
 			dot('grey', _('Включаю Mixed Proxy для секции ') + section + '…')));
 		return callEnsureMixedProxy(section).then(function(r) {
 			if (r && (r.ok || r.already_enabled)) {
@@ -136,12 +251,12 @@ return view.extend({
 					});
 				});
 			}
-			dom.content(self.body, E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(232,163,61,.4);border-radius:8px;padding:1em 1.2em;' }, [
+			dom.content(self.body, E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(232,163,61,.4);border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
 				dot('yellow', _('Не удалось включить Mixed Proxy')),
 				E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (r && r.detail) ? r.detail : (r && r.reason ? r.reason : ''))
 			]));
 		}).catch(function(e){
-			dom.content(self.body, E('div', { 'class':'cbi-section', 'style':'max-width:820px;' }, [
+			dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, [
 				dot('red', _('Ошибка включения Mixed Proxy')),
 				E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (e && e.message) ? String(e.message) : '')
 			]));
@@ -151,10 +266,24 @@ return view.extend({
 	/* Switching section shows that section's cached probe immediately (per-section
 	 * cache). No fresh probe — user presses "Проверить выбранную" for that. If the
 	 * section has no cache yet, show the empty state. */
-	onSectionChange: function(ev) {
+	/* target = either "sec:<name>" or "proxy:<endpoint>". Parse the prefix and
+	 * remember the selection; show the cached probe if one exists. */
+	onTargetChange: function(ev) {
 		var self = this;
-		this.selectedSection = ev.target.value;
-		return callActiveProbe('true', this.selectedSection).then(function(d) {
+		var v = ev.target.value || '';
+		if (v.indexOf('proxy:') === 0) {
+			this.selectedProxy = v.slice(6);
+			this.selectedSection = '';
+			var opt = ev.target.options[ev.target.selectedIndex];
+			this.selectedProxyLabel = (opt && opt.getAttribute('data-label')) || this.selectedProxy;
+			return callActiveProbe('true', '', this.selectedProxy, this.selectedProxyLabel).then(function(d) {
+				dom.content(self.body, self.renderProbe(d));
+			}).catch(function(){ dom.content(self.body, self.renderProbe(null)); });
+		}
+		this.selectedProxy = '';
+		this.selectedProxyLabel = '';
+		this.selectedSection = (v.indexOf('sec:') === 0) ? v.slice(4) : v;
+		return callActiveProbe('true', this.selectedSection, '', '').then(function(d) {
 			dom.content(self.body, self.renderProbe(d));
 		}).catch(function() {
 			dom.content(self.body, self.renderProbe(null));
@@ -165,12 +294,15 @@ return view.extend({
 		var self = this;
 		this.runBtn.disabled = true;
 		if (this.batchBtn) this.batchBtn.disabled = true;
-		var sec = this.selectedSection || '';
-		dom.content(this.body, E('div', { 'class':'cbi-section', 'style':'max-width:820px;' }, dot('grey', _('Проверка… (до 30 секунд)'))));
-		return callActiveProbe('', sec).then(function(d) {
+		var usingProxy = !!this.selectedProxy;
+		var sec = usingProxy ? '' : (this.selectedSection || '');
+		var prox = usingProxy ? this.selectedProxy : '';
+		var lbl = usingProxy ? (this.selectedProxyLabel || '') : '';
+		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' }, dot('grey', _('Проверка… (15–40 секунд)'))));
+		return callActiveProbe('', sec, prox, lbl).then(function(d) {
 			dom.content(self.body, self.renderProbe(d));
 		}).catch(function(e){
-			dom.content(self.body, E('div', { 'class':'cbi-section', 'style':'max-width:820px;' }, [
+			dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, [
 				dot('red', _('Проба не завершилась (превышено время или ошибка вызова).')),
 				E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (e && e.message) ? String(e.message) : '')
 			]));
@@ -185,14 +317,22 @@ return view.extend({
 		if (this.batchBtn) this.batchBtn.disabled = true;
 		var probeable = this.sections.filter(function(s){ return s.enabled_for_runtime; });
 		var results = [];
-		dom.content(this.body, E('div', { 'class':'cbi-section', 'style':'max-width:820px;' },
-			dot('grey', _('Последовательная проверка секций…'))));
+		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' },
+			dot('grey', _('Последовательная проверка маршрутов…'))));
 
 		var chain = Promise.resolve();
+		/* sections first (probe via their Mixed Proxy) */
 		probeable.forEach(function(s){
 			chain = chain.then(function(){
-				return callActiveProbe('', s.name).then(function(d){ results.push({ sec:s.name, d:d }); })
+				return callActiveProbe('', s.name, '', '').then(function(d){ results.push({ sec:s.name, d:d }); })
 					.catch(function(){ results.push({ sec:s.name, d:null }); });
+			});
+		});
+		/* then transport-tier proxies from the Transport tab (tier1/2/3) */
+		(this.tierProxies || []).forEach(function(p){
+			chain = chain.then(function(){
+				return callActiveProbe('', '', p.endpoint, p.label).then(function(d){ results.push({ sec:p.label, d:d, isProxy:true }); })
+					.catch(function(){ results.push({ sec:p.label, d:null, isProxy:true }); });
 			});
 		});
 		return chain.then(function(){
@@ -202,8 +342,8 @@ return view.extend({
 
 	renderBatch: function(results) {
 		var self = this;
-		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;' }, [
-			E('h3', { 'style':'margin-top:0;' }, _('Сводка по секциям')),
+		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
+			E('h3', { 'style':'margin-top:0;' }, _('Сводка по маршрутам')),
 			E('div', {}, results.map(function(r){
 				if (!r.d || r.d.available === false) {
 					return row(r.sec, dot('grey', _('нет данных / Mixed Proxy выключен')));
@@ -221,13 +361,13 @@ return view.extend({
 	renderProbe: function(d) {
 		var self = this;
 		if (!d) {
-			return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;' },
+			return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' },
 				dot('grey', _('Нет данных по этой секции — нажмите кнопку проверки')));
 		}
 		if (d.available === false) {
 			var reasons = {
 				mixed_proxy_off: _('Mixed Proxy не включён на этой секции.'),
-				no_cache: _('Нет сохранённого результата по этой секции — нажмите кнопку проверки.'),
+				no_cache: _('Нет сохранённого результата по этому маршруту — нажмите кнопку проверки.'),
 				no_section: _('Секция не найдена.'),
 				uci_missing: _('Podkop не установлен или не настроен.')
 			};
@@ -246,7 +386,7 @@ return view.extend({
 						_('Будет назначен свободный порт (без пересечения с другими секциями). Изменение вносится в конфигурацию Podkop.'))
 				]));
 			}
-			return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(232,163,61,.4);border-radius:8px;padding:1em 1.2em;' }, kids);
+			return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(232,163,61,.4);border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, kids);
 		}
 
 		var geo = d.geo || {};
@@ -256,17 +396,25 @@ return view.extend({
 
 		return E('div', {}, [
 			/* Active server (outbound) */
-			E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;' }, [
+			E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
 				E('h3', { 'style':'margin-top:0;' }, _('Активный сервер (outbound)')),
-				row(_('Сервер'), this.serverDisplay(d, flag)),
-				(d.server_delay != null && d.server_delay > 0)
+				/* proxy mode has no sing-box "server" — show only the Target row
+				 * (was duplicating the same endpoint in both Server and Target). */
+				(d.section === '__proxy__')
+					? row(_('Маршрут'), E('span', {}, d.proxy_human || d.endpoint || _('транспорт-прокси')))
+					: row(_('Сервер'), this.serverDisplay(d, flag)),
+				(d.section !== '__proxy__' && d.server_delay != null && d.server_delay > 0)
 					? row(_('Задержка до сервера'), dot(d.server_delay < 300 ? 'green' : 'yellow', d.server_delay + _(' мс')))
 					: E('span', {}),
-				row(_('Секция'), E('span', {}, d.section || '—')),
+				(d.section === '__proxy__')
+					? E('span', {})
+					: row(_('Секция'), E('span', {}, d.section || '—')),
 				row(_('Страна выхода'), E('span', {}, countryLabel)),
 				row(_('Провайдер'), E('span', {}, geo.org || '—')),
 				row(_('IP выхода'), E('span', {}, geo.ip || '—')),
-				row(_('Серверов в секции'), E('span', {}, String(d.servers != null ? d.servers : '—'))),
+				(d.section === '__proxy__')
+					? E('span', {})
+					: row(_('Серверов в секции'), E('span', {}, String(d.servers != null ? d.servers : '—'))),
 				(d.abuse && d.abuse !== 'unknown')
 					? row(_('Тип IP'), d.abuse === 'clean'
 						? dot('green', _('резидентный / чистый'))
@@ -276,8 +424,8 @@ return view.extend({
 			]),
 
 			/* Services */
-			E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
-				E('h3', { 'style':'margin-top:0;' }, _('Сервисы через туннель')),
+			E('div', { 'class':'cbi-section pb-card' }, [
+				E('h3', { 'style':'margin-top:0;margin-bottom:.6em;' }, _('Сервисы через туннель')),
 				E('div', { 'style':'display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.4em;' },
 					(d.services || []).map(function(s) {
 						var c = (s.status === 'ok') ? 'green'
@@ -302,7 +450,7 @@ return view.extend({
 			this.speedCard(d.speed || {}),
 
 			age ? E('div', { 'style':'max-width:820px;color:#888;font-size:85%;text-align:right;margin-top:.5em;' },
-				_('Данные: секция ') + (d.section || '—') + ' · ' + age) : E('span', {}),
+				_('Данные: ') + (d.section === '__proxy__' ? (d.proxy_human || _('транспорт-прокси')) : (_('секция ') + (d.section || '—'))) + ' · ' + age) : E('span', {}),
 			(this.selectedSection && d.section && this.selectedSection !== d.section)
 				? E('div', { 'style':'max-width:820px;color:#e8a33d;font-size:85%;text-align:right;margin-top:.2em;' },
 					_('Выбрана секция ') + this.selectedSection + _(', показан кеш секции ') + d.section + _('. Нажмите «Проверить выбранную».'))
@@ -326,7 +474,7 @@ return view.extend({
 			node = dot('grey', _('неизвестно'));
 			note = '';
 		}
-		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+		return E('div', { 'class':'cbi-section pb-card' }, [
 			E('h3', { 'style':'margin-top:0;' }, _('Скорость и блокировки ТСПУ')),
 			row(_('Скорость / статус'), node),
 			note ? E('p', { 'style':'color:#888;font-size:90%;margin:.4em 0 0;' }, note) : E('span', {})

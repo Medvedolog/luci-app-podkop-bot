@@ -43,7 +43,7 @@ return view.extend({
 		var self = this;
 
 		var pre = E('pre', {
-			'style':'max-height:60vh;overflow:auto;background:rgba(127,127,127,.08);' +
+			'style':'max-height:60vh;overflow:auto;background:var(--background-color-high,var(--background-color,var(--background,rgba(30,30,30,.96))));' +
 			        'padding:.7em;border-radius:6px;white-space:pre-wrap;font-size:85%;margin-top:.8em;'
 		}, self.fmt(data));
 

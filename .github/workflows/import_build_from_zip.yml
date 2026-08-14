@@ -6,6 +6,7 @@
 #   nfpm.yaml
 #   Makefile                       (optional, for feeds builds)
 #   CHANGELOG.md                   (optional)
+#   version.txt                    (optional; served from repo root for update check)
 #   scripts/{postinst,postrm}
 #   root/usr/libexec/rpcd/podkop_bot
 #   root/usr/lib/podkop_bot/{install.sh,podkop_bot,podkop_bot_init}
@@ -25,7 +26,7 @@ on:
       zip_path:
         description: "Path to zip inside the repository"
         required: true
-        default: "_incoming/luci-app-podkop-bot-0.16.82.zip"
+        default: "_incoming/luci-app-podkop-bot-repo-0.17.13.zip"
       source_root:
         description: "Root folder name inside the zip (blank = auto-detect first dir)"
         required: false
@@ -33,7 +34,7 @@ on:
       commit_message:
         description: "Commit message"
         required: true
-        default: "Import luci-app-podkop-bot 0.16.82 from ZIP"
+        default: "Import luci-app-podkop-bot 0.17.13 from ZIP"
 
 permissions:
   contents: write
@@ -166,6 +167,41 @@ jobs:
           done
           [ "$fail" = 0 ] || { echo "Shell syntax check failed"; exit 1; }
 
+      - name: Verify vendored bot checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.detect.outputs.src }}"
+          cd "$SRC/root/usr/lib/podkop_bot"
+          sha256sum -c vendor.sha256
+          grep -q '^BOT_VERSION="0.19.2"' podkop_bot
+
+      - name: RPC contract check (dispatch ↔ definition ↔ ACL)
+        shell: bash
+        run: |
+          # Catches the class of regression where a method is registered in the
+          # dispatch case but its function body was lost (e.g. dropped during a
+          # block edit) — syntax check passes but the call fails at runtime with
+          # "method not found". Also flags dispatched methods missing from ACL.
+          rpcd=$(find . -path '*/libexec/rpcd/podkop_bot' | head -1)
+          acl=$(find . -path '*/rpcd/acl.d/*.json' | head -1)
+          [ -n "$rpcd" ] || { echo "rpcd script not found"; exit 1; }
+          fail=0
+          # every "  name) method_name ;;" in dispatch must have a "method_name()" definition
+          for m in $(grep -oE '\)[[:space:]]+method_[a-z0-9_]+' "$rpcd" | grep -oE 'method_[a-z0-9_]+' | sort -u); do
+            if ! grep -q "^${m}()" "$rpcd"; then
+              echo "CONTRACT FAIL: dispatched '$m' has no definition"; fail=1
+            fi
+          done
+          # every dispatched RPC name should appear in ACL (read or write)
+          for n in $(grep -oE '^[[:space:]]+[a-z0-9_]+\)[[:space:]]+method_' "$rpcd" | grep -oE '[a-z0-9_]+\)' | tr -d ')' | sort -u); do
+            if [ -n "$acl" ] && ! grep -q "\"$n\"" "$acl"; then
+              echo "CONTRACT WARN: dispatched RPC '$n' not found in ACL"
+            fi
+          done
+          [ "$fail" = 0 ] || { echo "RPC contract check failed"; exit 1; }
+          echo "RPC contract check passed"
+
       - name: JSON validation (menu.d + acl.d)
         shell: bash
         run: |
@@ -209,6 +245,15 @@ jobs:
           cp -a "$SRC/nfpm.yaml" nfpm.yaml
           [ -f "$SRC/Makefile" ]     && cp -a "$SRC/Makefile" Makefile         || echo "note: no Makefile in zip"
           [ -f "$SRC/CHANGELOG.md" ] && cp -a "$SRC/CHANGELOG.md" CHANGELOG.md  || echo "note: no CHANGELOG.md in zip"
+          # version.txt lands in the repo ROOT so raw.githubusercontent.com/.../main/version.txt
+          # serves it for the in-app "newer LuCI release?" network check.
+          [ -f "$SRC/version.txt" ]  && cp -a "$SRC/version.txt" version.txt    || echo "note: no version.txt in zip"
+          [ -f "$SRC/README.md" ]    && cp -a "$SRC/README.md" README.md        || echo "note: no README.md in zip"
+          # Screenshots referenced by the README matrix.
+          if [ -d "$SRC/screenshots" ]; then
+            rm -rf screenshots && mkdir -p screenshots
+            cp -a "$SRC/screenshots/." screenshots/
+          fi
 
           # Do NOT overwrite .github/workflows — managed separately.
 
@@ -268,6 +313,9 @@ jobs:
           git add root scripts nfpm.yaml
           [ -f Makefile ]     && git add Makefile     || true
           [ -f CHANGELOG.md ] && git add CHANGELOG.md || true
+          [ -f version.txt ]  && git add version.txt  || true
+          [ -f README.md ]    && git add README.md    || true
+          [ -d screenshots ]  && git add screenshots  || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit"

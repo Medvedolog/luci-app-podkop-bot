@@ -20,19 +20,20 @@
 # ==============================================================================
 name: "luci-app-podkop-bot"
 platform: "linux"
-version: "0.17.6"
+version: "0.19.2"
 section: "luci"
 maintainer: "Medvedolog <Medvedolog@github.com>"
 description: |
   LuCI interface for the podkop_bot Telegram bot on OpenWrt. Eight tabs:
   Overview, Settings, Transport (fallback chain), Setup Wizard, Runtime
   (per-section tunnel diagnostics), Update, Logs, Help. Manages the bot and
-  reads Podkop/forks (podkop, podkop-plus, netshift) only for transport,
-  Mixed Proxy and diagnostics.
+  reads Podkop/forks (podkop, podkop-plus, netshift, forkop) for transport,
+  Mixed Proxy and diagnostics, and can explicitly run the detected fork updater.
 depends:
   - libc
   - luci-base
   - jq
+  - curl
 contents:
   # Executables (0755) — the four-file exec contract, modes pinned explicitly.
   - src: ./root/usr/libexec/rpcd/podkop_bot
@@ -51,6 +52,10 @@ contents:
     dst: /usr/lib/podkop_bot/podkop_bot_init
     file_info:
       mode: 0755
+  - src: ./root/usr/lib/podkop_bot/vendor.sha256
+    dst: /usr/lib/podkop_bot/vendor.sha256
+    file_info:
+      mode: 0644
   # Everything else (0644) copied by directory.
   - src: ./root/www/luci-static/resources/view/podkop-bot/
     dst: /www/luci-static/resources/view/podkop-bot/

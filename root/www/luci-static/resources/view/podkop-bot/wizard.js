@@ -134,7 +134,7 @@ return view.extend({
 	shell: function(title, bodyNodes, navNodes) {
 		var ind = E('div', { 'style':'color:#888;font-size:90%;margin-bottom:.6em;' },
 			_('Шаг %d из 7').format(this.state.step));
-		var card = E('div', { 'style':'max-width:640px;border:1px solid rgba(127,127,127,.2);border-radius:8px;padding:1em 1.2em;' },
+		var card = E('div', { 'class':'pb-card-narrow' },
 			[ ind, E('h3', { 'style':'margin-top:0;' }, title) ].concat(bodyNodes));
 		var nav = E('div', { 'style':'max-width:640px;display:flex;gap:.5em;margin-top:1em;' }, navNodes || []);
 		return [ card, nav ];
@@ -306,7 +306,7 @@ return view.extend({
 		var body = [
 			E('label', {}, _('Политика транспорта')), policy,
 			E('label', { 'style':'display:block;margin-top:.6em;' }, _('Резервные SOCKS')), socks,
-			E('p', { 'style':'color:#888;font-size:90%;' }, _('socks5h:// рекомендуется — DNS резолвится через прокси.')),
+			E('p', { 'class':'pb-hint-90' }, _('socks5h:// рекомендуется — DNS резолвится через прокси.')),
 			err
 		];
 		return self.shell(_('Шаг 5 — Транспорт'), body, [
@@ -323,7 +323,7 @@ return view.extend({
 	/* ---- Step 6: Apply ---- */
 	step6: function() {
 		var self = this;
-		var logBox = E('pre', { 'style':'max-width:640px;max-height:300px;overflow:auto;background:rgba(127,127,127,.08);padding:.6em;border-radius:6px;white-space:pre-wrap;font-size:85%;' }, self.state.install_log || _('(лог появится здесь)'));
+		var logBox = E('pre', { 'style':'max-width:640px;max-height:300px;overflow:auto;background:var(--background-color-high,var(--background-color,var(--background,rgba(30,30,30,.96))));padding:.6em;border-radius:6px;white-space:pre-wrap;font-size:85%;' }, self.state.install_log || _('(лог появится здесь)'));
 		var statusLine = E('div', { 'style':'margin:.5em 0;' });
 		var body = [
 			E('p', {}, _('Будет создан конфиг и запущен установщик с live-логом.')),
@@ -398,7 +398,7 @@ return view.extend({
 			 * (persistent log in the Runtime tab is a later slice). */
 			var logPre = E('pre', {
 				'style':'display:none;max-width:640px;max-height:320px;overflow:auto;' +
-				        'background:rgba(127,127,127,.08);padding:.6em;border-radius:6px;' +
+				        'background:var(--background-color-high,var(--background-color,var(--background,rgba(30,30,30,.96))));padding:.6em;border-radius:6px;' +
 				        'white-space:pre-wrap;font-size:85%;margin-top:.6em;'
 			}, self.state.install_log || _('(лог установки пуст)'));
 

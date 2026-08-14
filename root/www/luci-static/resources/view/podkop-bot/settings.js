@@ -24,7 +24,7 @@ var callService = rpc.declare({ object:'podkop_bot', method:'service', params:['
 
 function actionButtons() {
 	var dangerBody = E('div', {
-		'style':'display:none;border:1px solid #cc2b2b;border-radius:6px;padding:.8em;margin-top:.6em;max-width:640px;'
+		'style':'display:none;border:1px solid #cc2b2b;border-radius:6px;padding:.8em;margin-top:.6em;max-width:640px;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));'
 	}, [
 		E('p', { 'style':'color:#cc2b2b;margin-top:0;' }, _('Опасные действия — необратимы.')),
 		E('button', {
@@ -68,7 +68,7 @@ function actionButtons() {
 	]);
 
 	return E('div', { 'style':'margin-top:1.5em;' }, [
-		E('h4', {}, _('Действия')),
+		E('h4', { 'style':'margin-bottom:.5em;' }, _('Действия')),
 		E('button', {
 			'class':'cbi-button cbi-button-action',
 			'click': ui.createHandlerFn(this, function() {
@@ -116,7 +116,7 @@ return view.extend({
 		if (cfgLoaded === false) {
 			return E('div', {}, [
 				E('h2', {}, _('Настройки Podkop Bot')),
-				E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(232,163,61,.4);border-radius:8px;padding:1em 1.2em;' }, [
+				E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid rgba(232,163,61,.4);border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
 					E('p', {}, _('Бот ещё не установлен — /etc/config/podkop_bot отсутствует.')),
 					E('p', { 'style':'color:#888;' }, [
 						_('Пройдите '),

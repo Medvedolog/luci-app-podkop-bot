@@ -1,4 +1,27 @@
-# luci-app-podkop-bot
+<div align="center">
+
+# 🤖 luci-app-podkop-bot
+
+**Управление Telegram-ботом podkop_bot из LuCI — установка, обновление, транспорт и диагностика на OpenWrt**
+
+`0.19.3` · OpenWrt · LuCI · opkg / apk
+
+[![Release](https://img.shields.io/github/v/release/Medvedolog/luci-app-podkop-bot?style=flat-square&label=release&color=0969da)](https://github.com/Medvedolog/luci-app-podkop-bot/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/Medvedolog/luci-app-podkop-bot/luci-app-podkop-bot-release.yml?branch=main&style=flat-square&label=build)](https://github.com/Medvedolog/luci-app-podkop-bot/actions/workflows/luci-app-podkop-bot-release.yml)
+[![OpenWrt](https://img.shields.io/badge/OpenWrt-opkg%20%7C%20apk-00b5e2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org/)
+[![LuCI](https://img.shields.io/badge/LuCI-web%20interface-8250df?style=flat-square)](#вкладки)
+[![Bot](https://img.shields.io/badge/Telegram-podkop__bot-26a5e4?style=flat-square&logo=telegram&logoColor=white)](https://github.com/Medvedolog/podkop_bot)
+[![License](https://img.shields.io/badge/license-GPL--2.0--or--later-6e7781?style=flat-square)](#лицензия)
+
+### 📦 [Установка](#установка) · 🖼️ [Скриншоты](#скриншоты) · 🧭 [Вкладки](#вкладки)
+
+⚙️ [Как это устроено](#как-это-устроено) · 📝 [История изменений](CHANGELOG.md) · 🤖 [Репозиторий бота](https://github.com/Medvedolog/podkop_bot)
+
+</div>
+
+---
+
+## Что это такое
 
 LuCI веб-интерфейс для управления Telegram-ботом [**podkop_bot**](https://github.com/Medvedolog/podkop_bot) на роутерах OpenWrt.
 

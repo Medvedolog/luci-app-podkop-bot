@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.2"
+BOT_VERSION="0.19.3"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -985,6 +985,26 @@ get_singbox_version_display() {
 # is_singbox_extended: returns 0 if running sing-box-extended build
 is_singbox_extended() {
     get_singbox_version_display | grep -q "extended"
+}
+
+# singbox_supports_tailscale: returns 0 if the running sing-box can serve a
+# tailscale endpoint.
+#
+# Mirrors Forkop's sing_box_supports_tailscale() (singbox/runtime.uc): an
+# "extended" build always qualifies, otherwise the build must carry the
+# with_tailscale tag. This MUST be checked before writing a tailscale server
+# section — Forkop's validator rejects the WHOLE config when a tailscale
+# section exists on a build without the tag, so a blind write does not just
+# fail to start the node, it takes routing down with it.
+#
+# The tag probe runs `sing-box version` only as a last resort: that spawns a
+# second Go binary (+20-30 MB RSS), which is exactly what get_singbox_version_display
+# exists to avoid. On extended builds — the common case, and the only one most
+# routers have — we never reach it.
+singbox_supports_tailscale() {
+    is_singbox_extended && return 0
+    command -v sing-box >/dev/null 2>&1 || return 1
+    sing-box version 2>/dev/null | grep -q 'with_tailscale'
 }
 
 # reply_keyboard_main: persistent bottom navigation keyboard JSON
@@ -3300,7 +3320,20 @@ safe_reload_podkop() {
         echo "$now" > "$RELOAD_TS_FILE"
     fi
 
-    ${PODKOP_INIT} reload; rc=$?
+    # Bounded reload. This runs on the bot's single polling thread, so a reload
+    # that never returns takes the bot down completely — no commands, no way to
+    # undo whatever caused it. That is not hypothetical: a server section that
+    # dials out at startup (a Tailscale endpoint logging in to its control
+    # server) can stall the backend's start for as long as the network is
+    # unhappy, and the bot's own Telegram path runs through that same backend.
+    # A timeout cannot make the reload succeed, but it returns control to the
+    # bot so it can report the failure and stay reachable.
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 120 ${PODKOP_INIT} reload; rc=$?
+        [ "$rc" = "124" ] && logger -t podkop-bot "[Reload] Timed out after 120s"
+    else
+        ${PODKOP_INIT} reload; rc=$?
+    fi
     # Wait for sing-box config.json to be written and valid before building caches.
     # podkop reload is semi-async: returns before sing-box fully restarts.
     # Building caches too early produces empty TAG_URI/UCI_LINKS/TAG_NAME caches.
@@ -8874,6 +8907,55 @@ _fk_cond_human() {
     esac
 }
 
+# ── Tailscale server management (Forkop) ──────────────────────────────────────
+# Read-only rendering of tailscale servers already lives in cmd_server_instances.
+# This block adds the write path: create a server, and toggle the two flags that
+# are safe to flip after creation.
+#
+# Forkop stores a tailscale node as `config server` with protocol=tailscale, NOT
+# as a routing section, so none of the section helpers apply here. Of the six
+# tailscale_* options Forkop knows, only tailscale_auth_key has no default
+# (validateRequired in luci-app-forkop server.js); control_url, hostname and
+# advertise_exit_node are defaulted by server_default_set_option. We therefore
+# ask for the minimum and let Forkop fill the rest.
+#
+# control_url is asked for anyway because the default points at Tailscale's
+# cloud: on a self-hosted control plane (Headscale, ionscale, …) leaving the
+# default silently registers the node with the wrong network.
+
+# _ts_gen_name: unused UCI section name for a new tailscale server.
+_ts_gen_name() {
+    local _i=1 _n
+    while [ "$_i" -lt 100 ]; do
+        _n="server_ts_${_i}"
+        uci -q get "${PODKOP_UCI}.${_n}" >/dev/null 2>&1 || { printf '%s' "$_n"; return 0; }
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+# _ts_create SECTION_NAME CONTROL_URL AUTH_KEY EXIT_NODE
+# Stages the whole server in one transaction. Any staging failure reverts.
+_ts_create() {
+    local _n="$1" _url="$2" _key="$3" _exit="$4"
+    uci -q set "${PODKOP_UCI}.${_n}=server" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_n}.protocol" "tailscale"            || return 1
+    # Created DISABLED on purpose. Enabling a tailscale endpoint makes sing-box
+    # dial the control server during startup, and the bot reaches Telegram
+    # through that same sing-box — if the login stalls, the reload stalls, and
+    # the bot loses its own lifeline while the user is left with no way to undo
+    # it from the chat. So creation is a config-only step; starting the node is
+    # a separate, explicit action from the card.
+    _fk_stage_set "${PODKOP_UCI}.${_n}.enabled" "0"                     || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_n}.routing_mode" "rules"            || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_n}.label" "Tailscale"               || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_control_url" "$_url"   || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_auth_key" "$_key"      || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_hostname" "forkop-${_n}" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_advertise_exit_node" "$_exit" || return 1
+    return 0
+}
+
 _handle_forkop_ext() {
     local cmd="$1" mid="$2" text="$3" state="$4"
     local sec=$(get_active_section)
@@ -8887,6 +8969,74 @@ _handle_forkop_ext() {
             "🏠 Меню"|"/menu") rm -f "$STATE_FILE"; delete_message "$mid"; _handle_bot "/menu" "" "" ""; return ;;
         esac
         case "$state" in
+            wait_ts_url)
+                # Control-plane URL. Same shape check LuCI applies (validateHttpUrl):
+                # http/https only. Not defaulted here on empty input — an empty value
+                # would silently mean Tailscale's cloud, which is the exact mistake
+                # this screen exists to prevent.
+                rm -f "$STATE_FILE"; delete_message "$mid"
+                local _u; _u=$(printf '%s' "$text" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                if ! _fk_valid_url "$_u"; then
+                    send_message "$(printf '%s Нужен адрес вида <code>https://host</code> (только http/https).' "$E_WARN")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                    return
+                fi
+                printf '%s\n%s\n' "wait_ts_key" "$_u" > "$STATE_FILE"
+                send_message "$(printf '%s <b>Ключ авторизации</b>\n\nОтправьте pre-auth ключ вашего контрол-сервера.\n\n<i>Сообщение с ключом будет удалено сразу после чтения. Права узла (теги) задаются при выпуске ключа на стороне контрол-сервера, не здесь.</i>' "$E_EDIT")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                ;;
+            wait_ts_key)
+                logger -t podkop-bot "[ts] enter wait_ts_key branch"
+                # The key is a credential: delete the user's message FIRST, before any
+                # validation can return early and leave it sitting in the chat history.
+                #
+                # NOT "$mid": for plain text the dispatcher deliberately passes an
+                # empty mid (send_or_edit must not try to edit the user's own
+                # message), and delete_message silently no-ops on an empty argument —
+                # so the key stayed in the chat. CALLBACK_MSG_ID carries
+                # .message.message_id for plain messages too, which is what we need.
+                delete_message "${CALLBACK_MSG_ID:-$mid}"
+                logger -t podkop-bot "[ts] delete_message done"
+                local _url; _url=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+                logger -t podkop-bot "[ts] url_from_state=${_url:-EMPTY}"
+                rm -f "$STATE_FILE"
+                local _k; _k=$(printf '%s' "$text" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                # No format check: ionscale/Headscale keys are not tskey-auth-*, and
+                # Forkop itself only requires non-empty.
+                if [ -z "$_k" ] || [ -z "$_url" ]; then
+                    send_message "$(printf '%s Ключ пустой — создание отменено.' "$E_WARN")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                    return
+                fi
+                logger -t podkop-bot "[ts] key_len=$(printf '%s' "$_k" | wc -c)"
+                local _n; _n=$(_ts_gen_name)
+                logger -t podkop-bot "[ts] section_name=${_n:-EMPTY}"
+                if [ -z "$_n" ]; then
+                    send_message "$(printf '%s Не удалось подобрать имя секции.' "$E_ERR")" ""; return
+                fi
+                logger -t podkop-bot "[ts] calling _ts_create"
+                if ! _ts_create "$_n" "$_url" "$_k" "1"; then
+                    send_message "$(printf '%s Ошибка записи — изменения отменены.' "$E_ERR")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                    return
+                fi
+                # Acknowledge BEFORE committing. _fk_txn_commit_reload restarts the
+                # routing backend, and this bot reaches Telegram THROUGH that backend
+                # (tier1 = the local mixed proxy), so between the reload and the
+                # confirmation the transport is briefly down — from the user's side
+                # that looked like the bot silently ignoring the key.
+                send_message "$(printf '%s Применяю настройки — это займёт до минуты…' "$E_RST")" ""
+                logger -t podkop-bot "[ts] staged ok, committing"
+                _fk_txn_commit_reload; local _rc=$?
+                logger -t podkop-bot "[ts] commit rc=$_rc"
+                if [ "$_rc" != "0" ]; then
+                    send_message "$(_fk_txn_fail_msg "$_rc")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                    return
+                fi
+                send_message "$(printf '%s <b>Tailscale добавлен (выключен)</b>\n\nУзел: <code>forkop-%s</code>\nВыходной узел: будет анонсироваться\n\n<i>Узел создан, но НЕ запущен. Включите его кнопкой на карточке служб, когда будете готовы: запуск перезагружает маршрутизацию, а бот ходит в Telegram через неё же, поэтому связь может пропасть на минуту.</i>' "$E_OK" "$(html_escape "$_n")")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_SRV} К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                ;;
             wait_fkc_*)
                 # Add entries. domain/ip_cidr are ONE multiline scalar (LuCI canon;
                 # the domain scalar carries full:/keyword:/regex: prefixes inline),
@@ -9344,6 +9494,47 @@ ${_ip}"; fi
             echo "wait_fkss_i_${_ch}" > "$STATE_FILE"
             send_or_edit "$mid" "$(printf '%s <b>Интервал автообновления</b>\n\nОтправьте интервал: <code>12h</code>, <code>1d</code>, <code>30m</code>.' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+            ;;
+        "ts_add")
+            # Gate BEFORE any write: Forkop's validator rejects the ENTIRE config
+            # when a tailscale section exists on a sing-box without the feature,
+            # which would take routing down, not just fail to start the node.
+            rm -f "$STATE_FILE"
+            if ! singbox_supports_tailscale; then
+                send_or_edit "$mid" \
+                    "$(printf '%s <b>Tailscale недоступен</b>\n\nУстановленная сборка sing-box собрана без поддержки Tailscale. Нужна сборка <b>extended</b> либо собранная с тегом <code>with_tailscale</code>.\n\n<i>Секция не создана намеренно: Forkop отвергает весь конфиг целиком, если в нём есть Tailscale на неподдерживающей сборке — это уронило бы маршрутизацию.</i>' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                return
+            fi
+            printf '%s\n' "wait_ts_url" > "$STATE_FILE"
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Адрес контрол-сервера</b>\n\nОтправьте адрес, например <code>https://headscale.example.com</code>.\n\n<i>Для облачного Tailscale отправьте <code>https://controlplane.tailscale.com</code>.</i>' "$E_EDIT")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
+            ;;
+        "ts_e_"*|"ts_x_"*|"ts_r_"*)
+            # Toggles on an existing node: advertise_exit_node / accept_routes.
+            # callback = ts_<x|r>_<section>_<0|1>
+            local _rest _sn _nv _key
+            case "$cmd" in
+                ts_e_*) _rest="${cmd#ts_e_}"; _key="enabled" ;;
+                ts_x_*) _rest="${cmd#ts_x_}"; _key="tailscale_advertise_exit_node" ;;
+                *)      _rest="${cmd#ts_r_}"; _key="tailscale_accept_routes" ;;
+            esac
+            _sn="${_rest%_[01]}"; _nv="${_rest##*_}"
+            if [ "$(uci -q get "${PODKOP_UCI}.${_sn}.protocol" 2>/dev/null)" != "tailscale" ]; then
+                send_message "$(printf '%s Секция не найдена — откройте список заново.' "$E_WARN")" ""
+                return
+            fi
+            # Starting the node is the one toggle that makes sing-box dial out
+            # during reload, so warn before the transport may drop.
+            [ "$_key" = "enabled" ] && [ "$_nv" = "1" ] && \
+                send_message "$(printf '%s Запускаю узел — связь с ботом может пропасть на минуту.' "$E_RST")" ""
+            if ! _fk_stage_set "${PODKOP_UCI}.${_sn}.${_key}" "$_nv"; then
+                send_message "$(printf '%s Ошибка записи.' "$E_ERR")" ""; return
+            fi
+            _fk_txn_commit_reload; local _trc=$?
+            [ "$_trc" != "0" ] && { send_message "$(_fk_txn_fail_msg "$_trc")" ""; return; }
+            _handle_bot "cmd_server_instances" "$mid" "" ""
             ;;
         "fkss_px_"*)
             local _ch="${cmd#fkss_px_}"
@@ -11230,7 +11421,7 @@ EOF
             if [ "$_si_count" -eq 0 ]; then
                 send_or_edit "$mid" \
                     "$(printf '%s <b>Службы</b>\n\n<i>Серверы не настроены.</i>\n<i>Поддерживаются: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto, Tailscale и JSON-входящие подключения.</i>\n\n<i>Настройка: LuCI → %s → Серверы</i>' "$E_SRV" "$PODKOP_DISPLAY_NAME")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
+                    "{\"inline_keyboard\":[$(if [ "$PODKOP_VARIANT" = "forkop" ] && singbox_supports_tailscale; then printf '[{"text":"\xe2\x9e\x95 Tailscale","callback_data":"ts_add"}],'; fi)[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
@@ -11249,6 +11440,7 @@ EOF
                 ' > "$_conn_map_file" 2>/dev/null
             fi
 
+            local _ts_toggle_rows=""
             _si_conn_stats() {
                 awk -v t="$1" '$1==t{print;found=1;exit} END{if(!found)print t,0,0,0}' \
                     "$_conn_map_file" 2>/dev/null
@@ -11394,6 +11586,20 @@ EOF
                     _text="${_text}\n    🔌 ${_listen_disp}:<b>${_port:-?}</b>"
                 fi
 
+                # Per-node toggles for tailscale: exit node + accept routes.
+                # Built while rendering so the labels match what the card shows.
+                [ "$_proto" = "tailscale" ] && {
+                    local _ex_cur _rt_cur _ex_lbl _rt_lbl
+                    _ex_cur=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_advertise_exit_node 2>/dev/null)
+                    _rt_cur=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_accept_routes 2>/dev/null)
+                    [ "$_ex_cur" = "1" ] && _ex_lbl="${E_ON} Выходной узел" || _ex_lbl="${E_OFF} Выходной узел"
+                    [ "$_rt_cur" = "1" ] && _rt_lbl="${E_ON} Принимать маршруты" || _rt_lbl="${E_OFF} Принимать маршруты"
+                    local _en_cur _en_lbl
+                    _en_cur=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
+                    [ "$_en_cur" = "1" ] && _en_lbl="${E_ON} Узел включён" || _en_lbl="${E_OFF} Узел выключен"
+                    _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_en_lbl")\",\"callback_data\":\"ts_e_${_s}_$([ "$_en_cur" = "1" ] && echo 0 || echo 1)\"}],[{\"text\":\"$(json_escape "$_ex_lbl")\",\"callback_data\":\"ts_x_${_s}_$([ "$_ex_cur" = "1" ] && echo 0 || echo 1)\"},{\"text\":\"$(json_escape "$_rt_lbl")\",\"callback_data\":\"ts_r_${_s}_$([ "$_rt_cur" = "1" ] && echo 0 || echo 1)\"}],"
+                }
+
                 # Public host — skip for tailscale (public_host is router WAN/LAN, not TS IP)
                 [ -n "$_pubhost_esc" ] && [ "$_proto" != "tailscale" ] && \
                     _text="${_text}\n    🌐 <code>${_pubhost_esc}</code>"
@@ -11445,8 +11651,15 @@ EOF
             # two-byte sequence backslash-n; every other byte (UTF-8 emoji, stray '\') passes through.
             local _text_nl
             _text_nl=$(printf '%s' "$_text" | awk '{gsub(/\\n/,"\n")}1')
+            # Tailscale row: offered only on Forkop (config server + protocol=tailscale
+            # is a Forkop feature) and only when the sing-box build can actually serve
+            # it — offering a button that always errors is worse than no button.
+            local _ts_row=""
+            if [ "$PODKOP_VARIANT" = "forkop" ] && singbox_supports_tailscale; then
+                _ts_row="[{\"text\":\"➕ Tailscale\",\"callback_data\":\"ts_add\"}],"
+            fi
             send_or_edit "$mid" "$_text_nl" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
+                "{\"inline_keyboard\":[${_ts_row}${_ts_toggle_rows}[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
             ;;
         "cmd_tunnel_health")
             # Dedicated Tunnel Health screen: system-level tunnel state
@@ -12983,13 +13196,17 @@ handle_command() {
             rm -f "$STATE_FILE"; _handle_bot "main_menu" "$mid" "" ""; return
         fi
         case "$state" in
+            wait_ts_url|wait_ts_key) logger -t podkop-bot "[ts] dispatcher state=$state" ;;
+        esac
+        case "$state" in
             wait_proxy_link|pending_sub_url_*|wait_forkop_sub_url|pending_forkop_sub_url|wait_netshift_sub_url|pending_netshift_sub_url)
                 _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_sub_url_*)
                 _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_url_link)
                 _handle_url_links "STATE_INPUT" "$mid" "$cmd" "$state" ;;
-            wait_fkc_*|wait_fkcd_*|wait_fkss_i_*|wait_fkss_px_*|wait_fkut_u_*|wait_fkut_i_*|wait_fkut_t_*)
+            wait_fkc_*|wait_fkcd_*|wait_fkss_i_*|wait_fkss_px_*|wait_fkut_u_*|wait_fkut_i_*|wait_fkut_t_*|\
+            wait_ts_url|wait_ts_key)
                 _handle_forkop_ext "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_fully_routed_ip|wait_excl_ip|wait_remote_domain|wait_remote_subnet|\
             wait_user_domain_add|wait_user_domain_del|wait_user_subnet_add|wait_user_subnet_del|\
@@ -13056,7 +13273,8 @@ handle_command() {
         fk_conds|fk_c_*|fkc_add_*|fkc_del_*|fk_dev_list|fk_dev_a_*|\
         fk_detour|fkd_t_*|fkd_pick|fkd_s_*|\
         fk_sub_set_*|fkss_u_*|fkss_v_*|fkss_m_*|fkss_p_*|fkss_i_*|fkss_px_*|fkss_vp_*|fkss_vs_*|\
-        fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*)
+        fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|\
+        ts_add|ts_e_*|ts_x_*|ts_r_*)
             _handle_forkop_ext "$cmd" "$mid" "" "" ;;
 
         domain_resolver_settings|do_toggle_dr|set_dr_type_*|cmd_set_dr_server|\
@@ -13506,7 +13724,18 @@ EOF
             [ -z "$callback_id" ] && text=$(normalize_reply_button "$text")
 
             now=$(date +%s)
-            safe_text=$(echo "$text" | tr '\n' ' ' | tr '|' '_')
+            # Redact secret-bearing input before it reaches the audit log, the
+            # last-command file or syslog. When the pending state expects a
+            # credential (currently the Tailscale pre-auth key), the message body
+            # IS the secret: logging it verbatim would persist it in syslog, which
+            # survives far longer than the chat message we delete afterwards.
+            _audit_text="$text"
+            if [ -z "$callback_id" ] && [ -f "$STATE_FILE" ]; then
+                case "$(head -n 1 "$STATE_FILE" 2>/dev/null)" in
+                    wait_ts_key) _audit_text="<secret redacted>" ;;
+                esac
+            fi
+            safe_text=$(echo "$_audit_text" | tr '\n' ' ' | tr '|' '_')
             echo "${now}|${u_name:-Unknown}|${safe_text}" > "$LAST_CMD_FILE"
 
             set_chat_context "$chat_id" "$CALLBACK_MSG_ID" "$chat_type" "$message_thread_id"
@@ -13514,7 +13743,7 @@ EOF
             audit_str="user=@${u_name:-Unknown} id=${user_id:-none}"
             [ -n "$sender_chat_id" ] && [ "$sender_chat_id" != "null" ] && \
                 audit_str="${audit_str} sender_chat=${sender_chat_id}(${sender_chat_type:-none})"
-            logger -t podkop-bot "Audit: ${audit_str} -> ${text}"
+            logger -t podkop-bot "Audit: ${audit_str} -> ${_audit_text}"
 
             if [ -n "$callback_id" ]; then
                 CB_ANSWER_TEXT=""

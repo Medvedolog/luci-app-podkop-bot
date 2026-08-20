@@ -130,7 +130,7 @@ jobs:
           set -e
           cd root/usr/lib/podkop_bot
           sha256sum -c vendor.sha256
-          grep -q '^BOT_VERSION="0.19.2"' podkop_bot
+          grep -q '^BOT_VERSION="0.19.3"' podkop_bot
 
       - name: RPC contract check (list, dispatch, definitions, ACL)
         run: |

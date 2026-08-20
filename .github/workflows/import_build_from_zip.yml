@@ -174,7 +174,7 @@ jobs:
           SRC="${{ steps.detect.outputs.src }}"
           cd "$SRC/root/usr/lib/podkop_bot"
           sha256sum -c vendor.sha256
-          grep -q '^BOT_VERSION="0.19.2"' podkop_bot
+          grep -q '^BOT_VERSION="0.19.3"' podkop_bot
 
       - name: RPC contract check (dispatch ↔ definition ↔ ACL)
         shell: bash

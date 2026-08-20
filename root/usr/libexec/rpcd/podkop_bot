@@ -19,7 +19,7 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.19.2"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
+LUCI_APP_VERSION="0.19.3"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
 
 # -- degraded helper (18q.1) -------------------------------------------------
 emit_unavailable() {
@@ -681,10 +681,26 @@ method_check_update() {
 	_now=$(date +%s 2>/dev/null || echo 0)
 	_cur=$(_installed_bot_version); [ -z "$_cur" ] && _cur="unknown"
 
+	# Cache the NETWORK result only, never the verdict. The cache used to be
+	# replayed verbatim, so the "current" version and update_available flag were
+	# frozen for a day: after the bot updated itself, LuCI kept advertising the
+	# very update that had just been applied ("v0.18.1 -> v0.19.2" next to a card
+	# already reading 0.19.2). Clearing the browser cache could not help — this
+	# cache is a file on the router. The installed version is cheap to read, so
+	# re-read it every call and recompute the comparison against the cached
+	# "latest"; only the GitHub fetch is actually rate-limited by TTL.
 	if [ "$_force" != "true" ] && [ -f "$UPDATE_CACHE" ]; then
 		_ts=$(sed -n 's/.*"checked_at":\([0-9]*\).*/\1/p' "$UPDATE_CACHE")
 		if [ -n "$_ts" ] && [ "$((_now - _ts))" -lt "$UPDATE_CACHE_TTL" ] 2>/dev/null; then
-			cat "$UPDATE_CACHE"; printf '\n'; return
+			_c_latest=$(sed -n 's/.*"latest":"\([^"]*\)".*/\1/p' "$UPDATE_CACHE")
+			_c_via=$(sed -n 's/.*"via":"\([^"]*\)".*/\1/p' "$UPDATE_CACHE")
+			if [ -n "$_c_latest" ] && [ "$_c_latest" != "unknown" ]; then
+				_c_avail="false"
+				[ "$_cur" != "unknown" ] && _ver_gt "$_c_latest" "$_cur" && _c_avail="true"
+				printf '{"ok":true,"current":"%s","latest":"%s","update_available":%s,"via":"%s","checked_at":%s}\n' \
+					"$_cur" "$_c_latest" "$_c_avail" "${_c_via:-cache}" "$_ts"
+				return
+			fi
 		fi
 	fi
 
@@ -733,10 +749,21 @@ method_luci_update_check() {
 	_cur=$(printf '%s' "$LUCI_APP_VERSION" | sed 's/-[0-9]*$//')
 	[ -z "$_cur" ] && _cur="unknown"
 
+	# Same fix as check_update: replay only the fetched "latest", recompute the
+	# verdict against the currently installed version. Otherwise upgrading the
+	# app leaves a phantom "update available" banner for up to a day.
 	if [ "$_force" != "true" ] && [ -f "$LUCI_UPDATE_CACHE" ]; then
 		_ts=$(sed -n 's/.*"checked_at":\([0-9]*\).*/\1/p' "$LUCI_UPDATE_CACHE")
 		if [ -n "$_ts" ] && [ "$((_now - _ts))" -lt "$UPDATE_CACHE_TTL" ] 2>/dev/null; then
-			cat "$LUCI_UPDATE_CACHE"; printf '\n'; return
+			_c_latest=$(sed -n 's/.*"latest":"\([^"]*\)".*/\1/p' "$LUCI_UPDATE_CACHE")
+			_c_via=$(sed -n 's/.*"via":"\([^"]*\)".*/\1/p' "$LUCI_UPDATE_CACHE")
+			if [ -n "$_c_latest" ] && [ "$_c_latest" != "unknown" ]; then
+				_c_avail="false"
+				[ "$_cur" != "unknown" ] && _ver_gt "$_c_latest" "$_cur" && _c_avail="true"
+				printf '{"ok":true,"current":"%s","latest":"%s","update_available":%s,"via":"%s","checked_at":%s}\n' \
+					"$_cur" "$_c_latest" "$_c_avail" "${_c_via:-cache}" "$_ts"
+				return
+			fi
 		fi
 	fi
 

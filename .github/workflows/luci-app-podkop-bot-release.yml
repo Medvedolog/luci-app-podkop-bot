@@ -4,7 +4,7 @@
 # No compilation — JS/shell/config package (arch: all / noarch).
 #
 # Trigger:
-#   1. Push tag "0.16.*" or "0.[2-9]*" or "[1-9]*"
+#   1. Push any semantic-version tag (for example "0.19.3" or "1.0.0")
 #   2. Manual dispatch: enter version string (e.g. "0.17.13" or "0.17.13-1")
 #
 # The four-file exec contract (rpcd script, install.sh, podkop_bot,
@@ -17,8 +17,7 @@ name: Build and Release luci-app-podkop-bot
 on:
   push:
     tags:
-      - '0.16.*'
-      - '0.[2-9]*'
+      - '0.*.*'
       - '[1-9]*'
 
   workflow_dispatch:

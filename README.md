@@ -4,7 +4,7 @@
 
 **Управление Telegram-ботом podkop_bot из LuCI — установка, обновление, транспорт и диагностика на OpenWrt**
 
-`0.19.3` · OpenWrt · LuCI · opkg / apk
+`0.19.9` · OpenWrt · LuCI · opkg / apk
 
 [![Release](https://img.shields.io/github/v/release/Medvedolog/luci-app-podkop-bot?style=flat-square&label=release&color=0969da)](https://github.com/Medvedolog/luci-app-podkop-bot/releases/latest)
 [![Build](https://img.shields.io/github/actions/workflow/status/Medvedolog/luci-app-podkop-bot/luci-app-podkop-bot-release.yml?branch=main&style=flat-square&label=build)](https://github.com/Medvedolog/luci-app-podkop-bot/actions/workflows/luci-app-podkop-bot-release.yml)
@@ -55,7 +55,7 @@ Frontend сам ничего не устанавливает и не меняе�
 - **`check`** / **`check-token`** — проверки окружения и валидности токена бота.
 - **`uninstall`** — удаление бота.
 
-rpcd вызывает `install.sh` для операций со службой и конфигом (`uci get/set podkop_bot.settings.*`), а также сам определяет активную routing-секцию Podkop и параметры Mixed Proxy. Разделение ответственности сохраняется: приложение не редактирует routing-конфигурацию Podkop. Отдельная кнопка обновления лишь запускает штатный установщик автоматически определённого форка; повседневная настройка секций остаётся в Podkop/Forkop и Telegram-боте.
+rpcd вызывает `install.sh` для операций со службой и конфигом (`uci get/set podkop_bot.settings.*`), а также сам определяет активную routing-секцию Podkop и параметры Mixed Proxy. Разделение ответственности сохраняется: приложение не редактирует routing-конфигурацию Podkop. Отдельная кнопка обновления лишь запускает штатный установщик автоматически определённого форка; повседневная настройка секций остаётся в Podkop/Forkop и Telegram-боте. Для Forkop бот также умеет редактировать штатные child-фильтры URLTest: исключать страны и конкретные прокси из ротации.
 
 ## Вкладки
 

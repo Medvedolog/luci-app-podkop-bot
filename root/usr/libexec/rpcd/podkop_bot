@@ -19,7 +19,39 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.19.10"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
+LUCI_APP_VERSION="0.19.11"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
+
+# -- shared UCI lock ---------------------------------------------------------
+# The bot writes the same package from two processes (its command loop and the
+# watchdog's stats checkpoint) and takes /tmp/podkop_uci.lock around a whole
+# set→commit sequence. This backend is the third writer and used to take nothing,
+# so that lock only ever protected the bot from itself.
+#
+# It matters because `uci commit <pkg>` flushes everything staged for the package
+# regardless of who staged it: committing here mid-way through the bot's list
+# rebuild (delete the list, add entries back one by one) publishes a truncated
+# list. Both sides rebuild fallback_socks exactly that way.
+#
+# Bounded wait — a stuck holder must not hang an rpcd call, which would freeze
+# the web UI. On timeout we proceed unlocked and say so in the log.
+UCI_LOCK_FILE="/tmp/podkop_uci.lock"
+_UCI_TXN=0
+uci_txn_begin() {
+	command -v flock >/dev/null 2>&1 || return 0
+	exec 8>>"$UCI_LOCK_FILE" 2>/dev/null || return 0
+	if ! flock -x -w 10 8 2>/dev/null; then
+		exec 8>&- 2>/dev/null
+		logger -t podkop-bot-rpcd "[UCI] Config lock busy for 10s; writing without it."
+		return 1
+	fi
+	_UCI_TXN=1
+	return 0
+}
+uci_txn_end() {
+	_UCI_TXN=0
+	exec 8>&- 2>/dev/null
+	return 0
+}
 
 # -- degraded helper (18q.1) -------------------------------------------------
 emit_unavailable() {
@@ -474,9 +506,14 @@ method_ensure_mixed_proxy() {
 	# --- apply (transactional) ---
 	# Check each uci set; on failure revert staged changes so a partial state
 	# can't ride along on a later commit of the same package.
+	# Two staged sets and a commit — and `uci revert` on failure, which would also
+	# discard anything the bot had staged for this package. Hold the shared lock
+	# for the whole thing.
+	uci_txn_begin
 	if ! uci set "$_pkg.$_sec.mixed_proxy_enabled=1" 2>/dev/null \
 	  || ! uci set "$_pkg.$_sec.mixed_proxy_port=$_port" 2>/dev/null; then
 		uci -q revert "$_pkg" 2>/dev/null
+		uci_txn_end
 		printf '{"ok":false,"reason":"uci_set_failed","detail":"could not stage mixed_proxy on %s"}\n' "$_sec"; return
 	fi
 	# mixed_proxy state appears in install.sh status — drop the cache so Overview
@@ -1344,8 +1381,10 @@ method_set_transport_policy() {
 		auto|socks|direct) ;;
 		*) printf '{"ok":false,"reason":"bad_policy","detail":"%s"}\n' "$_pol"; return ;;
 	esac
+	uci_txn_begin
 	uci set podkop_bot.settings.transport="$_pol" 2>/dev/null
 	uci commit podkop_bot 2>/dev/null
+	uci_txn_end
 	[ -x "$INIT_PATH" ] && "$INIT_PATH" restart >/dev/null 2>&1
 	sleep 1
 	if bot_is_running; then _running="true"; else _running="false"; fi
@@ -1365,12 +1404,17 @@ _fb_list() {
 	uci -q get podkop_bot.settings.fallback_socks 2>/dev/null | tr ' ' '\n' | sed '/^$/d'
 }
 _fb_rewrite() {
-	# stdin = newline-separated entries → replace the whole list atomically
+	# stdin = newline-separated entries → replace the whole list atomically.
+	# "Atomically" only holds under the shared lock: between the delete and the
+	# last add_list the list is incomplete, and a commit from the bot lands
+	# exactly that.
+	uci_txn_begin
 	uci -q delete podkop_bot.settings.fallback_socks 2>/dev/null
 	while IFS= read -r _e; do
 		[ -n "$_e" ] && uci add_list podkop_bot.settings.fallback_socks="$_e" 2>/dev/null
 	done
 	uci commit podkop_bot 2>/dev/null
+	uci_txn_end
 }
 _valid_port() {
 	# 1..65535
@@ -1570,15 +1614,20 @@ method_set_uci_field() {
 	_read_input
 	_field_name=$(_field field)
 	_val=$(_field value)
+	# The case below stages a set or a delete; the commit is at the end. Hold the
+	# shared lock across both so the bot cannot commit this package in between.
+	# The case has early `return` paths — each releases the lock explicitly.
+	uci_txn_begin
 	case "$_field_name" in
 		custom_proxy)
 			_clean=$(printf '%s' "$_val" | tr -d '\r\n')
 			if [ -n "$_clean" ] && ! printf '%s' "$_clean" | grep -qE "$_FB_RE"; then
+				uci_txn_end
 				printf '{"ok":false,"reason":"bad_format","detail":"scheme://[user:pass@]IP:PORT[#name]"}\n'; return
 			fi
 			if [ -n "$_clean" ]; then
 				_p=$(_fb_port "$_clean")
-				_valid_port "$_p" || { printf '{"ok":false,"reason":"bad_port","detail":"port must be 1-65535"}\n'; return; }
+				_valid_port "$_p" || { uci_txn_end; printf '{"ok":false,"reason":"bad_port","detail":"port must be 1-65535"}\n'; return; }
 			fi
 			if [ -z "$_clean" ]; then uci -q delete podkop_bot.settings.custom_proxy 2>/dev/null
 			else uci set podkop_bot.settings.custom_proxy="$_clean" 2>/dev/null; fi
@@ -1587,6 +1636,7 @@ method_set_uci_field() {
 			_clean=$(printf '%s' "$_val" | tr -d '\r\n' | sed 's/[[:space:]]//g')
 			if [ -n "$_clean" ] && [ "$_clean" != "auto" ]; then
 				if ! ip link show "$_clean" >/dev/null 2>&1; then
+					uci_txn_end
 					printf '{"ok":false,"reason":"no_iface","detail":"%s does not exist"}\n' "$_clean"; return
 				fi
 			fi
@@ -1594,9 +1644,11 @@ method_set_uci_field() {
 			else uci set podkop_bot.settings.bind_interface="$_clean" 2>/dev/null; fi
 			;;
 		*)
+			uci_txn_end
 			printf '{"ok":false,"reason":"bad_field","detail":"%s"}\n' "$_field_name"; return ;;
 	esac
 	uci commit podkop_bot 2>/dev/null
+	uci_txn_end
 	[ -x "$INIT_PATH" ] && "$INIT_PATH" restart >/dev/null 2>&1
 	sleep 1
 	printf '{"ok":true,"field":"%s","value":%s}\n' "$_field_name" "$(_json_str "$_clean")"

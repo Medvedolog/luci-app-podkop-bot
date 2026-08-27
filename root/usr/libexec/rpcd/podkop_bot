@@ -19,7 +19,7 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.19.11"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
+LUCI_APP_VERSION="0.19.12"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
 
 # -- shared UCI lock ---------------------------------------------------------
 # The bot writes the same package from two processes (its command loop and the
@@ -39,9 +39,17 @@ _UCI_TXN=0
 uci_txn_begin() {
 	command -v flock >/dev/null 2>&1 || return 0
 	exec 8>>"$UCI_LOCK_FILE" 2>/dev/null || return 0
+	# Failing to lock must never abort the write — the caller goes ahead either
+	# way. Do not claim the lock was "busy": some BusyBox builds reject `-w`
+	# outright and return instantly with no contention at all, so try once more
+	# without the timeout flag before giving up.
 	if ! flock -x -w 10 8 2>/dev/null; then
+		if flock -x -n 8 2>/dev/null; then
+			_UCI_TXN=1
+			return 0
+		fi
 		exec 8>&- 2>/dev/null
-		logger -t podkop-bot-rpcd "[UCI] Config lock busy for 10s; writing without it."
+		logger -t podkop-bot-rpcd "[UCI] Could not take the config lock (busy, or flock lacks -w); writing without it."
 		return 1
 	fi
 	_UCI_TXN=1

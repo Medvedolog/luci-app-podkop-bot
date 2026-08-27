@@ -2,7 +2,7 @@
 
 # Installer for podkop_bot — Telegram remote management bot for podkop/sing-box on OpenWrt
 # Supports: OpenWrt 23.05 / 24.10 (opkg) and OpenWrt 25.x+ (apk)
-# Supports podkop variants: original, evolution, netshift, podkop-plus (auto-detected)
+# Supports podkop variants: original, evolution, netshift, podkop-plus, forkop (auto-detected)
 # Based on installer pattern from https://github.com/VizzleTF/podkop_autoupdater
 #
 # CORRECT install command:

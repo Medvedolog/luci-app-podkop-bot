@@ -16,6 +16,13 @@
 
 ## luci-app-podkop-bot
 
+### Unreleased — native OpenWrt packages through owfeed
+
+- **[Сборка]** nFPM заменён на owfeed: OpenWrt 25.12+ получает настоящий APKv3/ADB, 24.10 — IPK из того же staged tree.
+- **[CI]** Перед релизом source checks и package assertions дополняются установкой свежесобранных пакетов через owlab на OpenWrt 25.12.5 и 24.10.8; только затем reusable owfeed workflow может подписать и опубликовать релиз.
+- **[Подписи]** Подготовлены постоянный EC package-signing key и usign release-manifest key через `tools/setup-keys.sh`; приватные ключи хранятся только в GitHub Secrets/у владельца, публичные предназначены для pinning в community feed.
+- **[Баг]** Vendored install.sh 2.6.2 ищет APK release asset по `.apk`, а не старому nFPM-суффиксу `_noarch.apk`, поэтому `update-luci` понимает имена native owfeed APKv3 и остаётся совместим со старыми релизами.
+
 ### 0.19.13 — transport-state: POLL и FAST разделены
 
 - **[Баг]** Вендорный `podkop_bot` обновлён до **0.19.13**: состояние длинного `getUpdates` (POLL) больше не смешивается с короткими `sendMessage`/callback (FAST), поэтому отправка алерта вотчдогом не может сама породить ложную пару «Direct → восстановлено».

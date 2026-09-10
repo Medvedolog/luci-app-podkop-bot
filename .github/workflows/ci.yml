@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]*', 'v[0-9]*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sources:
+    name: Sources parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sh tools/check-sources.sh
+
+  build:
+    name: Build native OpenWrt packages
+    needs: sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: owfeed/owfeed/setup@v0.5.1
+        with:
+          version: v0.5.1
+
+      - name: Reproducible package timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - run: ./tools/stage.sh
+      - run: owfeed plan
+      - run: owfeed check
+      - run: owfeed build
+      - run: sh tools/check-package.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: owfeed-packages
+          path: |
+            dist/noarch
+            dist/all
+          if-no-files-found: error
+
+  verify:
+    name: Install on real OpenWrt userspace
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: owfeed-packages
+          path: dist/
+
+      - name: OpenWrt 25.12 APKv3
+        uses: owfeed/owlab/action@v0.6.1
+        with:
+          version: v0.6.1
+          releases: "25.12.5"
+          install: dist/noarch/luci-app-podkop-bot-*.apk
+          assert: |
+            package luci-app-podkop-bot
+            file /usr/libexec/rpcd/podkop_bot
+            file /usr/lib/podkop_bot/install.sh
+            file /usr/lib/podkop_bot/vendor.sha256
+            file /usr/share/luci/menu.d/luci-app-podkop-bot.json
+            file /usr/share/rpcd/acl.d/luci-app-podkop-bot.json
+            file /www/luci-static/resources/view/podkop-bot/overview.js
+            exec test -x /usr/libexec/rpcd/podkop_bot
+            exec test -x /usr/lib/podkop_bot/install.sh
+            http 200 /cgi-bin/luci/admin/services/podkop-bot/overview
+
+      - name: OpenWrt 24.10 IPK
+        uses: owfeed/owlab/action@v0.6.1
+        with:
+          version: v0.6.1
+          releases: "24.10.8"
+          install: dist/all/luci-app-podkop-bot_*.ipk
+          assert: |
+            package luci-app-podkop-bot
+            file /usr/libexec/rpcd/podkop_bot
+            file /usr/lib/podkop_bot/install.sh
+            file /usr/lib/podkop_bot/vendor.sha256
+            file /usr/share/luci/menu.d/luci-app-podkop-bot.json
+            file /usr/share/rpcd/acl.d/luci-app-podkop-bot.json
+            file /www/luci-static/resources/view/podkop-bot/overview.js
+            exec test -x /usr/libexec/rpcd/podkop_bot
+            exec test -x /usr/lib/podkop_bot/install.sh
+            http 200 /cgi-bin/luci/admin/services/podkop-bot/overview
+
+  release:
+    name: Sign and publish
+    needs: [build, verify]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    uses: owfeed/owfeed/.github/workflows/package.yml@v0.5.1
+    secrets:
+      sign-key: ${{ secrets.PODKOP_BOT_SIGN_KEY }}
+      usign-key: ${{ secrets.PODKOP_BOT_USIGN_KEY }}
+    with:
+      owfeed-version: v0.5.1
+      verify-with: keys/podkop-bot-release.pub

@@ -1,0 +1,6 @@
+/dist/
+/keys-setup/
+*.pem
+*.key
+!keys/*.pub.pem
+!keys/*.pub

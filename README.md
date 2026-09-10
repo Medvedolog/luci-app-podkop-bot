@@ -7,7 +7,7 @@
 `0.19.13` · OpenWrt · LuCI · opkg / apk
 
 [![Release](https://img.shields.io/github/v/release/Medvedolog/luci-app-podkop-bot?style=flat-square&label=release&color=0969da)](https://github.com/Medvedolog/luci-app-podkop-bot/releases/latest)
-[![Build](https://img.shields.io/github/actions/workflow/status/Medvedolog/luci-app-podkop-bot/luci-app-podkop-bot-release.yml?branch=main&style=flat-square&label=build)](https://github.com/Medvedolog/luci-app-podkop-bot/actions/workflows/luci-app-podkop-bot-release.yml)
+[![Build](https://img.shields.io/github/actions/workflow/status/Medvedolog/luci-app-podkop-bot/ci.yml?branch=main&style=flat-square&label=build)](https://github.com/Medvedolog/luci-app-podkop-bot/actions/workflows/ci.yml)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-opkg%20%7C%20apk-00b5e2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org/)
 [![LuCI](https://img.shields.io/badge/LuCI-web%20interface-8250df?style=flat-square)](#вкладки)
 [![Bot](https://img.shields.io/badge/Telegram-podkop__bot-26a5e4?style=flat-square&logo=telegram&logoColor=white)](https://github.com/Medvedolog/podkop_bot)
@@ -97,13 +97,13 @@ rpcd вызывает `install.sh` для операций со службой �
 
 ```sh
 opkg update
-opkg install luci-app-podkop-bot_<версия>_all.ipk
+opkg install luci-app-podkop-bot_<версия>-r1_all.ipk
 ```
 
 ### apk (OpenWrt 25.12 и новее)
 
 ```sh
-apk add --allow-untrusted luci-app-podkop-bot_<версия>_noarch.apk
+apk add --allow-untrusted luci-app-podkop-bot-<версия>-r1.apk
 ```
 
 Готовые пакеты — на странице [Releases](../../releases). После установки очистите кэш LuCI (приложение делает это в postinst автоматически) и при необходимости обновите страницу.
@@ -133,7 +133,7 @@ apk add --allow-untrusted luci-app-podkop-bot_<версия>_noarch.apk
 
 ## Сборка
 
-Пакет не требует компиляции (JS/shell/config, arch `all`/`noarch`). Сборка IPK и APK выполняется через [nFPM](https://nfpm.goreleaser.com/) в GitHub Actions (`Build and Release`). Конфигурация пакета — в `nfpm.yaml`; полезная нагрузка — в `root/`; maintainer-скрипты — в `scripts/`.
+Пакет не требует компиляции (JS/shell/config, arch `all`/`noarch`). Сборка выполняется через [owfeed](https://github.com/owfeed/owfeed): для OpenWrt 25.12+ создаётся нативный APKv3/ADB, для 24.10 — IPK. Оба контейнера строятся из одного staged tree, затем реально устанавливаются в OpenWrt через `owlab`; релиз публикуется только после этих проверок. Конфигурация пакета — `owfeed.yml`, полезная нагрузка — `root/`, maintainer-скрипты — `scripts/`. Процедура подписей и релиза описана в [RELEASING.md](RELEASING.md).
 
 Импорт рабочей выгрузки в дерево репозитория — через workflow `import-from-zip` (кладёт dev-zip в `_incoming/` и раскладывает по дереву).
 

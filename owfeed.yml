@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://owfeed.org/schema/v1.json
+#
+# OpenWrt package definition for luci-app-podkop-bot.
+# owfeed builds native APKv3/ADB packages for OpenWrt 25.12+ and IPK packages
+# for 24.10 from the same staged root filesystem.
+version: 1
+
+feed:
+  name: luci-app-podkop-bot
+  url: https://github.com/Medvedolog/luci-app-podkop-bot
+  title: luci-app-podkop-bot
+  maintainer: "Medvedolog <Medvedolog@github.com>"
+  homepage: https://github.com/Medvedolog/luci-app-podkop-bot
+
+releases:
+  - line: "25.12"
+    default: true
+    format: apk
+  - line: "24.10"
+    format: ipk
+
+# This repository publishes signed GitHub release assets, not its own feed.
+# A community feed can ingest the signed manifest and author-signed packages.
+publish:
+  - target: github-pages
+
+packages:
+  - name: luci-app-podkop-bot
+    build: mkpkg
+    arch: noarch
+    version-from: file:./dist/VERSION
+    files: ./dist/root
+
+    description: "LuCI web interface for installing, configuring and diagnosing the podkop_bot Telegram management service on OpenWrt."
+    depends: [libc, luci-base, jq, curl]
+    license: GPL-2.0-or-later
+    url: https://github.com/Medvedolog/luci-app-podkop-bot
+    maintainer: "Medvedolog <Medvedolog@github.com>"
+    repo-commit: env:GITHUB_SHA
+
+    # podkop_bot configuration is created and owned by the bot installer; this
+    # LuCI package intentionally ships no /etc/config/podkop_bot defaults.
+
+    scripts:
+      post-install: ./dist/scripts/postinst
+      post-deinstall: ./dist/scripts/postrm

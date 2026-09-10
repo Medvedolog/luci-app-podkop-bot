@@ -3,7 +3,7 @@
 # Run manually: Actions → import-from-zip → Run workflow
 #
 # Expected layout INSIDE the zip (under the source-root folder):
-#   nfpm.yaml
+#   owfeed.yml
 #   Makefile                       (optional, for feeds builds)
 #   CHANGELOG.md                   (optional)
 #   version.txt                    (optional; served from repo root for update check)
@@ -94,7 +94,7 @@ jobs:
           fi
 
           # 3) zip may be flat (files at root) — use _workzip itself
-          if [ -f "_workzip/nfpm.yaml" ]; then
+          if [ -f "_workzip/owfeed.yml" ]; then
             echo "src=_workzip" >> "$GITHUB_OUTPUT"
             echo "Flat zip detected, using _workzip"
             exit 0
@@ -110,7 +110,7 @@ jobs:
           SRC="${{ steps.detect.outputs.src }}"
 
           # Required pieces for the LuCI app
-          test -f "$SRC/nfpm.yaml"                                             || { echo "MISSING: nfpm.yaml"; exit 1; }
+          test -f "$SRC/owfeed.yml"                                             || { echo "MISSING: owfeed.yml"; exit 1; }
           test -f "$SRC/root/usr/libexec/rpcd/podkop_bot"                      || { echo "MISSING: rpcd/podkop_bot"; exit 1; }
           test -f "$SRC/root/usr/lib/podkop_bot/install.sh"                    || { echo "MISSING: lib/install.sh"; exit 1; }
           test -f "$SRC/root/usr/lib/podkop_bot/podkop_bot"                    || { echo "MISSING: lib/podkop_bot"; exit 1; }
@@ -242,7 +242,7 @@ jobs:
           fi
 
           # Root-level managed files
-          cp -a "$SRC/nfpm.yaml" nfpm.yaml
+          cp -a "$SRC/owfeed.yml" owfeed.yml
           [ -f "$SRC/Makefile" ]     && cp -a "$SRC/Makefile" Makefile         || echo "note: no Makefile in zip"
           [ -f "$SRC/CHANGELOG.md" ] && cp -a "$SRC/CHANGELOG.md" CHANGELOG.md  || echo "note: no CHANGELOG.md in zip"
           # version.txt lands in the repo ROOT so raw.githubusercontent.com/.../main/version.txt
@@ -273,14 +273,14 @@ jobs:
           done
           # Maintainer scripts executable.
           find scripts -type f -exec chmod 0755 {} \; 2>/dev/null || true
-          chmod 0644 nfpm.yaml 2>/dev/null || true
+          chmod 0644 owfeed.yml 2>/dev/null || true
 
       - name: Post-import validation
         shell: bash
         run: |
           set -euo pipefail
           echo "=== Imported files ==="
-          find root scripts nfpm.yaml -type f 2>/dev/null | sort
+          find root scripts owfeed.yml -type f 2>/dev/null | sort
           echo ""
           echo "=== Exec bits (must be exactly 4 files at 0755 under root/) ==="
           find root -type f -perm -u+x | sort
@@ -291,7 +291,7 @@ jobs:
             root/usr/lib/podkop_bot/install.sh \
             root/www/luci-static/resources/view/podkop-bot/overview.js \
             root/www/luci-static/resources/css/podkop-bot/podkop-bot.css \
-            nfpm.yaml scripts/postinst scripts/postrm; do
+            owfeed.yml scripts/postinst scripts/postrm; do
             test -f "$f" && echo "OK: $f" || echo "WARN: missing $f"
           done
 
@@ -310,7 +310,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add root scripts nfpm.yaml
+          git add root scripts owfeed.yml
           [ -f Makefile ]     && git add Makefile     || true
           [ -f CHANGELOG.md ] && git add CHANGELOG.md || true
           [ -f version.txt ]  && git add version.txt  || true

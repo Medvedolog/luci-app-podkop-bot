@@ -1295,39 +1295,59 @@ method_transport_probe() {
 	_read_input
 	_target=$(_field target)
 	[ -z "$_target" ] && { printf '{"ok":false,"available":false,"reason":"no_target","detail":"no probe target given","action":null}\n'; return; }
-	# Mask any password before echoing the target back (scheme://user:pass@ ->
-	# scheme://user:***@). curl still gets the real _target; only the response is
-	# masked so credentials never reach the UI/logs.
 	_target_masked=$(printf '%s' "$_target" | sed -E 's|(://[^:@/]+:)[^@/]*@|\1***@|')
 
-	# Telegram API endpoint that returns quickly (no token needed).
-	_url="https://api.telegram.org"
-	# latency from curl's own timing (-w time_total) — `date +%s%N` is unsupported
-	# on this BusyBox (%N emitted literally), which gave latency 0.
+	# Prefer a real Bot API transaction. A generic response from api.telegram.org
+	# proves routing only; getMe proves this path can carry the configured bot.
+	_token=$(uci -q get podkop_bot.settings.bot_token 2>/dev/null)
+	_verify=0
+	if [ -n "$_token" ]; then
+		_verify=1
+		_url="https://api.telegram.org/bot${_token}/getMe"
+	else
+		_url="https://api.telegram.org"
+	fi
+	mkdir -p /tmp/podkop_bot 2>/dev/null
+	_body="/tmp/podkop_bot/luci_tg_probe_$$.json"
+
 	if [ "$_target" = "direct" ]; then
 		_wan=$(_wan_if)
 		if [ -z "$_wan" ]; then
-			printf '{"ok":true,"target":"direct","result":"unknown","reason":"no_wan_if"}\n'; return
+			printf '{"ok":true,"target":"direct","result":"unknown","reason":"no_wan_if","telegram_reached":false,"verified_bot_api":false,"token_configured":%s}\n' "$([ "$_verify" = "1" ] && echo true || echo false)"
+			return
 		fi
-		_resp=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --interface "$_wan" --noproxy '*' \
+		_resp=$(curl -s -k -o "$_body" -w '%{http_code} %{time_total}' --interface "$_wan" --noproxy '*' \
 			--connect-timeout 5 --max-time 8 "$_url" 2>/dev/null)
 	else
-		_resp=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --proxy "$_target" \
+		_resp=$(curl -s -k -o "$_body" -w '%{http_code} %{time_total}' --proxy "$_target" \
 			--connect-timeout 5 --max-time 8 "$_url" 2>/dev/null)
 	fi
 	_code=$(printf '%s' "$_resp" | awk '{print $1}')
 	_secs=$(printf '%s' "$_resp" | awk '{print $2}')
-	_ms=$(awk -v s="$_secs" 'BEGIN{ printf "%d", (s*1000) }' 2>/dev/null)
-	[ -z "$_ms" ] && _ms=0
-
-	# Any HTTP response (even 404) means the path reached Telegram.
-	if [ -n "$_code" ] && [ "$_code" != "000" ]; then
-		printf '{"ok":true,"target":%s,"result":"ok","http":"%s","latency_ms":%s}\n' "$(_json_str "$_target_masked")" "$_code" "$_ms"
-	else
-		printf '{"ok":true,"target":%s,"result":"fail","http":"%s","latency_ms":%s}\n' "$(_json_str "$_target_masked")" "${_code:-000}" "$_ms"
+	_ms=$(awk -v x="${_secs:-0}" 'BEGIN{printf "%d", x*1000}' 2>/dev/null); [ -z "$_ms" ] && _ms=0
+	_reached=false; _verified=false; _username=""; _reason="timeout"; _result="fail"
+	if [ -n "$_code" ] && [ "$_code" != "000" ]; then _reached=true; fi
+	if [ "$_verify" = "1" ] && [ "$_code" = "200" ] && command -v jq >/dev/null 2>&1 && \
+	   jq -e '.ok == true and (.result.id != null)' "$_body" >/dev/null 2>&1; then
+		_verified=true; _result="ok"; _reason=""
+		_username=$(jq -r '.result.username // empty' "$_body" 2>/dev/null)
+	elif [ "$_reached" = "true" ]; then
+		_result="warn"
+		if [ "$_verify" = "1" ]; then
+			case "$_code" in
+				401) _reason="token_rejected" ;;
+				429) _reason="rate_limited" ;;
+				*)   _reason="bot_api_not_verified" ;;
+			esac
+		else
+			_reason="token_not_configured"
+		fi
 	fi
+	rm -f "$_body" 2>/dev/null
+	printf '{"ok":true,"available":true,"target":%s,"result":"%s","reason":%s,"http":"%s","latency_ms":%s,"telegram_reached":%s,"verified_bot_api":%s,"token_configured":%s,"bot_username":%s}\n' \
+		"$(_json_str "$_target_masked")" "$_result" "$(_json_str "$_reason")" "${_code:-000}" "$_ms" "$_reached" "$_verified" \
+		"$([ "$_verify" = "1" ] && echo true || echo false)" "$(_json_str "$_username")"
 }
-
 # -- singbox_info: read the installed sing-box version + flavour for display.
 # Flavour (extended/tiny/standard) is a property of the INSTALLED sing-box, not
 # of the podkop variant — original podkop, podkop-plus and NetShift can each run
@@ -2246,11 +2266,41 @@ method_active_probe() {
 		fi
 	}
 
+
+	# Telegram service is stricter than a generic HTTP reachability probe: require
+	# getMe JSON for the configured bot. Never expose the token in files/results.
+	_probe_tg_api() {
+		_tg_token=$(uci -q get podkop_bot.settings.bot_token 2>/dev/null)
+		_tg_file="$_svc_dir/TelegramAPI"; _tg_body="$_svc_dir/.body_TelegramAPI"
+		if [ -z "$_tg_token" ]; then
+			printf 'na|000|0|token not configured' > "$_tg_file"; return
+		fi
+		_tg_resp=$(curl -s -k -o "$_tg_body" -w '%{http_code} %{time_total}' -x "$_proxy" \
+			--connect-timeout 5 --max-time 12 "https://api.telegram.org/bot${_tg_token}/getMe" 2>/dev/null)
+		_tg_code=$(printf '%s' "$_tg_resp" | awk '{print $1}')
+		_tg_time=$(printf '%s' "$_tg_resp" | awk '{print $2}')
+		_tg_ms=$(awk -v x="${_tg_time:-0}" 'BEGIN{printf "%d", x*1000}' 2>/dev/null); [ -z "$_tg_ms" ] && _tg_ms=0
+		_tg_geo=""
+		if [ "$_tg_code" = "200" ] && jq -e '.ok == true and (.result.id != null)' "$_tg_body" >/dev/null 2>&1; then
+			_tg_stat="ok"; _tg_geo=$(jq -r '.result.username // empty' "$_tg_body" 2>/dev/null); [ -n "$_tg_geo" ] && _tg_geo="@${_tg_geo}"
+		else
+			case "$_tg_code" in
+				''|000) _tg_stat="timeout" ;;
+				403|451) _tg_stat="blocked" ;;
+				401) _tg_stat="other"; _tg_geo="token rejected" ;;
+				429) _tg_stat="other"; _tg_geo="rate limited" ;;
+				*) _tg_stat="other" ;;
+			esac
+		fi
+		rm -f "$_tg_body" 2>/dev/null
+		printf '%s|%s|%s|%s' "$_tg_stat" "${_tg_code:-000}" "$_tg_ms" "$_tg_geo" > "$_tg_file"
+	}
+
 	# Fan out (slot names double as display labels via _svc_label below).
 	# Collect PIDs explicitly — `jobs -p` is empty in a non-interactive shell,
 	# so we can't rely on it to reap stragglers.
 	_pids=""
-	_probe_one "TelegramAPI" "https://api.telegram.org" "200 302" & _pids="$_pids $!"
+	_probe_tg_api & _pids="$_pids $!"
 	_probe_one "GitHub"      "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" "200" & _pids="$_pids $!"
 	_probe_one "Claude"      "https://api.anthropic.com/v1/models" "200 401" & _pids="$_pids $!"
 	_probe_one "YouTube"     "https://www.youtube.com/sw.js_data" "200" "youtube" & _pids="$_pids $!"
@@ -2324,13 +2374,13 @@ method_active_probe() {
 	elif [ "${_s1kb:-0}" -le 20 ]; then
 		_speed_status="block16k"
 	else
-		# Stage 2: 3 MB — larger sample lets TCP finish slow-start so fast links
+		# Stage 2: 8 MB — larger sample lets TCP finish slow-start so fast links
 		# (100+ Mbit/s, where 1 MB completes before the window opens up) aren't
 		# under-reported. curl's %{speed_download} reflects the actual achieved
 		# rate even if --max-time cuts a slow link short, so this stays bounded.
 		_raw2=$(curl -s -k -x "$_proxy" --connect-timeout 6 --max-time 60 \
-			-H "Range: bytes=0-3145727" -o /dev/null \
-			-w "%{speed_download}" "https://speed.cloudflare.com/__down?bytes=3145728" 2>/dev/null)
+			-H "Range: bytes=0-8388607" -o /dev/null \
+			-w "%{speed_download}" "https://speed.cloudflare.com/__down?bytes=8388608" 2>/dev/null)
 		_bps=$(printf '%s' "$_raw2" | grep -oE '^[0-9]+(\.[0-9]+)?' || echo 0)
 		# Fallback: if Cloudflare's endpoint is unreachable (0 bytes/s) but the
 		# tunnel itself works (stage 1 passed), retry against a fast.com CDN URL
@@ -2341,7 +2391,7 @@ method_active_probe() {
 				| jq -r '.targets[0].url // empty' 2>/dev/null)
 			if [ -n "$_furl" ]; then
 				_raw2b=$(curl -s -k -x "$_proxy" --connect-timeout 6 --max-time 60 \
-					-r 0-3145727 -o /dev/null -w "%{speed_download}" "$_furl" 2>/dev/null)
+					-r 0-8388607 -o /dev/null -w "%{speed_download}" "$_furl" 2>/dev/null)
 				_bps=$(printf '%s' "$_raw2b" | grep -oE '^[0-9]+(\.[0-9]+)?' || echo 0)
 			fi
 		fi

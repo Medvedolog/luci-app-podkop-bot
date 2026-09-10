@@ -25,6 +25,7 @@ var callAppInfo = rpc.declare({ object: 'podkop_bot', method: 'app_info' });
 var callLuciUpdate = rpc.declare({ object: 'podkop_bot', method: 'luci_update_check', params: [ 'force' ] });
 var callTestGithub = rpc.declare({ object: 'podkop_bot', method: 'test_github' });
 var callPodkopUpdate = rpc.declare({ object: 'podkop_bot', method: 'podkop_update_check' });
+var callActiveProbe = rpc.declare({ object: 'podkop_bot', method: 'active_probe', params: [ 'cached','section','proxy','label' ] });
 
 /* visiblePoller: runs tick() every `ms`, but only while the page is BOTH
  * visible and focused. Pauses on tab-hide and on window blur, resumes on
@@ -200,6 +201,8 @@ return view.extend({
 				    'click': ui.createHandlerFn(self, 'handleService', 'start_bot') }, _('Запустить')),
 			E('button', { 'class':'cbi-button cbi-button-action',
 			    'click': ui.createHandlerFn(self, 'handleService', 'restart_bot') }, _('Перезапустить')),
+			E('button', { 'class':'cbi-button cbi-button-action',
+			    'click': ui.createHandlerFn(self, 'handleOutboundProbe') }, _('Полный тест Outbound')),
 			autostart
 				? E('button', { 'class':'cbi-button',
 				    'click': ui.createHandlerFn(self, 'handleService', 'disable_bot') }, _('Отключить автозапуск'))
@@ -394,6 +397,43 @@ return view.extend({
 		}).then(function(data) {
 			self.data = data;
 			dom.content(self.container, self.buildCard(data));
+		});
+	},
+
+
+	handleOutboundProbe: function() {
+		ui.showModal(_('Полный тест Outbound'), [
+			E('p', { 'class':'spinning' }, _('Проверяются геолокация, 12 сервисов и скорость (до 8 МиБ)…'))
+		]);
+		return callActiveProbe('', '', '', '').then(function(d) {
+			if (!d || d.available === false) {
+				ui.showModal(_('Полный тест Outbound'), [
+					E('p', {}, dot('yellow', (d && d.detail) ? d.detail : _('Проверка недоступна.'))),
+					E('div', { 'class':'right' }, [ E('button', { 'class':'btn', 'click': ui.hideModal }, _('Закрыть')) ])
+				]);
+				return;
+			}
+			var svc = (d.services || []).map(function(x) {
+				var c = x.status === 'ok' ? 'green' : ((x.status === 'blocked' || x.status === 'timeout') ? 'red' : 'yellow');
+				var tail = (x.ms ? (' · ' + x.ms + ' ms') : '') + (x.geo ? (' · ' + x.geo) : '') + (x.code && x.code !== '000' ? (' · HTTP ' + x.code) : '');
+				return E('div', { 'style':'margin:.2em 0;' }, dot(c, (x.name || '?') + tail));
+			});
+			var sp = d.speed || {}, spc = sp.status === 'ok' ? 'green' : 'red';
+			ui.showModal(_('Полный тест Outbound'), [
+				E('p', {}, [ E('strong', {}, _('Выход: ')), (d.geo && d.geo.ip ? d.geo.ip : '—') + (d.geo && d.geo.country ? (' · ' + d.geo.country) : '') ]),
+				E('div', { 'style':'max-height:45vh;overflow:auto;margin:.5em 0;' }, svc),
+				E('p', {}, dot(spc, _('Скорость: ') + (sp.mbps || '0') + ' Mbit/s · ' + (sp.status || 'unknown'))),
+				E('div', { 'class':'right' }, [
+					E('button', { 'class':'cbi-button', 'click': function(){ window.location = L.url('admin/services/podkop-bot/runtime'); } }, _('Открыть Runtime')),
+					' ',
+					E('button', { 'class':'btn', 'click': ui.hideModal }, _('Закрыть'))
+				])
+			]);
+		}).catch(function() {
+			ui.showModal(_('Полный тест Outbound'), [
+				E('p', {}, dot('red', _('Проверка не завершилась.'))),
+				E('div', { 'class':'right' }, [ E('button', { 'class':'btn', 'click': ui.hideModal }, _('Закрыть')) ])
+			]);
 		});
 	},
 

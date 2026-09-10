@@ -107,5 +107,23 @@ if errors:
 print(f'RPC contract OK: {len(listed)} methods')
 PY
 
+# Telegram/root security invariants (0.19.17+).
+BOT_SRC="root/usr/lib/podkop_bot/podkop_bot"
+grep -Fq '[ -z "$ALLOW_ANON_ADMINS" ] && ALLOW_ANON_ADMINS="0"' "$BOT_SRC" || {
+    echo "security: anonymous admins must default to disabled" >&2; exit 1;
+}
+grep -Fq 'UPLOAD_SESSION_TTL=300' "$BOT_SRC" || {
+    echo "security: upload session TTL guard missing" >&2; exit 1;
+}
+grep -Fq '[ "$chat_type" != "private" ] || [ "$user_id" != "$ADMIN_ID" ]' "$BOT_SRC" || {
+    echo "security: uploaded executable must be primary-admin/private-chat gated" >&2; exit 1;
+}
+grep -Fq 'blocked_user_ids' "$BOT_SRC" && grep -Fq 'blocked_sender_chat_ids' "$BOT_SRC" || {
+    echo "security: persistent manual blocklist support missing" >&2; exit 1;
+}
+if grep -E 'logger .*\[Security\].*(text=|\$\{text\}|\$text)' "$BOT_SRC" >/dev/null 2>&1; then
+    echo "security: attacker-controlled Telegram text must not reach syslog" >&2; exit 1;
+fi
+
 [ "$fail" -eq 0 ] || { echo "source checks failed"; exit 1; }
 echo "source checks passed"

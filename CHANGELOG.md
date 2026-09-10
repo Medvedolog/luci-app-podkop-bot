@@ -18,6 +18,11 @@
 
 ### Unreleased — native OpenWrt packages through owfeed
 
+- **[0.19.17 / security]** Anonymous `sender_chat` admins are opt-in; default is disabled.
+- **[0.19.17 / security]** Executable bot uploads require a fresh 5-minute private-chat session owned by the primary administrator; extra admins and anonymous sender_chat identities cannot upload code.
+- **[0.19.17 / security]** Unauthorized actors are rate-limited and temporarily blocked in RAM after repeated attempts; optional persistent UCI blocklists are supported by `blocked_user_ids` and `blocked_sender_chat_ids`.
+- **[0.19.17 / security]** Attacker-controlled Telegram message bodies are no longer written verbatim to syslog.
+
 - **[0.19.16 / transport]** Vendored bot now probes Telegram `getMe` concurrently through tier1, every tier2 fallback/auto-section and tier3. On reserve/degraded POLL routes the follower refreshes every health tick.
 - **[0.19.16 / anti-flap]** One failed POLL proxy cascade is held when the follower still has a fresh successful Telegram sample; a second consecutive failure may demote to Direct. FAST remains independent.
 - **[0.19.16 / journal]** Localized probe/route display values are kept out of syslog; source checks reject known presentation variables and display helpers in logger calls.

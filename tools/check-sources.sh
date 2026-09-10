@@ -50,7 +50,12 @@ files = [
 forbidden_vars = (
     'ROUTE_NAME', 'LAST_ROUTE_NAME', 'LAST_ROUTE_FAST_NAME',
     'LAST_ROUTE_POLL_NAME', 'active_px_display',
+    # UI/display fallbacks below may contain localized text; logger must use
+    # an ASCII/machine value (normally via _journal_value) instead.
+    'PROBE_COUNTRY', 'PROBE_CF_COUNTRY', 'PROBE_GOOGLE_COUNTRY',
+    'PROBE_ORG', 'px_type',
 )
+forbidden_logger_helpers = ('_proxy_display', 'display_proxy_name')
 errors = []
 for path in files:
     for n, line in enumerate(path.read_text().splitlines(), 1):
@@ -60,6 +65,8 @@ for path in files:
             errors.append(f'{path}:{n}: Cyrillic logger literal: {line.strip()}')
         if any(v in line for v in forbidden_vars):
             errors.append(f'{path}:{n}: localized display variable in logger: {line.strip()}')
+        if any(h in line for h in forbidden_logger_helpers):
+            errors.append(f'{path}:{n}: display helper in logger: {line.strip()}')
 if errors:
     print('\n'.join(errors))
     sys.exit(1)

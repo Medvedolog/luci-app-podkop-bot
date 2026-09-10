@@ -18,6 +18,10 @@
 
 ### Unreleased — native OpenWrt packages through owfeed
 
+- **[0.19.16 / transport]** Vendored bot now probes Telegram `getMe` concurrently through tier1, every tier2 fallback/auto-section and tier3. On reserve/degraded POLL routes the follower refreshes every health tick.
+- **[0.19.16 / anti-flap]** One failed POLL proxy cascade is held when the follower still has a fresh successful Telegram sample; a second consecutive failure may demote to Direct. FAST remains independent.
+- **[0.19.16 / journal]** Localized probe/route display values are kept out of syslog; source checks reject known presentation variables and display helpers in logger calls.
+
 - **[Сборка]** nFPM заменён на owfeed: OpenWrt 25.12+ получает настоящий APKv3/ADB, 24.10 — IPK из того же staged tree.
 - **[CI]** Перед релизом source checks и package assertions дополняются установкой свежесобранных пакетов через owlab на OpenWrt 25.12.5 и 24.10.8; только затем reusable owfeed workflow может подписать и опубликовать релиз.
 - **[Подписи]** Подготовлены постоянный EC package-signing key и usign release-manifest key через `tools/setup-keys.sh`; приватные ключи хранятся только в GitHub Secrets/у владельца, публичные предназначены для pinning в community feed.

@@ -18,19 +18,18 @@ s = p.read_text()
 assert '`0.19.15` · OpenWrt · LuCI · opkg / apk' in s
 p.write_text(s.replace('`0.19.15` · OpenWrt · LuCI · opkg / apk', '`0.19.16` · OpenWrt · LuCI · opkg / apk', 1))
 
-# Changelog.
+# Changelog: keep the project's existing RU/history structure and add this build
+# at the top of the current Unreleased section.
 p = Path('CHANGELOG.md')
 s = p.read_text()
-marker = '# Changelog\n\n'
+marker = '### Unreleased — native OpenWrt packages through owfeed\n\n'
 if marker not in s:
-    raise SystemExit('CHANGELOG marker not found')
-entry = '''# Changelog
+    raise SystemExit('CHANGELOG Unreleased marker not found')
+entry = '''### Unreleased — native OpenWrt packages through owfeed
 
-## v0.19.16
-
-- **TRANSPORT:** vendored bot gains a Telegram-aware parallel follower: `getMe` is probed concurrently through tier1, every tier2 fallback/auto-section and tier3. On reserve/degraded POLL routes it refreshes every health tick.
-- **ANTI-FLAP:** one failed POLL proxy cascade is held when the follower still has a fresh successful Telegram sample; a second consecutive failure may demote to Direct. FAST remains independent.
-- **JOURNAL:** localized probe/route display values are kept out of syslog; source checks reject known presentation variables and display helpers in logger calls.
+- **[0.19.16 / transport]** Vendored bot now probes Telegram `getMe` concurrently through tier1, every tier2 fallback/auto-section and tier3. On reserve/degraded POLL routes the follower refreshes every health tick.
+- **[0.19.16 / anti-flap]** One failed POLL proxy cascade is held when the follower still has a fresh successful Telegram sample; a second consecutive failure may demote to Direct. FAST remains independent.
+- **[0.19.16 / journal]** Localized probe/route display values are kept out of syslog; source checks reject known presentation variables and display helpers in logger calls.
 
 '''
 p.write_text(s.replace(marker, entry, 1))

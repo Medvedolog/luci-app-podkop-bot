@@ -125,5 +125,16 @@ if grep -E 'logger .*\[Security\].*(text=|\$\{text\}|\$text)' "$BOT_SRC" >/dev/n
     echo "security: attacker-controlled Telegram text must not reach syslog" >&2; exit 1;
 fi
 
+# Journal verbosity contract (0.19.17+).
+grep -Fq 'podkop_bot.settings.log_level="normal"' "$BOT_SRC" || {
+    echo "logging: normal default missing" >&2; exit 1;
+}
+grep -Fq 'FOLLOWER_LOG_SUMMARY_TS_FILE' "$BOT_SRC" || {
+    echo "logging: follower summary/state gate missing" >&2; exit 1;
+}
+grep -Fq "form.ListValue, 'log_level'" root/www/luci-static/resources/view/podkop-bot/settings.js || {
+    echo "logging: LuCI verbosity selector missing" >&2; exit 1;
+}
+
 [ "$fail" -eq 0 ] || { echo "source checks failed"; exit 1; }
 echo "source checks passed"

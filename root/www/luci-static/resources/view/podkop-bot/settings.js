@@ -192,6 +192,13 @@ return view.extend({
 		o.datatype = 'range(30,3600)';
 		o.default = '60';
 
+		o = s.option(form.ListValue, 'log_level', _('Подробность системного журнала'),
+			_('Тихий — только важные события; обычный — изменения состояния и редкие сводки; отладочный — подробные проверки и транспортная телеметрия. Изменение подхватывается ботом автоматически.'));
+		o.value('quiet', _('Тихий'));
+		o.value('normal', _('Обычный'));
+		o.value('debug', _('Отладочный'));
+		o.default = 'normal';
+
 		o = s.option(form.Flag, 'broadcast_alerts', _('Рассылать алерты всем admin_ids'),
 			_('Watchdog-алерты уходят всем из admin_ids, а не только основному chat_id.'));
 		o.default = '0';

@@ -60,3 +60,5 @@ new2 = '''        if any(v in line for v in forbidden_vars):
             errors.append(f'{path}:{n}: display helper in logger: {line.strip()}')'''
 assert old2 in s
 p.write_text(s.replace(old2, new2, 1))
+
+# Staging-only marker: this helper is deleted after the verified sync.

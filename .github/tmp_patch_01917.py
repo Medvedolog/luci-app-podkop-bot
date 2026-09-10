@@ -28,7 +28,7 @@ p.write_text(s.replace(marker, entry, 1))
 # Permanent source guards for the root-Telegram security boundary.
 p = Path('tools/check-sources.sh')
 s = p.read_text()
-marker = 'echo "source checks OK"'
+marker = '[ "$fail" -eq 0 ] || { echo "source checks failed"; exit 1; }\necho "source checks passed"'
 assert marker in s
 security = r'''# Telegram/root security invariants (0.19.17+).
 BOT_SRC="root/usr/lib/podkop_bot/podkop_bot"

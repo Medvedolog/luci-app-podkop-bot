@@ -9,7 +9,7 @@
  *
  * Answers "how will the bot reach Telegram if direct Telegram is blocked?".
  * Shows the 6-tier fallback chain with per-tier configured/probe state, the
- * bot's live active route (last_ok from its state file), and lets the user
+ * bot's authoritative POLL/getUpdates route, and lets the user
  * probe each tier or the whole chain. fallback_socks CRUD is a follow-up slice;
  * this slice is read + probe + Enable Mixed Proxy.
  */
@@ -153,7 +153,7 @@ return view.extend({
 			]);
 		}
 
-		/* Build the tier rows. Active tier (state.last_ok) is highlighted. */
+		/* Build tier rows. The authoritative POLL/getUpdates tier is highlighted. */
 		var tiers = this.buildTiers(data);
 		var chainBox = E('div', { 'id':'podkop-tiers' }, this.renderTiers(tiers, data));
 		this.chainBox = chainBox;
@@ -242,13 +242,20 @@ return view.extend({
 	/* Bot Transport vs Active route summary (TZ 11.3). */
 	botTransportCard: function(d) {
 		var self = this;
-		var routeLabel = (d.last_ok && d.last_ok !== 'unknown') ? d.last_ok : (d.route || 'unknown');
+		var pollKey = d.poll_route || d.route || 'unknown';
+		var pollName = d.poll_route_name || d.route_name || pollKey;
+		var fastKey = d.fast_route || 'unknown';
+		var fastName = d.fast_route_name || fastKey;
+		var routeLabel = (pollName && pollName !== 'unknown' && pollName !== pollKey) ? (pollName + ' [' + pollKey + ']') : pollKey;
+		var fastLabel = (fastName && fastName !== 'unknown' && fastName !== fastKey) ? (fastName + ' [' + fastKey + ']') : fastKey;
 		var tgColour = (d.tg === 'ok') ? 'green' : (d.tg === 'fail' ? 'red' : 'grey');
-		/* Active route colour reflects whether a transport tier was last working
-		 * (last_ok), NOT the aggregate Telegram state. A live Mixed Proxy with
-		 * Telegram-through-transport failing must not paint the route red — those
-		 * are separate conditions (see 0.16.52 NetShift regression). */
-		var routeColour = (d.last_ok && d.last_ok !== 'unknown') ? 'green' : 'grey';
+		/* POLL/getUpdates determines whether the bot can receive commands. FAST is
+		 * displayed separately because a short sendMessage can succeed while the
+		 * same proxy cannot sustain a long poll. */
+		var routeColour = (pollKey === 'fail') ? 'red' :
+			((pollKey === 'tier4' || pollKey === 'tier5') ? 'yellow' : (pollKey !== 'unknown' ? 'green' : 'grey'));
+		var fastColour = (fastKey === 'fail') ? 'red' :
+			((fastKey === 'tier4' || fastKey === 'tier5') ? 'yellow' : (fastKey !== 'unknown' ? 'green' : 'grey'));
 		var directColour = (d.tg_direct === 'ok') ? 'green' : (d.tg_direct === 'fail' ? 'yellow' : 'grey');
 		var transportColour = (d.tg_transport === 'ok') ? 'green' : (d.tg_transport === 'fail' ? 'red' : 'grey');
 
@@ -281,7 +288,8 @@ return view.extend({
 
 		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
 			E('h3', { 'style':'margin-top:0;' }, _('Состояние')),
-			this.row(_('Активный маршрут'), dot(routeColour, routeLabel)),
+			this.row(_('POLL · getUpdates'), dot(routeColour, routeLabel)),
+			this.row(_('FAST · отправка'), dot(fastColour, fastLabel)),
 			this.row(_('Telegram напрямую'), dot(directColour, d.tg_direct === 'fail' ? _('заблокирован (ожидаемо)') : (d.tg_direct||'unknown'))),
 			this.row(_('Telegram через транспорт'), dot(transportColour, d.tg_transport||'unknown')),
 			E('div', { 'style':'display:flex;align-items:center;padding:.3em 0;gap:.5em;flex-wrap:wrap;' }, [
@@ -315,7 +323,7 @@ return view.extend({
 
 	renderTiers: function(tiers, d) {
 		var self = this;
-		var active = (d.last_ok && d.last_ok !== 'unknown') ? d.last_ok : null;
+		var active = (d.poll_route && d.poll_route !== 'unknown') ? d.poll_route : ((d.route && d.route !== 'unknown') ? d.route : null);
 		return E('div', {}, tiers.map(function(t) {
 			var isActive = (t.id === active);
 			t._active = isActive;

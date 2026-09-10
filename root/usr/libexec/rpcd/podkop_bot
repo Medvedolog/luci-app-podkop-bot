@@ -19,7 +19,7 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.19.12"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
+LUCI_APP_VERSION="0.19.13"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
 
 # -- shared UCI lock ---------------------------------------------------------
 # The bot writes the same package from two processes (its command loop and the
@@ -1165,6 +1165,10 @@ method_update_paste() {
 BOT_DIR="/tmp/podkop_bot"
 SOCKS_STATE="$BOT_DIR/socks_state"
 HEALTH_STATE="$BOT_DIR/health_state"
+POLL_ROUTE="$BOT_DIR/poll_route"
+POLL_ROUTE_KEY="$BOT_DIR/poll_route_key"
+FAST_ROUTE="$BOT_DIR/fast_route"
+FAST_ROUTE_KEY="$BOT_DIR/fast_route_key"
 
 # Read one key=value line from a bot state file. Empty if absent.
 _state_get() { grep "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2-; }
@@ -1213,11 +1217,31 @@ method_transport_state() {
 	[ -z "$_variant" ] && _variant="unknown"
 	_pkg=$(podkop_uci_pkg "$_variant")
 
-	# --- bot route state (live, written by the bot) ---
-	_route=$(_state_get "$SOCKS_STATE" route);        [ -z "$_route" ] && _route="unknown"
+	# --- bot route state (live, written by bot 0.19.13+) ---
+	# POLL/getUpdates is authoritative for bot availability. FAST/sendMessage is
+	# diagnostic only. Never fall back to watchdog's historical `last_ok`: that
+	# field describes SOCKS health, not the route that actually carries long-poll.
+	_poll_route=$(cat "$POLL_ROUTE_KEY" 2>/dev/null)
+	_poll_route_name=$(cat "$POLL_ROUTE" 2>/dev/null)
+	_fast_route=$(cat "$FAST_ROUTE_KEY" 2>/dev/null)
+	_fast_route_name=$(cat "$FAST_ROUTE" 2>/dev/null)
+	# The watchdog also snapshots the new fields into socks_state. This fallback
+	# covers a narrow read race or direct state-file cleanup without reviving the
+	# old shared-route model. Older bots honestly report unknown here.
+	[ -z "$_poll_route" ] && _poll_route=$(_state_get "$SOCKS_STATE" poll_route)
+	[ -z "$_poll_route_name" ] && _poll_route_name=$(_state_get "$SOCKS_STATE" poll_route_name)
+	[ -z "$_fast_route" ] && _fast_route=$(_state_get "$SOCKS_STATE" fast_route)
+	[ -z "$_fast_route_name" ] && _fast_route_name=$(_state_get "$SOCKS_STATE" fast_route_name)
+	[ -z "$_poll_route" ] && _poll_route="unknown"
+	[ -z "$_poll_route_name" ] && _poll_route_name="$_poll_route"
+	[ -z "$_fast_route" ] && _fast_route="unknown"
+	[ -z "$_fast_route_name" ] && _fast_route_name="$_fast_route"
+	# Compatibility aliases for existing RPC consumers: route/last_ok now both
+	# mean the authoritative POLL route rather than a watchdog approximation.
+	_route="$_poll_route"
+	_last_ok="$_poll_route"
 	_st_tg=$(_state_get "$SOCKS_STATE" tg);           [ -z "$_st_tg" ] && _st_tg="unknown"
 	_st_socks=$(_state_get "$SOCKS_STATE" socks);     [ -z "$_st_socks" ] && _st_socks="unknown"
-	_last_ok=$(_state_get "$SOCKS_STATE" last_ok);    [ -z "$_last_ok" ] && _last_ok="unknown"
 	_tg_direct=$(_state_get "$HEALTH_STATE" tg_direct);     [ -z "$_tg_direct" ] && _tg_direct="unknown"
 	_tg_transport=$(_state_get "$HEALTH_STATE" tg_transport); [ -z "$_tg_transport" ] && _tg_transport="unknown"
 
@@ -1251,8 +1275,9 @@ method_transport_state() {
 	_wan=$(_wan_if); [ -z "$_wan" ] && _wan="unknown"
 
 	printf '{"ok":true,"available":true,"variant":"%s","uci_pkg":"%s","policy":"%s",' "$_variant" "$_pkg" "$_policy"
-	printf '"route":"%s","tg":"%s","socks":"%s","last_ok":"%s","tg_direct":"%s","tg_transport":"%s",' \
-		"$_route" "$_st_tg" "$_st_socks" "$_last_ok" "$_tg_direct" "$_tg_transport"
+	printf '"route":%s,"route_name":%s,"poll_route":%s,"poll_route_name":%s,"fast_route":%s,"fast_route_name":%s,"tg":"%s","socks":"%s","last_ok":%s,"tg_direct":"%s","tg_transport":"%s",' \
+		"$(_json_str "$_route")" "$(_json_str "$_poll_route_name")" "$(_json_str "$_poll_route")" "$(_json_str "$_poll_route_name")" \
+		"$(_json_str "$_fast_route")" "$(_json_str "$_fast_route_name")" "$_st_tg" "$_st_socks" "$(_json_str "$_last_ok")" "$_tg_direct" "$_tg_transport"
 	printf '"tier1":{"section":%s,"mixed_proxy_enabled":%s,"port":%s,"endpoint":%s},' \
 		"$(_json_str "$_sec")" "$([ "$_mp_enabled" = "1" ] && echo true || echo false)" "$(_json_str "$_mp_port")" "$(_json_str "$_mp_endpoint")"
 	printf '"tier2_fallback_socks":%s,' "$_fb_json"

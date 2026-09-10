@@ -23,6 +23,12 @@
 - **[Подписи]** Подготовлены постоянный EC package-signing key и usign release-manifest key через `tools/setup-keys.sh`; приватные ключи хранятся только в GitHub Secrets/у владельца, публичные предназначены для pinning в community feed.
 - **[Баг]** Vendored install.sh 2.6.2 ищет APK release asset по `.apk`, а не старому nFPM-суффиксу `_noarch.apk`, поэтому `update-luci` понимает имена native owfeed APKv3 и остаётся совместим со старыми релизами.
 
+### 0.19.14 — полный Outbound-тест из Status и Telegram-aware transport probe
+
+- **[Баг]** Кнопка «Полный тест Outbound» в Telegram Status теперь правильно маршрутизируется в существующий диагностический `ask_probe_outbound`/`cmd_probe_outbound_back_*` flow. Раньше новый callback `ask_probe_outbound_status` не был внесён в главный router и проваливался в общий `ask_*`, поэтому показывал `probe_outbound_status?`, а «Да» вызывало несуществующий `do_probe_outbound_status`.
+- **[Интерфейс]** Экран подтверждения явно сообщает, что это тот же тест, что «Диагностика → Проверить прокси», перечисляет 12 сервисов, предупреждает о 20–60 секундах работы и о трафике до 8 МБ через туннель плюс до 8 МБ через прямой WAN для сравнения.
+- **[Диагностика]** Vendored bot синхронизирован со standalone 0.19.14; транспортные проверки Telegram используют реальный Bot API `getMe`, а полный Outbound-тест сохраняет 12-service/8 MiB схему.
+
 ### 0.19.13 — transport-state: POLL и FAST разделены
 
 - **[Баг]** Вендорный `podkop_bot` обновлён до **0.19.13**: состояние длинного `getUpdates` (POLL) больше не смешивается с короткими `sendMessage`/callback (FAST), поэтому отправка алерта вотчдогом не может сама породить ложную пару «Direct → восстановлено».

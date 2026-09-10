@@ -37,6 +37,35 @@ if [ -f root/usr/share/luci-app-podkop-bot/install.sh ]; then
     echo "FAIL  stale duplicate installer is present"; fail=1
 fi
 
+# System journal is operator/machine-facing: built-in event templates stay
+# English/ASCII. Localized labels belong in Telegram/LuCI, not logread.
+# Also reject the known human-facing variables that can contain localized route
+# names even when the logger source line itself is ASCII.
+python3 - <<'PY' || fail=1
+import pathlib, re, sys
+files = [
+    pathlib.Path('root/usr/lib/podkop_bot/podkop_bot'),
+    pathlib.Path('root/usr/libexec/rpcd/podkop_bot'),
+]
+forbidden_vars = (
+    'ROUTE_NAME', 'LAST_ROUTE_NAME', 'LAST_ROUTE_FAST_NAME',
+    'LAST_ROUTE_POLL_NAME', 'active_px_display',
+)
+errors = []
+for path in files:
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        if 'logger ' not in line:
+            continue
+        if re.search(r'[\u0400-\u04FF]', line):
+            errors.append(f'{path}:{n}: Cyrillic logger literal: {line.strip()}')
+        if any(v in line for v in forbidden_vars):
+            errors.append(f'{path}:{n}: localized display variable in logger: {line.strip()}')
+if errors:
+    print('\n'.join(errors))
+    sys.exit(1)
+print('journal language contract OK')
+PY
+
 # RPC contract: every advertised method has a definition/dispatch/ACL entry and
 # every frontend RPC call names an advertised method.
 python3 - <<'PY' || fail=1

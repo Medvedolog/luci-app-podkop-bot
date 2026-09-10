@@ -23,6 +23,13 @@
 - **[Подписи]** Подготовлены постоянный EC package-signing key и usign release-manifest key через `tools/setup-keys.sh`; приватные ключи хранятся только в GitHub Secrets/у владельца, публичные предназначены для pinning в community feed.
 - **[Баг]** Vendored install.sh 2.6.2 ищет APK release asset по `.apk`, а не старому nFPM-суффиксу `_noarch.apk`, поэтому `update-luci` понимает имена native owfeed APKv3 и остаётся совместим со старыми релизами.
 
+### 0.19.15 — исправление зависания Outbound probe
+
+- **[Баг]** Полный Outbound-тест больше не зависает на шаге 3/4: `probe_services()` теперь ожидает только PID своих 12 service-workers, а не выполняет голый `wait`, который также ждал постоянно работающий watchdog.
+- **[Отзывчивость]** Полный тест выполняется в background worker, поэтому Telegram polling loop продолжает принимать `/start` и другие команды во время диагностики.
+- **[Журнал]** События бота и runtime-диагностики пишутся в syslog на английском; локализованные названия маршрутов остаются только в Telegram/LuCI. Добавлены progress/result строки по всем четырём стадиям и 12 сервисам без вывода bot token.
+- **[Runtime]** Кнопка «Проверить Telegram API» перенесена в конец панели действий.
+
 ### 0.19.14 — полный Outbound-тест из Status и Telegram-aware transport probe
 
 - **[Баг]** Кнопка «Полный тест Outbound» в Telegram Status теперь правильно маршрутизируется в существующий диагностический `ask_probe_outbound`/`cmd_probe_outbound_back_*` flow. Раньше новый callback `ask_probe_outbound_status` не был внесён в главный router и проваливался в общий `ask_*`, поэтому показывал `probe_outbound_status?`, а «Да» вызывало несуществующий `do_probe_outbound_status`.

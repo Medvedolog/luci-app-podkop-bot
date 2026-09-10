@@ -205,7 +205,7 @@ return view.extend({
 			E('p', { 'class':'pb-muted' }, _('Проверка туннеля: страна и провайдер выхода, доступность 12 сервисов и их регионы, скорость, признаки блокировок ТСПУ. Маршрут — это через что идёт проверка: секция Podkop, транспортный или ручной прокси.')),
 			E('p', { 'style':'color:#c60;font-size:90%;margin-top:-.4em;' }, _('⚠ Полная проверка идёт 15–60 секунд и нагружает роутер (параллельные запросы + загрузка до 8 МиБ через туннель). Быстрая кнопка Telegram API проверяет только реальный getMe и почти не создаёт трафика.')),
 			selectorRow,
-			E('div', { 'style':'margin:.6em 0;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ tgBtn, runBtn, batchBtn, cpToggle ]),
+			E('div', { 'style':'margin:.6em 0;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ runBtn, batchBtn, cpToggle, tgBtn ]),
 			cpForm,
 			tgBody,
 			body,

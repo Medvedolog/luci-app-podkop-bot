@@ -22,6 +22,10 @@
           "podkop_update_check",
           "luci_update_log",
           "podkop_update_log"
+        ],
+        "podkop_bot_warpscout": [
+          "status",
+          "log"
         ]
       },
       "uci": [
@@ -42,6 +46,9 @@
           "set_tier1_port",
           "luci_update_run",
           "podkop_update_run"
+        ],
+        "podkop_bot_warpscout": [
+          "run"
         ]
       },
       "uci": [

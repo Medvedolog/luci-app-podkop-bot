@@ -25,7 +25,9 @@
         ],
         "podkop_bot_warpscout": [
           "status",
-          "log"
+          "log",
+          "action_log",
+          "shortlist"
         ]
       },
       "uci": [
@@ -48,7 +50,11 @@
           "podkop_update_run"
         ],
         "podkop_bot_warpscout": [
-          "run"
+          "run",
+          "config_set",
+          "account_import",
+          "action_run",
+          "select"
         ]
       },
       "uci": [

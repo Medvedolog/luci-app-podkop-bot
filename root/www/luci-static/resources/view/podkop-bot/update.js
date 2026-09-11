@@ -20,6 +20,9 @@ var callLuciLog     = rpc.declare({ object:'podkop_bot', method:'luci_update_log
 var callPodkopRun   = rpc.declare({ object:'podkop_bot', method:'podkop_update_run' });
 var callPodkopLog   = rpc.declare({ object:'podkop_bot', method:'podkop_update_log', params:['offset'] });
 var callUpdateUpload = rpc.declare({ object:'podkop_bot', method:'update_upload' });
+var callWarpscoutStatus = rpc.declare({ object:'podkop_bot_warpscout', method:'status', params:['force'] });
+var callWarpscoutRun = rpc.declare({ object:'podkop_bot_warpscout', method:'run' });
+var callWarpscoutLog = rpc.declare({ object:'podkop_bot_warpscout', method:'log', params:['offset'] });
 
 /* Force one fresh LuCI version check per page session (module scope survives
  * tab re-renders but resets on full reload). Without this the daily cache could
@@ -54,7 +57,7 @@ function pbFooter() {
 	callAppInfo().then(function(a) {
 		if (a && a.ok) {
 			dom.content(span, [
-				E('span', {}, 'luci-app-podkop-bot v' + (a.luci_app_version || '?') + ' \u00b7 '),
+				E('span', {}, 'luci-app-podkop-bot v' + (a.luci_app_version || '?') + ' · '),
 				E('a', { 'href': a.repo || 'https://github.com/Medvedolog/luci-app-podkop-bot', 'target': '_blank', 'rel': 'noopener' }, _('репозиторий'))
 			]);
 		}
@@ -193,6 +196,9 @@ return view.extend({
 
 			/* ─── Card 3: Podkop / fork ─────────────────────────────────── */
 			this.podkopUpdateCard(),
+
+			/* ─── Card 4: optional WARPSCOUT component ──────────────────── */
+			this.warpscoutUpdateCard(),
 
 			/* ─── Danger zone: uninstall the bot (collapsed by default) ─── */
 			(function(){
@@ -440,6 +446,112 @@ return view.extend({
 			}
 			dom.content(holder, E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));margin-top:1em;' }, inner));
 		}).catch(function(){});
+	},
+
+	warpscoutUpdateCard: function() {
+		var self = this;
+		var holder = E('div', { 'id':'warpscout-update' },
+			E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));margin-top:1em;' }, [
+				E('h3', { 'style':'margin-top:0;' }, _('WARPSCOUT')),
+				dot('grey', _('проверяю…'))
+			]));
+		this.fillWarpscout(holder, '');
+		return holder;
+	},
+
+	fillWarpscout: function(holder, force) {
+		var self = this;
+		callWarpscoutStatus(force).then(function(d) {
+			var opStatus = E('div', { 'style':'margin-top:.5em;' });
+			var opLog = E('pre', { 'class':'pb-mono', 'style':'display:none;max-width:760px;max-height:280px;overflow:auto;background:var(--background-color-high,var(--background-color,var(--background,rgba(30,30,30,.96))));padding:.6em;border-radius:6px;white-space:pre-wrap;font-size:80%;margin-top:.5em;' });
+			var recheck = E('button', {
+				'class':'cbi-button',
+				'click': function() {
+					dom.content(opStatus, dot('grey', _('Проверка…')));
+					self.fillWarpscout(holder, 'true');
+				}
+			}, _('Проверить версию'));
+			var installed = !!(d && d.installed);
+			var current = installed ? (d.current || '—') : _('не установлен');
+			var latest = (d && d.latest) ? d.latest : '';
+			var updateAvailable = !!(d && d.update_available);
+			var runBtn = E('button', {
+				'class':(!installed || updateAvailable) ? 'cbi-button cbi-button-action' : 'cbi-button',
+				'click': ui.createHandlerFn(self, function() {
+					if (!confirm(installed ? _('Запустить официальный установщик WARPSCOUT? Он обновит или переустановит компонент.') : _('Установить WARPSCOUT официальным upstream install.sh?'))) return;
+					runBtn.disabled = true;
+					opLog.style.display = 'block';
+					opLog.textContent = '';
+					dom.content(opStatus, dot('yellow', _('Установка WARPSCOUT запущена…')));
+					return callWarpscoutRun().then(function(r) {
+						if (!r || !r.ok) {
+							dom.content(opStatus, dot('red', (r && r.reason === 'already_running') ? _('установка уже выполняется') : _('не удалось запустить установку')));
+							runBtn.disabled = false;
+							return;
+						}
+						self.pollWarpscoutLog(holder, opStatus, opLog, runBtn);
+					}).catch(function() {
+						dom.content(opStatus, dot('red', _('ошибка вызова WARPSCOUT backend')));
+						runBtn.disabled = false;
+					});
+				})
+			}, installed ? (updateAvailable ? _('Обновить WARPSCOUT') : _('Переустановить WARPSCOUT')) : _('Установить WARPSCOUT'));
+
+			var latestNode = latest ? (updateAvailable ? dot('yellow', latest + _(' — доступно')) : dot('green', latest + (installed ? _(' — актуально') : ''))) : dot('yellow', _('последнюю версию проверить не удалось'));
+			var inner = [
+				E('h3', { 'style':'margin-top:0;' }, _('WARPSCOUT')),
+				E('p', { 'style':'color:#888;font-size:90%;margin:.3em 0 .7em;' }, _('Опциональный WARP-инструмент. Здесь проверяются наличие и версия и выполняется ручная установка. Настройка WARP Rescue будет находиться в разделе «Транспорт».')),
+				E('div', { 'class':'pb-row pb-row--plain' }, [
+					E('span', { 'class':'pb-row-label' }, _('Установлено')),
+					E('span', { 'class':'pb-row-val' }, installed ? dot('green', current) : dot('grey', current))
+				]),
+				E('div', { 'class':'pb-row pb-row--plain' }, [
+					E('span', { 'class':'pb-row-label' }, _('В репозитории')),
+					E('span', { 'class':'pb-row-val' }, latestNode)
+				]),
+				E('div', { 'class':'pb-action-row', 'style':'margin-top:.7em;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [
+					E('a', { 'class':'cbi-button', 'href': (d && d.releases_url) || 'https://github.com/vernette/warpscout/releases', 'target':'_blank', 'rel':'noopener' }, _('Страница WARPSCOUT')),
+					recheck,
+					runBtn
+				]),
+				opStatus,
+				opLog
+			];
+			dom.content(holder, E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));margin-top:1em;' }, inner));
+		}).catch(function() {
+			dom.content(holder, E('div', { 'class':'cbi-section', 'style':'max-width:760px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;margin-top:1em;' }, [
+				E('h3', { 'style':'margin-top:0;' }, _('WARPSCOUT')),
+				dot('red', _('backend WARPSCOUT недоступен'))
+			]));
+		});
+	},
+
+	pollWarpscoutLog: function(holder, statusNode, logNode, btn) {
+		var self = this, offset = 0, logText = '', failures = 0;
+		var tick = function() {
+			callWarpscoutLog(offset).then(function(r) {
+				failures = 0;
+				if (r && r.chunk) { logText += r.chunk; logNode.textContent = logText; logNode.scrollTop = logNode.scrollHeight; }
+				if (r && typeof r.offset === 'number') offset = r.offset;
+				if (r && r.done) {
+					if (r.exit_code === 0) dom.content(statusNode, dot('green', _('WARPSCOUT установлен.')));
+					else dom.content(statusNode, dot('red', _('Установка WARPSCOUT завершилась с ошибкой — см. лог.')));
+					if (btn) btn.disabled = false;
+					setTimeout(function(){ self.fillWarpscout(holder, 'true'); }, 500);
+					return;
+				}
+				setTimeout(tick, 1200);
+			}).catch(function() {
+				failures++;
+				if (failures >= 10) {
+					dom.content(statusNode, dot('red', _('Не удалось получить временный лог WARPSCOUT')));
+					if (btn) btn.disabled = false;
+					return;
+				}
+				setTimeout(tick, 1800);
+			});
+		};
+		tick();
 	},
 
 	currentBlock: function() {

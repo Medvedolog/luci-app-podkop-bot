@@ -14,7 +14,15 @@
 	},
 	"admin/services/podkop-bot/transport": {
 		"title": "Транспорт", "order": 20,
+		"action": { "type": "firstchild" }
+	},
+	"admin/services/podkop-bot/transport/main": {
+		"title": "Proxy Pool", "order": 5,
 		"action": { "type": "view", "path": "podkop-bot/transport" }
+	},
+	"admin/services/podkop-bot/transport/warpscout": {
+		"title": "WARP Rescue", "order": 10,
+		"action": { "type": "view", "path": "podkop-bot/warpscout" }
 	},
 	"admin/services/podkop-bot/wizard": {
 		"title": "Мастер настройки", "order": 25,
@@ -22,7 +30,15 @@
 	},
 	"admin/services/podkop-bot/runtime": {
 		"title": "Runtime", "order": 30,
+		"action": { "type": "firstchild" }
+	},
+	"admin/services/podkop-bot/runtime/services": {
+		"title": "Тест сервисов", "order": 5,
 		"action": { "type": "view", "path": "podkop-bot/runtime" }
+	},
+	"admin/services/podkop-bot/runtime/warpscout": {
+		"title": "WARP Rescue", "order": 10,
+		"action": { "type": "view", "path": "podkop-bot/warpscout-runtime" }
 	},
 	"admin/services/podkop-bot/update": {
 		"title": "Обновление", "order": 35,

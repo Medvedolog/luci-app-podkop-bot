@@ -1,0 +1,169 @@
+#!/bin/sh
+# rpcd exec plugin for WARPSCOUT installation/update lifecycle.
+# Deliberately limited to the Update page: detection, version check, manual
+# install/update through the official upstream installer, and temporary logs.
+
+BIN="/usr/bin/warpscout"
+STATE_DIR="/tmp/podkop_bot"
+LOG_FILE="$STATE_DIR/warpscout_update.log"
+STATE_FILE="$STATE_DIR/warpscout_update.state"
+PID_FILE="$STATE_DIR/warpscout_update.pid"
+INSTALLER_TMP="$STATE_DIR/warpscout-install.sh"
+INSTALLER_URL="https://raw.githubusercontent.com/vernette/warpscout/master/install.sh"
+RELEASE_API="https://api.github.com/repos/vernette/warpscout/releases/latest"
+RELEASES_URL="https://github.com/vernette/warpscout/releases"
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+installed_version() {
+	[ -x "$BIN" ] || return 1
+	_v=$($BIN version 2>/dev/null | head -n1 | tr -d '\r')
+	[ -n "$_v" ] || return 1
+	printf '%s' "$_v"
+}
+
+fetch_stdout() {
+	_url="$1"
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 8 --max-time 20 "$_url" 2>/dev/null && return 0
+	fi
+	if command -v wget >/dev/null 2>&1; then
+		wget -qO- -T 20 "$_url" 2>/dev/null && return 0
+	fi
+	return 1
+}
+
+fetch_file() {
+	_url="$1"; _dst="$2"
+	rm -f "$_dst" 2>/dev/null
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 8 --max-time 30 -o "$_dst" "$_url" 2>/dev/null && [ -s "$_dst" ] && return 0
+	fi
+	rm -f "$_dst" 2>/dev/null
+	if command -v wget >/dev/null 2>&1; then
+		wget -q -T 30 -O "$_dst" "$_url" 2>/dev/null && [ -s "$_dst" ] && return 0
+	fi
+	rm -f "$_dst" 2>/dev/null
+	return 1
+}
+
+latest_version() {
+	_j=$(fetch_stdout "$RELEASE_API") || return 1
+	_t=$(printf '%s' "$_j" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+	[ -n "$_t" ] || return 1
+	printf '%s' "${_t#v}"
+}
+
+method_status() {
+	read -r _input 2>/dev/null
+	_cur=""; _latest=""; _installed=false
+	if _cur=$(installed_version); then _installed=true; fi
+	_latest=$(latest_version 2>/dev/null || true)
+	_upd=false
+	if [ -n "$_cur" ] && [ -n "$_latest" ] && [ "$_cur" != "$_latest" ]; then _upd=true; fi
+	printf '{"ok":true,"installed":%s,"current":"%s","latest":"%s","update_available":%s,"releases_url":"%s"}\n' \
+		"$_installed" "$(json_escape "$_cur")" "$(json_escape "$_latest")" "$_upd" "$RELEASES_URL"
+}
+
+is_running() {
+	[ -s "$PID_FILE" ] || return 1
+	_pid=$(cat "$PID_FILE" 2>/dev/null)
+	case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
+	kill -0 "$_pid" 2>/dev/null
+}
+
+run_install_worker() {
+	{
+		echo "[warpscout] downloading official installer"
+		if ! fetch_file "$INSTALLER_URL" "$INSTALLER_TMP"; then
+			echo "[warpscout][error] installer download failed"
+			echo "[warpscout-update-exit] 20"
+			printf 'error 20\n' > "$STATE_FILE"
+			rm -f "$PID_FILE" "$INSTALLER_TMP" 2>/dev/null
+			return
+		fi
+		if ! head -n1 "$INSTALLER_TMP" 2>/dev/null | grep -q '^#!'; then
+			echo "[warpscout][error] downloaded installer has no shebang"
+			echo "[warpscout-update-exit] 21"
+			printf 'error 21\n' > "$STATE_FILE"
+			rm -f "$PID_FILE" "$INSTALLER_TMP" 2>/dev/null
+			return
+		fi
+		echo "[warpscout] running upstream install.sh"
+		/bin/sh "$INSTALLER_TMP"
+		_rc=$?
+		rm -f "$INSTALLER_TMP" 2>/dev/null
+		if [ "$_rc" -ne 0 ]; then
+			echo "[warpscout][error] upstream installer exited $_rc"
+			echo "[warpscout-update-exit] $_rc"
+			printf 'error %s\n' "$_rc" > "$STATE_FILE"
+			rm -f "$PID_FILE" 2>/dev/null
+			return
+		fi
+		_v=$(installed_version 2>/dev/null || true)
+		if [ -z "$_v" ]; then
+			echo "[warpscout][error] /usr/bin/warpscout missing or version check failed after install"
+			echo "[warpscout-update-exit] 22"
+			printf 'error 22\n' > "$STATE_FILE"
+			rm -f "$PID_FILE" 2>/dev/null
+			return
+		fi
+		echo "[warpscout] installed version $_v"
+		echo "[warpscout-update-exit] 0"
+		printf 'done 0\n' > "$STATE_FILE"
+		rm -f "$PID_FILE" 2>/dev/null
+	} >> "$LOG_FILE" 2>&1
+}
+
+method_run() {
+	if is_running; then
+		printf '{"ok":false,"reason":"already_running"}\n'
+		return
+	fi
+	: > "$LOG_FILE"
+	printf 'running\n' > "$STATE_FILE"
+	run_install_worker &
+	_pid=$!
+	printf '%s\n' "$_pid" > "$PID_FILE"
+	printf '{"ok":true,"pid":%s}\n' "$_pid"
+}
+
+method_log() {
+	read -r _input 2>/dev/null
+	_off=$(printf '%s' "$_input" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p')
+	[ -n "$_off" ] || _off=0
+	_size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' '); [ -n "$_size" ] || _size=0
+	[ "$_off" -le "$_size" ] 2>/dev/null || _off=0
+	_chunk=""
+	if [ "$_size" -gt "$_off" ] 2>/dev/null; then
+		_chunk=$(tail -c +$((_off + 1)) "$LOG_FILE" 2>/dev/null | head -c 32768)
+	fi
+	_new=$((_off + ${#_chunk}))
+	_state=$(cat "$STATE_FILE" 2>/dev/null | head -n1)
+	_done=false; _rc=-1
+	case "$_state" in
+		done\ *) _done=true; _rc=${_state#done } ;;
+		error\ *) _done=true; _rc=${_state#error } ;;
+	esac
+	printf '{"ok":true,"chunk":"%s","offset":%s,"done":%s,"exit_code":%s}\n' \
+		"$(json_escape "$_chunk")" "$_new" "$_done" "$_rc"
+}
+
+case "$1" in
+	list)
+		echo '{ "status": { "force": "x" }, "run": {}, "log": { "offset": 0 } }'
+		;;
+	call)
+		case "$2" in
+			status) method_status ;;
+			run)    method_run ;;
+			log)    method_log ;;
+			*) echo '{"error":"unknown method"}'; exit 1 ;;
+		esac
+		;;
+	*) echo '{"error":"unknown command"}'; exit 1 ;;
+esac

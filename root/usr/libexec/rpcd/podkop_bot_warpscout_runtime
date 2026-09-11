@@ -51,7 +51,7 @@ runtime_json() {
 	_running=false; _pid=0; _rss=0
 	if is_running; then _running=true; _pid=$(pid_value); _rss=$(pid_rss_mb "$_pid"); else rm -f "$PID_FILE" 2>/dev/null; fi
 	_state=$(cat "$STATE_FILE" 2>/dev/null | head -n1); [ -n "$_state" ] || _state=stopped
-	_tg_status=""; _tg_http=""; _tg_ms=""; _tg_checked=""; _tg_rc=""; _tg_error=""; _tg_proxy=""
+	_tg_status=""; _tg_http=""; _tg_ms=""; _tg_checked=""; _tg_rc=""; _tg_error=""; _tg_proxy=""; _tg_reason=""
 	if [ -s "$TG_STATE_FILE" ]; then
 		_tg_status=$(sed -n 's/^status=//p' "$TG_STATE_FILE" | head -n1)
 		_tg_http=$(sed -n 's/^http=//p' "$TG_STATE_FILE" | head -n1)
@@ -60,10 +60,11 @@ runtime_json() {
 		_tg_rc=$(sed -n 's/^curl_rc=//p' "$TG_STATE_FILE" | head -n1)
 		_tg_error=$(sed -n 's/^error=//p' "$TG_STATE_FILE" | head -n1)
 		_tg_proxy=$(sed -n 's/^proxy=//p' "$TG_STATE_FILE" | head -n1)
+		_tg_reason=$(sed -n 's/^reason=//p' "$TG_STATE_FILE" | head -n1)
 	fi
-	printf '{"ok":true,"installed":%s,"version":%s,"running":%s,"state":%s,"pid":%s,"rss_mb":%s,"endpoint":%s,"protocol":%s,"listen":"127.0.0.1","port":%s,"proxy":%s,"telegram":{"status":%s,"http":%s,"latency_ms":%s,"checked_at":%s,"curl_rc":%s,"error":%s,"proxy":%s}}\n' \
+	printf '{"ok":true,"installed":%s,"version":%s,"running":%s,"state":%s,"pid":%s,"rss_mb":%s,"endpoint":%s,"protocol":%s,"listen":"127.0.0.1","port":%s,"proxy":%s,"telegram":{"status":%s,"reason":%s,"http":%s,"latency_ms":%s,"checked_at":%s,"curl_rc":%s,"error":%s,"proxy":%s}}\n' \
 		"$_installed" "$(json_str "$_version")" "$_running" "$(json_str "$_state")" "$_pid" "$_rss" "$(json_str "$_ep")" "$(json_str "$_proto")" "$_port" "$(json_str "socks5h://127.0.0.1:$_port")" \
-		"$(json_str "$_tg_status")" "$(json_str "$_tg_http")" "$(json_str "$_tg_ms")" "$(json_str "$_tg_checked")" "$(json_str "$_tg_rc")" "$(json_str "$_tg_error")" "$(json_str "$_tg_proxy")"
+		"$(json_str "$_tg_status")" "$(json_str "$_tg_reason")" "$(json_str "$_tg_http")" "$(json_str "$_tg_ms")" "$(json_str "$_tg_checked")" "$(json_str "$_tg_rc")" "$(json_str "$_tg_error")" "$(json_str "$_tg_proxy")"
 }
 
 method_status() { read -r _in 2>/dev/null; runtime_json; }
@@ -115,9 +116,15 @@ method_log() {
 	_off=$(printf '%s' "$_in" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p'); [ -n "$_off" ] || _off=0
 	_size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' '); [ -n "$_size" ] || _size=0
 	[ "$_off" -le "$_size" ] 2>/dev/null || _off=0
-	_chunk=""; [ "$_size" -gt "$_off" ] 2>/dev/null && _chunk=$(tail -c +$((_off+1)) "$LOG_FILE" 2>/dev/null | head -c 32768)
-	_new=$((_off+${#_chunk}))
-	printf '{"ok":true,"chunk":%s,"offset":%s}\n' "$(json_str "$_chunk")" "$_new"
+	_bytes=$((_size-_off)); [ "$_bytes" -gt 32768 ] 2>/dev/null && _bytes=32768
+	if [ "$_bytes" -gt 0 ] 2>/dev/null; then
+		_chunk_json=$(tail -c +$((_off+1)) "$LOG_FILE" 2>/dev/null | head -c "$_bytes" | jq -Rs . 2>/dev/null)
+		[ -n "$_chunk_json" ] || _chunk_json='""'
+	else
+		_chunk_json='""'
+	fi
+	_new=$((_off+_bytes))
+	printf '{"ok":true,"chunk":%s,"offset":%s}\n' "$_chunk_json" "$_new"
 }
 
 method_telegram_test() {
@@ -139,22 +146,26 @@ method_telegram_test() {
 	_errtxt=$(head -c 240 "$_err" 2>/dev/null | tr '\n\r\t' '   ')
 	# Never persist the bot token even if a future curl build includes the URL in stderr.
 	[ -n "$_token" ] && _errtxt=$(printf '%s' "$_errtxt" | sed "s/${_token}/<redacted>/g")
-	_status="OTHER_API_RESPONSE"; _reachable=true; _verified=false
-	if [ "$_rc" -ne 0 ] || [ -z "$_http" ] || [ "$_http" = 000 ]; then
-		_status="NETWORK_FAIL"; _reachable=false; _http=000
+	_status="OTHER_API_RESPONSE"; _reason="api_response"; _reachable=true; _verified=false
+	if [ "$_rc" -eq 28 ]; then
+		_status="TIMEOUT"; _reachable=false; _http=000
+		case "$_errtxt" in *[Cc]onnection\ timed\ out*) _reason="connect_timeout";; *) _reason="request_timeout";; esac
+	elif [ "$_rc" -ne 0 ] || [ -z "$_http" ] || [ "$_http" = 000 ]; then
+		_status="NETWORK_FAIL"; _reason="curl_error_${_rc}"; _reachable=false; _http=000
 	elif [ "$_http" = 200 ] && jq -e '.ok == true' "$_body" >/dev/null 2>&1; then
-		_status="OK"; _verified=true
+		_status="OK"; _reason="ok"; _verified=true
 	elif [ "$_http" = 429 ]; then
-		_status="RATE_LIMITED"
+		_status="RATE_LIMITED"; _reason="http_429"
 	elif [ "$_http" = 401 ]; then
-		_status="AUTH_ERROR"
+		_status="AUTH_ERROR"; _reason="http_401"
 	elif [ "$_http" = 403 ]; then
-		_status="API_DENIED"
+		_status="API_DENIED"; _reason="http_403"
 	fi
 	rm -f "$_body" "$_err" 2>/dev/null
 	_now=$(date +%s 2>/dev/null || echo 0)
 	{
 		printf 'status=%s\n' "$_status"
+		printf 'reason=%s\n' "$_reason"
 		printf 'http=%s\n' "$_http"
 		printf 'latency_ms=%s\n' "$_ms"
 		printf 'checked_at=%s\n' "$_now"
@@ -162,8 +173,8 @@ method_telegram_test() {
 		printf 'error=%s\n' "$_errtxt"
 		printf 'proxy=%s\n' "$_proxy"
 	} > "$TG_STATE_FILE"
-	printf '{"ok":true,"status":%s,"telegram_reached":%s,"verified_bot_api":%s,"http":%s,"latency_ms":%s,"checked_at":%s,"curl_rc":%s,"error":%s,"proxy":%s}\n' \
-		"$(json_str "$_status")" "$_reachable" "$_verified" "$(json_str "$_http")" "$_ms" "$_now" "$_rc" "$(json_str "$_errtxt")" "$(json_str "$_proxy")"
+	printf '{"ok":true,"status":%s,"reason":%s,"telegram_reached":%s,"verified_bot_api":%s,"http":%s,"latency_ms":%s,"checked_at":%s,"curl_rc":%s,"error":%s,"proxy":%s}\n' \
+		"$(json_str "$_status")" "$(json_str "$_reason")" "$_reachable" "$_verified" "$(json_str "$_http")" "$_ms" "$_now" "$_rc" "$(json_str "$_errtxt")" "$(json_str "$_proxy")"
 }
 
 case "$1" in

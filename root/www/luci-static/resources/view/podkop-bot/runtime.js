@@ -92,7 +92,7 @@ return view.extend({
 			}
 		}
 		if (this.warpRuntime && this.warpRuntime.running && this.warpRuntime.proxy) {
-			this.tierProxies.push({ endpoint: this.warpRuntime.proxy, label: _('WARP Rescue · WARPSCOUT') + ' — ' + this.warpRuntime.proxy });
+			this.tierProxies.push({ endpoint: this.warpRuntime.proxy, label: _('WARP Rescue · WARPSCOUT · test route') + ' — ' + this.warpRuntime.proxy });
 		}
 		this.selectedProxy = '';
 		this.selectedProxyLabel = '';
@@ -119,12 +119,15 @@ return view.extend({
 				var optProxies = this.tierProxies.map(function(p){ return E('option', { 'value': 'proxy:' + p.endpoint, 'data-label': p.label }, p.label); });
 				groups.push(E('optgroup', { 'label': _('Транспортные маршруты') }, optProxies));
 			}
-			var sel = E('select', { 'class':'cbi-input-select', 'style':'width:100%;max-width:420px;box-sizing:border-box;', 'change': ui.createHandlerFn(this, 'onTargetChange') }, groups);
+			var sel = E('select', { 'class':'cbi-input-select', 'style':'width:100%;max-width:500px;box-sizing:border-box;', 'change': ui.createHandlerFn(this, 'onTargetChange') }, groups);
 			this.targetSelect = sel;
 			selectorRow = E('div', { 'style':'margin-bottom:.5em;' }, [
 				E('label', { 'style':'display:block;color:#888;font-size:90%;margin-bottom:.2em;' }, _('Маршрут проверки')),
 				sel
 			]);
+			/* Browsers may restore a previous <select> value without firing change.
+			 * Keep JS routing state aligned with what the user actually sees. */
+			window.setTimeout(function(){ self.syncSelectedTarget(); }, 0);
 		}
 		var batchBtn = E('span', {});
 		if (this.sections.length > 1 || this.tierProxies.length > 0) {
@@ -168,15 +171,15 @@ return view.extend({
 	renderWarpRuntime: function() {
 		var st = this.warpStatus, sl = this.warpShortlist, rt = this.warpRuntime;
 		if (!st || !st.installed) return E('span', {});
-		var cfg = st.config || {}, active = cfg.active_endpoint || '—', item = null;
-		(sl && sl.items || []).some(function(x){ if (x.endpoint === active) { item = x; return true; } return false; });
+		var cfg = st.config || {}, active = cfg.active_endpoint || '—', item = st.active_snapshot || null;
+		if (!item) (sl && sl.items || []).some(function(x){ if (x.endpoint === active) { item = x; return true; } return false; });
 		var tg = rt && rt.telegram || {}, tgNode = dot('grey', _('ещё не проверялся'));
 		if (tg.status === 'OK') tgNode = dot('green', _('OK') + (tg.http ? (' · HTTP ' + tg.http) : ''));
 		else if (tg.status === 'RATE_LIMITED') tgNode = dot('yellow', _('Telegram доступен · rate limited (429)'));
 		else if (tg.status === 'AUTH_ERROR') tgNode = dot('yellow', _('Telegram доступен · auth error (401)'));
 		else if (tg.status === 'API_DENIED') tgNode = dot('yellow', _('Telegram доступен · API denied (403)'));
 		else if (tg.status === 'OTHER_API_RESPONSE') tgNode = dot('yellow', _('Telegram отвечает · HTTP ') + (tg.http || '?'));
-		else if (tg.status === 'NETWORK_FAIL') tgNode = dot('red', _('NETWORK_FAIL'));
+		else if (tg.status === 'NETWORK_FAIL') tgNode = dot('red', _('NETWORK_FAIL') + (tg.curl_rc ? (' · curl ' + tg.curl_rc) : ''));
 		var checked = item && item.checked_at ? this.ago(parseInt(item.checked_at,10)) : '—';
 		var tgChecked = tg.checked_at ? this.ago(parseInt(tg.checked_at,10)) : '—';
 		return E('div', { 'class':'cbi-section pb-card', 'style':'max-width:820px;' }, [
@@ -187,11 +190,14 @@ return view.extend({
 			row(_('NODE'), E('span', {}, item && item.node || '—')),
 			row(_('NODE LOCATION'), E('span', {}, item && item.node_location || '—')),
 			row(_('SEEN AS'), E('span', {}, item && item.seen_as || '—')),
+			row(_('Endpoint ping'), E('span', {}, item && item.endpoint_ping || '—')),
 			row(_('Tunnel ping / loss'), E('span', {}, (item && item.tunnel_ping || '—') + ' / ' + (item && item.loss || '—'))),
 			row(_('Scout data age'), E('span', {}, checked)),
-			row(_('SOCKS process'), rt && rt.running ? dot('green', _('running') + (rt.pid ? (' · PID ' + rt.pid) : '')) : dot('grey', rt && rt.state || _('stopped'))),
+			row(_('SOCKS process'), rt && rt.running ? dot('green', _('running') + (rt.pid ? (' · PID ' + rt.pid) : '') + (rt.rss_mb != null ? (' · RSS ' + rt.rss_mb + ' MB') : '')) : dot('grey', rt && rt.state || _('stopped'))),
 			row(_('Local SOCKS'), E('span', {}, rt && rt.proxy || ('socks5h://127.0.0.1:' + (cfg.socks_port || 18191)))),
 			row(_('Telegram API'), tgNode),
+			(tg.proxy ? row(_('Telegram test route'), E('span', {}, tg.proxy)) : E('span', {})),
+			(tg.error ? row(_('Telegram error'), E('span', {}, tg.error)) : E('span', {})),
 			row(_('Telegram test age'), E('span', {}, tgChecked)),
 			E('div', { 'style':'margin-top:.7em;' }, [ E('a', { 'class':'cbi-button', 'href':L.url('admin/services/podkop-bot/transport/warpscout') }, _('Открыть WARP Rescue')) ])
 		]);
@@ -207,8 +213,24 @@ return view.extend({
 		return E('div', { 'class':'cbi-section pb-wide', 'style':'margin:.5em 0;padding:.65em .9em;' }, [ dot(colour, text), E('div', { 'style':'color:#888;font-size:85%;margin-top:.3em;' }, (label || d.target || '') + (d.http ? (' · HTTP ' + d.http) : '') + (d.latency_ms != null ? (' · ' + d.latency_ms + ' ms') : '')) ]);
 	},
 
+	syncSelectedTarget: function() {
+		if (!this.targetSelect) return;
+		var sel = this.targetSelect, v = sel.value || '';
+		if (v.indexOf('proxy:') === 0) {
+			this.selectedProxy = v.slice(6);
+			this.selectedSection = '';
+			var opt = sel.options[sel.selectedIndex];
+			this.selectedProxyLabel = (opt && opt.getAttribute('data-label')) || this.selectedProxy;
+		} else {
+			this.selectedProxy = '';
+			this.selectedProxyLabel = '';
+			this.selectedSection = (v.indexOf('sec:') === 0) ? v.slice(4) : v;
+		}
+	},
+
 	runTelegramProbe: function() {
 		var self = this, target = '', label = '';
+		this.syncSelectedTarget();
 		if (this.selectedProxy) { target = this.selectedProxy; label = this.selectedProxyLabel || target; }
 		else {
 			var name = this.selectedSection || '';
@@ -217,7 +239,7 @@ return view.extend({
 		}
 		if (!target) { dom.content(this.tgBody, this.renderTelegramProbe({ telegram_reached:false, reason:'mixed_proxy_disabled' }, label)); return; }
 		this.tgBtn.disabled = true;
-		dom.content(this.tgBody, E('div', {}, dot('grey', _('Проверяю реальный Telegram getMe…'))));
+		dom.content(this.tgBody, E('div', {}, dot('grey', _('Проверяю реальный Telegram getMe через: ') + label)));
 		return callTransportProbe(target).then(function(d) { dom.content(self.tgBody, self.renderTelegramProbe(d, label)); self.tgBtn.disabled = false; }).catch(function() { dom.content(self.tgBody, self.renderTelegramProbe(null, label)); self.tgBtn.disabled = false; });
 	},
 
@@ -253,18 +275,17 @@ return view.extend({
 	},
 
 	onTargetChange: function(ev) {
-		var self = this, v = ev.target.value || '';
-		if (v.indexOf('proxy:') === 0) {
-			this.selectedProxy = v.slice(6); this.selectedSection = '';
-			var opt = ev.target.options[ev.target.selectedIndex]; this.selectedProxyLabel = (opt && opt.getAttribute('data-label')) || this.selectedProxy;
+		var self = this;
+		this.syncSelectedTarget();
+		if (this.selectedProxy) {
 			return callActiveProbe('true', '', this.selectedProxy, this.selectedProxyLabel).then(function(d) { dom.content(self.body, self.renderProbe(d)); }).catch(function(){ dom.content(self.body, self.renderProbe(null)); });
 		}
-		this.selectedProxy = ''; this.selectedProxyLabel = ''; this.selectedSection = (v.indexOf('sec:') === 0) ? v.slice(4) : v;
 		return callActiveProbe('true', this.selectedSection, '', '').then(function(d) { dom.content(self.body, self.renderProbe(d)); }).catch(function() { dom.content(self.body, self.renderProbe(null)); });
 	},
 
 	runProbe: function() {
 		var self = this; this.runBtn.disabled = true; if (this.batchBtn) this.batchBtn.disabled = true;
+		this.syncSelectedTarget();
 		var usingProxy = !!this.selectedProxy, sec = usingProxy ? '' : (this.selectedSection || ''), prox = usingProxy ? this.selectedProxy : '', lbl = usingProxy ? (this.selectedProxyLabel || '') : '';
 		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' }, dot('grey', _('Проверка… (15–40 секунд)'))));
 		return callActiveProbe('', sec, prox, lbl).then(function(d) { dom.content(self.body, self.renderProbe(d)); }).catch(function(e){ dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, [ dot('red', _('Проба не завершилась (превышено время или ошибка вызова).')), E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (e && e.message) ? String(e.message) : '') ])); }).finally(function(){ self.runBtn.disabled = false; if (self.batchBtn) self.batchBtn.disabled = false; });

@@ -49,15 +49,15 @@ return view.extend({
 				])
 			]);
 		}
-		var cfg=st.config||{}, active=cfg.active_endpoint||'—', item=null;
-		(sl&&sl.items||[]).some(function(x){ if(x.endpoint===active){item=x;return true;}return false; });
+		var cfg=st.config||{}, active=cfg.active_endpoint||'—', item=st.active_snapshot||null;
+		if (!item) (sl&&sl.items||[]).some(function(x){ if(x.endpoint===active){item=x;return true;}return false; });
 		var tg=rt&&rt.telegram||{}, tgNode=dot('grey',_('ещё не проверялся'));
 		if(tg.status==='OK') tgNode=dot('green',_('OK')+(tg.http?(' · HTTP '+tg.http):''));
 		else if(tg.status==='RATE_LIMITED') tgNode=dot('yellow',_('Telegram доступен · rate limited (429)'));
 		else if(tg.status==='AUTH_ERROR') tgNode=dot('yellow',_('Telegram доступен · auth error (401)'));
 		else if(tg.status==='API_DENIED') tgNode=dot('yellow',_('Telegram доступен · API denied (403)'));
 		else if(tg.status==='OTHER_API_RESPONSE') tgNode=dot('yellow',_('Telegram отвечает · HTTP ')+(tg.http||'?'));
-		else if(tg.status==='NETWORK_FAIL') tgNode=dot('red',_('NETWORK_FAIL'));
+		else if(tg.status==='NETWORK_FAIL') tgNode=dot('red',_('NETWORK_FAIL')+(tg.curl_rc?(' · curl '+tg.curl_rc):''));
 		var checked=item&&item.checked_at?this.ago(parseInt(item.checked_at,10)):'—';
 		var tgChecked=tg.checked_at?this.ago(parseInt(tg.checked_at,10)):'—';
 		return E('div', {}, [
@@ -65,16 +65,20 @@ return view.extend({
 			E('p', { 'class':'pb-muted' }, _('Scout snapshot, живой test SOCKS и последняя проверка Telegram показаны отдельно. Это наблюдение, не управление WARPSCOUT.')),
 			E('div', { 'class':'cbi-section pb-card', 'style':'max-width:820px;' }, [
 				E('h3', { 'style':'margin-top:0;' }, _('WARPSCOUT / WARP Rescue')),
+				row(_('WARPSCOUT'), E('span', {}, (rt&&rt.version)||st.current||'—')),
 				row(_('Active endpoint'), E('span', {}, active)),
 				row(_('Protocol'), E('span', {}, String(cfg.protocol||'—').toUpperCase())),
 				row(_('NODE'), E('span', {}, item&&item.node||'—')),
 				row(_('NODE LOCATION'), E('span', {}, item&&item.node_location||'—')),
 				row(_('SEEN AS'), E('span', {}, item&&item.seen_as||'—')),
+				row(_('Endpoint ping'), E('span', {}, item&&item.endpoint_ping||'—')),
 				row(_('Tunnel ping / loss'), E('span', {}, (item&&item.tunnel_ping||'—')+' / '+(item&&item.loss||'—'))),
 				row(_('Scout data age'), E('span', {}, checked)),
-				row(_('SOCKS process'), rt&&rt.running ? dot('green',_('running')+(rt.pid?(' · PID '+rt.pid):'')) : dot('grey',rt&&rt.state||_('stopped'))),
+				row(_('SOCKS process'), rt&&rt.running ? dot('green',_('running')+(rt.pid?(' · PID '+rt.pid):'')+(rt.rss_mb!=null?(' · RSS '+rt.rss_mb+' MB') : '')) : dot('grey',rt&&rt.state||_('stopped'))),
 				row(_('Local SOCKS'), E('span', {}, rt&&rt.proxy||('socks5h://127.0.0.1:'+(cfg.socks_port||18191)))),
 				row(_('Telegram API'), tgNode),
+				(tg.proxy ? row(_('Telegram test route'), E('span', {}, tg.proxy)) : E('span', {})),
+				(tg.error ? row(_('Telegram error'), E('span', {}, tg.error)) : E('span', {})),
 				row(_('Telegram test age'), E('span', {}, tgChecked)),
 				E('div', { 'style':'margin-top:.7em;' }, [ E('a', { 'class':'cbi-button', 'href':L.url('admin/services/podkop-bot/transport/warpscout') }, _('Открыть настройки WARP Rescue')) ])
 			])

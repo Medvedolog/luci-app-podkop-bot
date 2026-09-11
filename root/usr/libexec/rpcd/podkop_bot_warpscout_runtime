@@ -19,7 +19,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '; }
 json_str() { printf '"%s"' "$(json_escape "$1")"; }
 cfg_get() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | head -n1; }
-valid_endpoint() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$'; }
+valid_endpoint() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}$'; }
 
 pid_value() {
 	[ -s "$PID_FILE" ] || return 1
@@ -29,22 +29,41 @@ pid_value() {
 }
 is_running() { _p=$(pid_value) || return 1; kill -0 "$_p" 2>/dev/null; }
 
+installed_version() {
+	[ -x "$BIN" ] || return 1
+	_v=$($BIN version 2>/dev/null | head -n1 | tr -d '\r')
+	[ -n "$_v" ] || return 1
+	printf '%s' "$_v"
+}
+
+pid_rss_mb() {
+	_p="$1"
+	case "$_p" in ''|0|*[!0-9]*) printf '0'; return;; esac
+	_kb=$(awk '/^VmRSS:/ {print $2; exit}' "/proc/$_p/status" 2>/dev/null)
+	case "$_kb" in ''|*[!0-9]*) printf '0';; *) awk -v k="$_kb" 'BEGIN{printf "%.1f", k/1024}';; esac
+}
+
 runtime_json() {
 	_ep=$(cfg_get active_endpoint); _proto=$(cfg_get protocol); [ -n "$_proto" ] || _proto=awg
 	_port=$(cfg_get socks_port); case "$_port" in ''|*[!0-9]*) _port=18191;; esac
-	_running=false; _pid=0
-	if is_running; then _running=true; _pid=$(pid_value); else rm -f "$PID_FILE" 2>/dev/null; fi
+	_installed=false; _version=""
+	if _version=$(installed_version); then _installed=true; fi
+	_running=false; _pid=0; _rss=0
+	if is_running; then _running=true; _pid=$(pid_value); _rss=$(pid_rss_mb "$_pid"); else rm -f "$PID_FILE" 2>/dev/null; fi
 	_state=$(cat "$STATE_FILE" 2>/dev/null | head -n1); [ -n "$_state" ] || _state=stopped
-	_tg_status=""; _tg_http=""; _tg_ms=""; _tg_checked=""
+	_tg_status=""; _tg_http=""; _tg_ms=""; _tg_checked=""; _tg_rc=""; _tg_error=""; _tg_proxy=""
 	if [ -s "$TG_STATE_FILE" ]; then
 		_tg_status=$(sed -n 's/^status=//p' "$TG_STATE_FILE" | head -n1)
 		_tg_http=$(sed -n 's/^http=//p' "$TG_STATE_FILE" | head -n1)
 		_tg_ms=$(sed -n 's/^latency_ms=//p' "$TG_STATE_FILE" | head -n1)
 		_tg_checked=$(sed -n 's/^checked_at=//p' "$TG_STATE_FILE" | head -n1)
+		_tg_rc=$(sed -n 's/^curl_rc=//p' "$TG_STATE_FILE" | head -n1)
+		_tg_error=$(sed -n 's/^error=//p' "$TG_STATE_FILE" | head -n1)
+		_tg_proxy=$(sed -n 's/^proxy=//p' "$TG_STATE_FILE" | head -n1)
 	fi
-	printf '{"ok":true,"running":%s,"state":%s,"pid":%s,"endpoint":%s,"protocol":%s,"listen":"127.0.0.1","port":%s,"proxy":%s,"telegram":{"status":%s,"http":%s,"latency_ms":%s,"checked_at":%s}}\n' \
-		"$_running" "$(json_str "$_state")" "$_pid" "$(json_str "$_ep")" "$(json_str "$_proto")" "$_port" "$(json_str "socks5h://127.0.0.1:$_port")" \
-		"$(json_str "$_tg_status")" "$(json_str "$_tg_http")" "$(json_str "$_tg_ms")" "$(json_str "$_tg_checked")"
+	printf '{"ok":true,"installed":%s,"version":%s,"running":%s,"state":%s,"pid":%s,"rss_mb":%s,"endpoint":%s,"protocol":%s,"listen":"127.0.0.1","port":%s,"proxy":%s,"telegram":{"status":%s,"http":%s,"latency_ms":%s,"checked_at":%s,"curl_rc":%s,"error":%s,"proxy":%s}}\n' \
+		"$_installed" "$(json_str "$_version")" "$_running" "$(json_str "$_state")" "$_pid" "$_rss" "$(json_str "$_ep")" "$(json_str "$_proto")" "$_port" "$(json_str "socks5h://127.0.0.1:$_port")" \
+		"$(json_str "$_tg_status")" "$(json_str "$_tg_http")" "$(json_str "$_tg_ms")" "$(json_str "$_tg_checked")" "$(json_str "$_tg_rc")" "$(json_str "$_tg_error")" "$(json_str "$_tg_proxy")"
 }
 
 method_status() { read -r _in 2>/dev/null; runtime_json; }
@@ -105,15 +124,21 @@ method_telegram_test() {
 	read -r _in 2>/dev/null
 	is_running || { printf '{"ok":false,"reason":"socks_not_running","status":"NETWORK_FAIL"}\n'; return; }
 	_port=$(cfg_get socks_port); case "$_port" in ''|*[!0-9]*) _port=18191;; esac
+	_proxy="socks5h://127.0.0.1:$_port"
 	_token=$(uci -q get podkop_bot.settings.bot_token 2>/dev/null)
 	[ -n "$_token" ] || { printf '{"ok":false,"reason":"bot_token_missing","status":"AUTH_ERROR"}\n'; return; }
 	command -v curl >/dev/null 2>&1 || { printf '{"ok":false,"reason":"curl_missing","status":"NETWORK_FAIL"}\n'; return; }
 
 	_body="$STATE_DIR/warpscout_telegram_body.$$"
-	_t0=$(date +%s 2>/dev/null || echo 0)
-	_http=$(curl -sS -o "$_body" -w '%{http_code}' -x "socks5h://127.0.0.1:$_port" --connect-timeout 5 --max-time 12 "https://api.telegram.org/bot${_token}/getMe" 2>/dev/null)
+	_err="$STATE_DIR/warpscout_telegram_error.$$"
+	_t0=$(date +%s%3N 2>/dev/null); case "$_t0" in ''|*[!0-9]*) _t0=$(( $(date +%s 2>/dev/null || echo 0) * 1000 ));; esac
+	_http=$(curl -sS -o "$_body" -w '%{http_code}' --proxy "$_proxy" --connect-timeout 5 --max-time 12 "https://api.telegram.org/bot${_token}/getMe" 2>"$_err")
 	_rc=$?
-	_t1=$(date +%s 2>/dev/null || echo 0); _ms=$(( (_t1-_t0) * 1000 ))
+	_t1=$(date +%s%3N 2>/dev/null); case "$_t1" in ''|*[!0-9]*) _t1=$(( $(date +%s 2>/dev/null || echo 0) * 1000 ));; esac
+	_ms=$((_t1-_t0)); [ "$_ms" -lt 0 ] 2>/dev/null && _ms=0
+	_errtxt=$(head -c 240 "$_err" 2>/dev/null | tr '\n\r\t' '   ')
+	# Never persist the bot token even if a future curl build includes the URL in stderr.
+	[ -n "$_token" ] && _errtxt=$(printf '%s' "$_errtxt" | sed "s/${_token}/<redacted>/g")
 	_status="OTHER_API_RESPONSE"; _reachable=true; _verified=false
 	if [ "$_rc" -ne 0 ] || [ -z "$_http" ] || [ "$_http" = 000 ]; then
 		_status="NETWORK_FAIL"; _reachable=false; _http=000
@@ -126,16 +151,19 @@ method_telegram_test() {
 	elif [ "$_http" = 403 ]; then
 		_status="API_DENIED"
 	fi
-	rm -f "$_body" 2>/dev/null
+	rm -f "$_body" "$_err" 2>/dev/null
 	_now=$(date +%s 2>/dev/null || echo 0)
 	{
 		printf 'status=%s\n' "$_status"
 		printf 'http=%s\n' "$_http"
 		printf 'latency_ms=%s\n' "$_ms"
 		printf 'checked_at=%s\n' "$_now"
+		printf 'curl_rc=%s\n' "$_rc"
+		printf 'error=%s\n' "$_errtxt"
+		printf 'proxy=%s\n' "$_proxy"
 	} > "$TG_STATE_FILE"
-	printf '{"ok":true,"status":%s,"telegram_reached":%s,"verified_bot_api":%s,"http":%s,"latency_ms":%s,"checked_at":%s}\n' \
-		"$(json_str "$_status")" "$_reachable" "$_verified" "$(json_str "$_http")" "$_ms" "$_now"
+	printf '{"ok":true,"status":%s,"telegram_reached":%s,"verified_bot_api":%s,"http":%s,"latency_ms":%s,"checked_at":%s,"curl_rc":%s,"error":%s,"proxy":%s}\n' \
+		"$(json_str "$_status")" "$_reachable" "$_verified" "$(json_str "$_http")" "$_ms" "$_now" "$_rc" "$(json_str "$_errtxt")" "$(json_str "$_proxy")"
 }
 
 case "$1" in

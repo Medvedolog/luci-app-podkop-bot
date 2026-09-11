@@ -182,21 +182,30 @@ build_scan_args() {
 parse_report() {
 	[ -s "$REPORT_FILE" ] || return 1
 	_now=$(date +%s 2>/dev/null || echo 0); _tmp="$STATE_DIR/warpscout-shortlist.$$"; : > "$_tmp"
-	# The upstream report is a fixed-column, script-friendly flat table. Take the
-	# first three working rows; they are already sorted by WARPSCOUT quality.
+	# WARPSCOUT report format is flat text: commented header, working rows,
+	# optional torn-down rows, then a per-node summary. Parse the first three
+	# working endpoint rows directly instead of depending on an exact header
+	# layout. SEEN AS may include a flag glyph before the two-letter region.
 	awk -v now="$_now" '
-		BEGIN{rows=0;inrows=0}
-		/^ENDPOINT[[:space:]]+ENDPOINT PING/{inrows=1;next}
-		/^#/ {if(inrows && rows>0) exit; next}
-		/^[[:space:]]*$/ {if(inrows && rows>0) exit; next}
-		inrows && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/ {
-			ep=$1; epp=$2; tun=$3; loss=$4; seen=$5; node=$6;
-			loc=""; for(i=7;i<=NF;i++){loc=loc (loc?" ":"") $i}
+		BEGIN{rows=0;stop=0}
+		/^# [0-9]+ torn down/ {stop=1}
+		/^# Best endpoint per node/ {stop=1}
+		stop {next}
+		$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/ {
+			ep=$1; epp=$2; tun=$3; loss=$4; seen="?"; node="?"; loc=""; cc=0;
+			for(i=5;i<=NF;i++) if($i ~ /^[A-Z][A-Z]$/){cc=i;break}
+			if(cc>0){seen=$cc; if(cc+1<=NF) node=$(cc+1); for(i=cc+2;i<=NF;i++) loc=loc (loc?" ":"") $i}
+			else {if(5<=NF) seen=$5; if(6<=NF) node=$6; for(i=7;i<=NF;i++) loc=loc (loc?" ":"") $i}
 			print ep "|" epp "|" tun "|" loss "|" seen "|" node "|" loc "|" now;
 			rows++; if(rows>=3) exit
 		}' "$REPORT_FILE" > "$_tmp"
-	[ -s "$_tmp" ] || { rm -f "$_tmp"; return 1; }
+	if [ ! -s "$_tmp" ]; then
+		echo "[warpscout][error] report contains no parseable working endpoint rows"
+		echo "[warpscout] report path: $REPORT_FILE"
+		rm -f "$_tmp"; return 1
+	fi
 	mv "$_tmp" "$SHORTLIST_FILE"; chmod 600 "$SHORTLIST_FILE"
+	_count=$(shortlist_count); echo "[warpscout] shortlist saved: $_count endpoint(s)"
 	_active=$(cfg_get active_endpoint); if [ -z "$_active" ] || ! grep -q "^${_active}|" "$SHORTLIST_FILE" 2>/dev/null; then _active=$(cut -d'|' -f1 "$SHORTLIST_FILE" | head -n1); cfg_write active_endpoint "$_active"; fi
 	return 0
 }

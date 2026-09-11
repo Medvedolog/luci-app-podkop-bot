@@ -16,13 +16,35 @@
 
 var callState   = rpc.declare({ object:'podkop_bot', method:'transport_state' });
 
-/* Auto-run the full-chain test once per page session on first open of the
- * Transport tab (like Runtime's active probe). After that, results + the check
- * time are kept in-module and shown from cache until the user hits the button
- * again. Reset on full page reload. */
+/* Full-chain probe hysteresis survives LuCI subpage navigation. LuCI destroys
+ * this JS module when switching views, so module-only variables caused a fresh
+ * chain probe every time the user returned to Proxy Pool. sessionStorage keeps
+ * the last results within this browser tab while preserving the 10-minute TTL. */
+var _CHAIN_STORE_KEY = 'podkop-bot.transport-chain-cache.v1';
 var _chainTestedThisSession = false;
 var _chainCache = {};      // chainKey(t) -> { html, colour, active }
 var _chainCheckedAt = 0;   // epoch seconds of last full-chain run
+
+function loadChainProbeCache() {
+	try {
+		var raw = window.sessionStorage ? sessionStorage.getItem(_CHAIN_STORE_KEY) : null;
+		if (!raw) return;
+		var v = JSON.parse(raw);
+		if (!v || typeof v !== 'object') return;
+		_chainCheckedAt = parseInt(v.checked_at || 0, 10) || 0;
+		_chainCache = (v.cache && typeof v.cache === 'object') ? v.cache : {};
+		_chainTestedThisSession = !!_chainCheckedAt;
+	} catch (e) {
+		_chainCheckedAt = 0; _chainCache = {}; _chainTestedThisSession = false;
+	}
+}
+function saveChainProbeCache() {
+	try {
+		if (!window.sessionStorage) return;
+		sessionStorage.setItem(_CHAIN_STORE_KEY, JSON.stringify({ checked_at:_chainCheckedAt, cache:_chainCache }));
+	} catch (e) {}
+}
+loadChainProbeCache();
 
 /* Cache key includes the endpoint, not just the tier slot id — so if tier2_1
  * changes from proxy A to proxy B, the old cached result no longer matches and
@@ -37,6 +59,7 @@ function clearChainProbeCache() {
 	_chainCache = {};
 	_chainCheckedAt = 0;
 	_chainTestedThisSession = false;
+	try { if (window.sessionStorage) sessionStorage.removeItem(_CHAIN_STORE_KEY); } catch (e) {}
 }
 var callProbe   = rpc.declare({ object:'podkop_bot', method:'transport_probe', params:['target'] });
 var callEnsureMP = rpc.declare({ object:'podkop_bot', method:'ensure_mixed_proxy' });
@@ -122,7 +145,7 @@ function pbFooter() {
 		if (a && a.ok) {
 			dom.content(span, [
 				E('span', {}, 'luci-app-podkop-bot v' + (a.luci_app_version || '?') + ' \u00b7 '),
-				E('a', { 'href': a.repo || 'https://github.com/Medvedolog/luci-app-podkop-bot', 'target': '_blank', 'rel': 'noopener' }, _('репозиторий'))
+				E('a', { 'href': a.repo || 'https://github.com/Medvedolog/luci-app-podkop-bot', 'target':'_blank', 'rel':'noopener' }, _('репозиторий'))
 			]);
 		}
 	}).catch(function(){});
@@ -180,13 +203,11 @@ return view.extend({
 		 * screens, each button full-width on mobile via .pb-action-row (CSS). */
 		var actionRow = E('div', { 'class':'pb-action-row', 'style':'margin-top:1em;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ addBtn, testAllBtn, reloadBtn ]);
 		this._chainMeta = E('div', { 'style':'margin-top:.5em;color:#888;font-size:85%;' });
-		/* First open this session → auto-run the chain test (lamps + ping) so the
-		 * user sees live state without pressing anything; afterwards show cached
-		 * results + date until they hit "Тест всей цепочки" again. Also re-run if
-		 * the cache is older than the TTL, so a long-open session still refreshes.
-		 * Deferred so the DOM (result nodes) exists first. */
+		/* Auto-run only when there is no fresh cached chain result. The cache is
+		 * restored from sessionStorage, so navigating away and back within the TTL
+		 * does not trigger another expensive full-chain probe. */
 		var _CHAIN_TTL = 600; // seconds (10 min)
-		var _stale = (Math.floor(Date.now()/1000) - _chainCheckedAt) > _CHAIN_TTL;
+		var _stale = !_chainCheckedAt || (Math.floor(Date.now()/1000) - _chainCheckedAt) > _CHAIN_TTL;
 		if (!_chainTestedThisSession || _stale) {
 			window.setTimeout(function(){ self.testFullChain(); }, 60);
 		} else {
@@ -248,7 +269,6 @@ return view.extend({
 		var fastName = d.fast_route_name || fastKey;
 		var routeLabel = (pollName && pollName !== 'unknown' && pollName !== pollKey) ? (pollName + ' [' + pollKey + ']') : pollKey;
 		var fastLabel = (fastName && fastName !== 'unknown' && fastName !== fastKey) ? (fastName + ' [' + fastKey + ']') : fastKey;
-		var tgColour = (d.tg === 'ok') ? 'green' : (d.tg === 'fail' ? 'red' : 'grey');
 		/* POLL/getUpdates determines whether the bot can receive commands. FAST is
 		 * displayed separately because a short sendMessage can succeed while the
 		 * same proxy cannot sustain a long poll. */
@@ -259,8 +279,8 @@ return view.extend({
 		var directColour = (d.tg_direct === 'ok') ? 'green' : (d.tg_direct === 'fail' ? 'yellow' : 'grey');
 		var transportColour = (d.tg_transport === 'ok') ? 'green' : (d.tg_transport === 'fail' ? 'red' : 'grey');
 
-		/* Editable transport policy: a select + Save. socks/direct narrow how the
-		 * bot reaches Telegram and can strand it under blocking, so warn. */
+		/* Editable transport policy: this backend intentionally restarts the bot
+		 * after committing the policy, so the button must say so explicitly. */
 		var sel = E('select', { 'class':'cbi-input-select', 'style':'padding:.15em .4em;font-size:90%;height:auto;line-height:1.3;max-width:100%;min-width:0;' }, [
 			E('option', { 'value':'auto' }, _('auto (direct → SOCKS)')),
 			E('option', { 'value':'socks' }, _('только SOCKS')),
@@ -278,20 +298,20 @@ return view.extend({
 			'class':'cbi-button cbi-button-apply',
 			'style':'padding:.15em .6em;font-size:90%;',
 			'click': ui.createHandlerFn(this, function() {
-				dom.content(policyStatus, _('сохранение…'));
+				dom.content(policyStatus, _('сохранение и перезапуск…'));
 				return callSetPolicy(sel.value).then(function(r) {
 					if (r && r.ok) dom.content(policyStatus, _('сохранено · ') + (r.service_running ? _('бот работает') : _('бот остановлен')));
 					else dom.content(policyStatus, _('ошибка'));
 				}).catch(function(){ dom.content(policyStatus, _('ошибка вызова')); });
 			})
-		}, _('Сохранить'));
+		}, _('Сохранить и перезапустить бота'));
 
 		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
 			E('h3', { 'style':'margin-top:0;' }, _('Состояние')),
-			this.row(_('POLL · getUpdates'), dot(routeColour, routeLabel)),
-			this.row(_('FAST · отправка'), dot(fastColour, fastLabel)),
+			this.row(_('Приём команд (POLL)'), dot(routeColour, routeLabel)),
+			this.row(_('Отправка сообщений (FAST)'), dot(fastColour, fastLabel)),
 			this.row(_('Telegram напрямую'), dot(directColour, d.tg_direct === 'fail' ? _('заблокирован (ожидаемо)') : (d.tg_direct||'unknown'))),
-			this.row(_('Telegram через транспорт'), dot(transportColour, d.tg_transport||'unknown')),
+			this.row(_('Telegram через резервный транспорт'), dot(transportColour, d.tg_transport||'unknown')),
 			E('div', { 'style':'display:flex;align-items:center;padding:.3em 0;gap:.5em;flex-wrap:wrap;' }, [
 				E('span', { 'style':'color:#888;flex:none;' }, _('Политика транспорта')),
 				E('span', { 'style':'display:flex;align-items:center;gap:.4em;flex-wrap:wrap;' }, [ sel, saveBtn, policyStatus ])
@@ -327,14 +347,8 @@ return view.extend({
 		return E('div', {}, tiers.map(function(t) {
 			var isActive = (t.id === active);
 			t._active = isActive;
-			/* Colour semantics (TZ 18t.1):
-			 *   green  — active path, or a probe that just succeeded
-			 *   grey   — configured-but-inactive, OR not configured (expected,
-			 *            optional tiers like custom_proxy left empty)
-			 *   yellow — only after a probe FAILED on a configured tier (a real
-			 *            problem). Not configured ≠ problem, so never yellow.
-			 *   red    — reserved
-			 * Probe results recolour the dot live via probeOne(). */
+		/* Colour semantics (TZ 18t.1):
+		 * green active path / successful probe; grey inactive; yellow failed probe. */
 			var cfgColour = isActive ? 'green' : 'grey';
 			var dotNode = dot(cfgColour, t.name + (isActive ? '  ✓ '+_('активен') : ''));
 			t._dotNode = dotNode;
@@ -345,13 +359,8 @@ return view.extend({
 					'click': ui.createHandlerFn(self, 'probeOne', t)
 				}, _('Тест'))
 				: E('span', {});
-			/* tier3 (custom_proxy): single editable value → pencil.
-			 * tier4 (Direct WAN): bind_interface picker → gear. */
 			var probeResult = E('span', { 'id':'probe-'+t.id, 'style':'margin-left:.6em;color:#888;font-size:90%;' });
 			t._resultNode = probeResult;
-
-			/* tier3 (custom_proxy): single editable value → pencil.
-			 * tier4 (Direct WAN): bind_interface picker → gear. */
 			var extraBtn = E('span', {});
 			if (t.id === 'tier1') {
 				extraBtn = E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('изменить порт Mixed Proxy'),
@@ -363,10 +372,6 @@ return view.extend({
 				extraBtn = E('button', { 'class':'cbi-button', 'style':'padding:.1em .4em;font-size:85%;', 'title':_('выбрать интерфейс привязки'),
 					'click': ui.createHandlerFn(self, 'editBindIface') }, '⚙');
 			}
-
-			/* fallback (tier2_*) entries get edit controls: move up/down, delete.
-			 * The index within the fallback_socks list is t._fbIndex (set in
-			 * buildTiers). */
 			var crudBtns = E('span', {});
 			if (t.id.indexOf('tier2_') === 0 && t._fbIndex != null) {
 				crudBtns = E('span', { 'style':'display:inline-flex;gap:.2em;' }, [
@@ -405,10 +410,6 @@ return view.extend({
 
 	refreshState: function(mutated) {
 		var self = this;
-		/* mutated=true → the chain changed (add/edit/delete/move/port/custom/
-		 * iface): drop probe cache so stale results can't land on new rows, and
-		 * the next render auto-re-tests. Plain refresh → re-apply cached results
-		 * and keep the "Проверено:" date so lamps don't blank out. */
 		if (mutated) clearChainProbeCache();
 		return Promise.all([
 			callState(),
@@ -458,9 +459,6 @@ return view.extend({
 		return callFbCrud(op, '', index).then(function(){ return self.refreshState(true); });
 	},
 
-	/* Shared add/edit form with separate fields (scheme/host/port/user/pass/
-	 * mnemonic) — same ergonomics as the Runtime manual-proxy form. For edit,
-	 * prefill by parsing the existing record; index<0 means add. */
 	fbForm: function(index, current) {
 		var self = this;
 		var f = fbParse(current);
@@ -492,8 +490,6 @@ return view.extend({
 			var pnum = parseInt(vf.port, 10);
 			if (!/^[0-9]+$/.test(vf.port) || pnum < 1 || pnum > 65535) { dom.content(err, _('порт должен быть числом 1–65535')); return; }
 			if (vf.pass && !vf.user) { dom.content(err, _('пароль указан без логина')); return; }
-			/* variant A: keep the raw URI unambiguous — no whitespace, and no
-			 * @ : / # in credentials (percent-encoding deferred). */
 			if (/[\s@/#]/.test(vf.user)) { dom.content(err, _('в логине недопустимы пробел, @, /, #')); return; }
 			if (/[\s@/#]/.test(vf.pass)) { dom.content(err, _('в пароле недопустимы пробел, @, /, #')); return; }
 			if (/[\s#]/.test(vf.mnemonic)) { dom.content(err, _('в мнемонике нельзя пробел и #')); return; }
@@ -540,7 +536,6 @@ return view.extend({
 				_('Резервный прокси. Тип, хост, порт, логин, пароль и мнемоника вводятся отдельными полями.'))
 		]);
 	},
-
 
 	editTier1Port: function(endpoint) {
 		var self = this;
@@ -624,8 +619,6 @@ return view.extend({
 
 	editBindIface: function() {
 		var self = this;
-		/* Populate the picker with real interfaces so tailscale0/awg0 appear as
-		 * they come up; the bot validates with `ip link show`, we mirror that. */
 		return callListIfaces().then(function(d) {
 			var ifaces = (d && d.interfaces) || [];
 			var current = (d && d.current) || '';
@@ -660,7 +653,10 @@ return view.extend({
 		function recolour(c) {
 			if (t._dotWrap) dom.content(t._dotWrap, [ dot(c, t.name + (t._active ? '  ✓ '+_('активен') : '')) ]);
 		}
-		function store(html, colour) { _chainCache[chainKey(t)] = { html: html, colour: colour, active: !!t._active }; }
+		function store(html, colour) {
+			_chainCache[chainKey(t)] = { html: html, colour: colour, active: !!t._active };
+			saveChainProbeCache();
+		}
 		return callProbe(target).then(function(r) {
 			if (r && r.result === 'ok') {
 				var ms = (r.latency_ms != null && r.latency_ms > 0) ? (' · ' + r.latency_ms + ' мс') : '';
@@ -670,22 +666,20 @@ return view.extend({
 			else if (r && r.result === 'unknown') { var h = '— ' + (r.reason || 'unknown'); dom.content(node, h); store(h, 'grey'); }
 			else {
 				var hf = '✗ fail' + (r && r.http ? (' ('+r.http+')') : '');
-				dom.content(node, hf);
-				/* configured but unreachable → yellow (a real, actionable problem) */
-				recolour('yellow'); store(hf, 'yellow');
+				dom.content(node, hf); recolour('yellow'); store(hf, 'yellow');
 			}
 		}).catch(function(){ var he = '✗ ' + _('ошибка'); dom.content(node, he); recolour('yellow'); store(he, 'yellow'); });
 	},
 
 	testFullChain: function() {
 		var self = this;
-		/* Probe every tier with an endpoint, sequentially, top to bottom. */
 		var seq = this.tiers.filter(function(t){ return t.endpoint && t.endpoint !== ''; });
 		var i = 0;
 		if (this._testAllBtn) this._testAllBtn.disabled = true;
 		function finish() {
 			_chainCheckedAt = Math.floor(Date.now()/1000);
 			_chainTestedThisSession = true;
+			saveChainProbeCache();
 			self.renderChainMeta();
 			if (self._testAllBtn) self._testAllBtn.disabled = false;
 		}
@@ -697,11 +691,7 @@ return view.extend({
 		return next().catch(function(){ if (self._testAllBtn) self._testAllBtn.disabled = false; });
 	},
 
-	/* Re-apply cached probe results (html + dot colour) to the freshly rendered
-	 * tier rows, so switching back to the tab shows the last run without
-	 * re-probing. */
 	applyChainCache: function() {
-		var self = this;
 		(this.tiers || []).forEach(function(t){
 			var c = _chainCache[chainKey(t)];
 			if (!c) return;
@@ -711,13 +701,11 @@ return view.extend({
 		this.renderChainMeta();
 	},
 
-	/* "Проверено: <date>" line under the action row. */
 	renderChainMeta: function() {
 		if (!this._chainMeta) return;
 		if (!_chainCheckedAt) { dom.content(this._chainMeta, ''); return; }
 		var d = new Date(_chainCheckedAt * 1000);
-		var s = d.toLocaleString();
-		dom.content(this._chainMeta, _('Проверено: ') + s);
+		dom.content(this._chainMeta, _('Проверено: ') + d.toLocaleString());
 	},
 
 	enableMixedProxy: function() {
@@ -734,7 +722,8 @@ return view.extend({
 							var msg = r.already_enabled ? _('Mixed Proxy уже включён')
 								: (r.probe === 'ok' ? _('Mixed Proxy включён, SOCKS отвечает') : _('Mixed Proxy включён'));
 							ui.addNotification(null, E('p', {}, msg + (r.endpoint ? (' · ' + r.endpoint) : '')), 'info');
-							return callState().then(function(d){ self.state=d; self.tiers=self.buildTiers(d); dom.content(self.chainBox, self.renderTiers(self.tiers, d)); });
+							clearChainProbeCache();
+							return callState().then(function(d){ self.state=d; self.tiers=self.buildTiers(d); dom.content(self.chainBox, self.renderTiers(self.tiers, d)); window.setTimeout(function(){ self.testFullChain(); }, 60); });
 						}
 						var rm = {
 							not_proxy_section: _('Секция не является proxy — Mixed Proxy неприменим'),

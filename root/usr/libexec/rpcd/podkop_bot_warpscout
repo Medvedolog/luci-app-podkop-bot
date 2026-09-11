@@ -91,15 +91,21 @@ latest_version() {
 
 shortlist_count() { [ -s "$SHORTLIST_FILE" ] && grep -c '^[0-9]' "$SHORTLIST_FILE" 2>/dev/null || echo 0; }
 shortlist_json() {
-	printf '['; _first=1
-	[ -s "$SHORTLIST_FILE" ] && while IFS='|' read -r ep epping tunping loss seen node location checked; do
-		[ -n "$ep" ] || continue
-		[ "$_first" = 1 ] || printf ','
-		_first=0
-		printf '{"endpoint":%s,"endpoint_ping":%s,"tunnel_ping":%s,"loss":%s,"seen_as":%s,"node":%s,"node_location":%s,"checked_at":%s}' \
-			"$(json_str "$ep")" "$(json_str "$epping")" "$(json_str "$tunping")" "$(json_str "$loss")" "$(json_str "$seen")" "$(json_str "$node")" "$(json_str "$location")" "$(json_str "$checked")"
-	done
-	printf ']'
+	[ -s "$SHORTLIST_FILE" ] || { printf '[]'; return; }
+	jq -Rn '[inputs | split("|") | select(length >= 8) | {
+		endpoint: .[0], endpoint_ping: .[1], tunnel_ping: .[2], loss: .[3],
+		seen_as: .[4], node: .[5], node_location: .[6], checked_at: .[7]
+	}]' "$SHORTLIST_FILE" 2>/dev/null || printf '[]'
+}
+active_snapshot_json() {
+	_active=$(cfg_get active_endpoint)
+	[ -n "$_active" ] && [ -s "$SHORTLIST_FILE" ] || { printf 'null'; return; }
+	_line=$(grep -F "${_active}|" "$SHORTLIST_FILE" 2>/dev/null | head -n1)
+	[ -n "$_line" ] || { printf 'null'; return; }
+	printf '%s\n' "$_line" | jq -Rn --arg active "$_active" '[inputs | split("|") | select(.[0] == $active) | {
+		endpoint: .[0], endpoint_ping: .[1], tunnel_ping: .[2], loss: .[3],
+		seen_as: .[4], node: .[5], node_location: .[6], checked_at: .[7]
+	}][0] // null' 2>/dev/null || printf 'null'
 }
 
 method_status() {
@@ -109,10 +115,11 @@ method_status() {
 	_latest=$(latest_version 2>/dev/null || true)
 	_upd=false; [ -n "$_cur" ] && [ -n "$_latest" ] && [ "$_cur" != "$_latest" ] && _upd=true
 	_account=false; [ -s "$ACCOUNT_FILE" ] && jq -e 'type=="object"' "$ACCOUNT_FILE" >/dev/null 2>&1 && _account=true
-	printf '{"ok":true,"installed":%s,"current":%s,"latest":%s,"update_available":%s,"releases_url":%s,"account_ready":%s,"config":{"enabled":%s,"policy":%s,"protocol":%s,"socks_port":%s,"node":%s,"country":%s,"exclude_node":%s,"exclude_country":%s,"active_endpoint":%s},"shortlist_count":%s}\n' \
+	_snapshot=$(active_snapshot_json)
+	printf '{"ok":true,"installed":%s,"current":%s,"latest":%s,"update_available":%s,"releases_url":%s,"account_ready":%s,"config":{"enabled":%s,"policy":%s,"protocol":%s,"socks_port":%s,"node":%s,"country":%s,"exclude_node":%s,"exclude_country":%s,"active_endpoint":%s},"shortlist_count":%s,"active_snapshot":%s}\n' \
 		"$_installed" "$(json_str "$_cur")" "$(json_str "$_latest")" "$_upd" "$(json_str "$RELEASES_URL")" "$_account" \
 		"$( [ "$(cfg_get enabled)" = 1 ] && echo true || echo false )" "$(json_str "$(cfg_get policy)")" "$(json_str "$(cfg_get protocol)")" "$(cfg_get socks_port)" \
-		"$(json_str "$(cfg_get node)")" "$(json_str "$(cfg_get country)")" "$(json_str "$(cfg_get exclude_node)")" "$(json_str "$(cfg_get exclude_country)")" "$(json_str "$(cfg_get active_endpoint)")" "$(shortlist_count)"
+		"$(json_str "$(cfg_get node)")" "$(json_str "$(cfg_get country)")" "$(json_str "$(cfg_get exclude_node)")" "$(json_str "$(cfg_get exclude_country)")" "$(json_str "$(cfg_get active_endpoint)")" "$(shortlist_count)" "$_snapshot"
 }
 
 pid_alive() { _pf="$1"; [ -s "$_pf" ] || return 1; _p=$(cat "$_pf" 2>/dev/null); case "$_p" in ''|*[!0-9]*) return 1;; esac; kill -0 "$_p" 2>/dev/null; }
@@ -247,7 +254,12 @@ method_action_run() {
 	: > "$ACTION_LOG"; printf 'running\n' > "$ACTION_STATE"; run_action_worker "$_act" "$_target" & _pid=$!; printf '%s\n' "$_pid" > "$ACTION_PID"; printf '{"ok":true,"pid":%s}\n' "$_pid"
 }
 
-method_shortlist() { printf '{"ok":true,"active":%s,"items":' "$(json_str "$(cfg_get active_endpoint)")"; shortlist_json; printf '}\n'; }
+method_shortlist() {
+	read -r _in 2>/dev/null
+	_items=$(shortlist_json)
+	_active=$(cfg_get active_endpoint)
+	printf '{"ok":true,"active":%s,"items":%s}\n' "$(json_str "$_active")" "$_items"
+}
 method_select() { read -r _in 2>/dev/null; _ep=$(printf '%s' "$_in" | jq -r '.endpoint // ""' 2>/dev/null); valid_endpoint "$_ep" || { printf '{"ok":false,"reason":"bad_endpoint"}\n'; return; }; grep -q "^${_ep}|" "$SHORTLIST_FILE" 2>/dev/null || { printf '{"ok":false,"reason":"not_in_shortlist"}\n'; return; }; cfg_write active_endpoint "$_ep"; printf '{"ok":true}\n'; }
 
 case "$1" in

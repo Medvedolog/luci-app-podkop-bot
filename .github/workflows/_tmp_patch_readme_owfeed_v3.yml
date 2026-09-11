@@ -1,0 +1,54 @@
+name: tmp-patch-readme-owfeed-v3
+on:
+  push:
+    branches: [dev/0.19.17-readme-owfeed]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/0.19.17-readme-owfeed
+      - name: Patch docs and setup helper
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('README.md'); s=p.read_text()
+          old='''## Установка\n\n### opkg (OpenWrt до 24.10 включительно)\n\n```sh\nopkg update\nopkg install luci-app-podkop-bot_<версия>-r1_all.ipk\n```\n\n### apk (OpenWrt 25.12 и новее)\n\n```sh\napk add --allow-untrusted luci-app-podkop-bot-<версия>-r1.apk\n```\n\nГотовые пакеты — на странице [Releases](../../releases). После установки очистите кэш LuCI (приложение делает это в postinst автоматически) и при необходимости обновите страницу.\n'''
+          new='''## Установка\n\nГотовые пакеты публикуются в [GitHub Releases](../../releases). Ниже команды сами определяют **актуальный Latest release**, находят нужный asset, скачивают его во `/tmp` и устанавливают — вручную копировать файл на роутер не нужно. Используется штатный `jsonfilter`, который входит в OpenWrt.\n\n### OpenWrt 24.10 и старее — opkg, одной командой\n\n```sh\nU="$(wget -qO- https://api.github.com/repos/Medvedolog/luci-app-podkop-bot/releases/latest | jsonfilter -e '@.assets[*].browser_download_url' | grep '_all\\.ipk$' | head -n1)"; [ -n "$U" ] && wget -O /tmp/luci-app-podkop-bot.ipk "$U" && opkg install /tmp/luci-app-podkop-bot.ipk\n```\n\n### OpenWrt 25.12 и новее — apk, одной командой\n\n```sh\nU="$(wget -qO- https://api.github.com/repos/Medvedolog/luci-app-podkop-bot/releases/latest | jsonfilter -e '@.assets[*].browser_download_url' | grep '\\.apk$' | head -n1)"; [ -n "$U" ] && wget -O /tmp/luci-app-podkop-bot.apk "$U" && apk add --allow-untrusted /tmp/luci-app-podkop-bot.apk\n```\n\nДля локального APK из GitHub Releases правильный флаг — `--allow-untrusted`, не `--unrestricted`: до настройки доверенного feed-индекса одиночный APK не имеет доверенной индексной подписи. После установки через пакет очищается кэш LuCI; при необходимости обновите страницу.\n'''
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('tools/setup-keys.sh'); s=p.read_text()
+          old='''gh secret set PODKOP_BOT_SIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-sign.pem"\ngh secret set PODKOP_BOT_USIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-release.key"\n\nmkdir -p keys\ncp "$WORK/podkop-bot-sign.pub.pem" keys/podkop-bot-sign.pub.pem\ncp "$WORK/podkop-bot-release.pub" keys/podkop-bot-release.pub\n'''
+          new='''gh secret set PODKOP_BOT_SIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-sign.pem"\ngh secret set PODKOP_BOT_USIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-release.key"\n\nfor name in PODKOP_BOT_SIGN_KEY PODKOP_BOT_USIGN_KEY; do\n    gh secret list --repo "$REPO" | awk '{print $1}' | grep -Fxq "$name" || {\n        echo "GitHub Actions secret was not created: $name" >&2\n        exit 1\n    }\ndone\n\nmkdir -p keys\ncp "$WORK/podkop-bot-sign.pub.pem" keys/podkop-bot-sign.pub.pem\ncp "$WORK/podkop-bot-release.pub" keys/podkop-bot-release.pub\n'''
+          assert s.count(old)==1
+          s=s.replace(old,new,1)
+          old='''PUBLIC — commit these files:\n  keys/podkop-bot-sign.pub.pem\n  keys/podkop-bot-release.pub\n\nGitHub secrets set:\n'''
+          new='''PUBLIC — commit these files BEFORE the next release tag:\n  keys/podkop-bot-sign.pub.pem\n  keys/podkop-bot-release.pub\n\nSuggested commands:\n  git add keys/podkop-bot-sign.pub.pem keys/podkop-bot-release.pub\n  git commit -m "chore: add owfeed author signing keys"\n  git push\n\nGitHub secrets set:\n'''
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('RELEASING.md'); s=p.read_text()
+          s=s.replace('OpenWrt 25.12+ — APKv3/ADB (`dist/noarch/*.apk`);', 'OpenWrt 25.12+ — APKv3 (`dist/noarch/*.apk`);')
+          old='''## Создание релиза\n\nПеред тегом убедитесь, что `version.txt`, `PKG_VERSION` в `Makefile` и `LUCI_APP_VERSION` в rpcd содержат одну базовую версию.\n'''
+          new='''## Создание релиза\n\n### Один раз: bootstrap подписей для owfeed\n\nПеред первым **owfeed-совместимым** релизом на доверенной машине выполните `./tools/setup-keys.sh`. Он создаёт постоянную EC prime256v1 пару для подписи APK и постоянную usign-пару для `manifest.txt`, загружает приватные ключи в GitHub Actions Secrets (`PODKOP_BOT_SIGN_KEY`, `PODKOP_BOT_USIGN_KEY`) и оставляет в `keys/` только публичные половины. Публичные файлы необходимо закоммитить до создания release tag.\n\nCommunity owfeed принимает upstream-артефакт по подписанному manifest и закреплённому публичному ключу. Release pipeline проверяет наличие публичных ключей до вызова reusable workflow; сам owfeed отдельно откажется публиковать релиз, если приватные secrets отсутствуют.\n\nПеред тегом убедитесь, что `version.txt`, `PKG_VERSION` в `Makefile` и `LUCI_APP_VERSION` в rpcd содержат одну базовую версию.\n'''
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new,1))
+          PY
+      - name: Validate
+        run: |
+          sh -n tools/setup-keys.sh
+          grep -Fq 'apk add --allow-untrusted /tmp/luci-app-podkop-bot.apk' README.md
+          git diff --check
+      - name: Commit
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add README.md RELEASING.md tools/setup-keys.sh
+          git commit -m "docs: add latest-release install commands and document owfeed signing bootstrap"
+          git pull --rebase origin dev/0.19.17-readme-owfeed
+          git push origin HEAD:dev/0.19.17-readme-owfeed

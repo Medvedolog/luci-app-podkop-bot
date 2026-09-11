@@ -16,25 +16,24 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          # README: one-command latest-release install for both package managers.
           p=Path('README.md'); s=p.read_text()
           old='''## Установка\n\n### opkg (OpenWrt до 24.10 включительно)\n\n```sh\nopkg update\nopkg install luci-app-podkop-bot_<версия>-r1_all.ipk\n```\n\n### apk (OpenWrt 25.12 и новее)\n\n```sh\napk add --allow-untrusted luci-app-podkop-bot-<версия>-r1.apk\n```\n\nГотовые пакеты — на странице [Releases](../../releases). После установки очистите кэш LuCI (приложение делает это в postinst автоматически) и при необходимости обновите страницу.\n'''
           new='''## Установка\n\nГотовые пакеты публикуются в [GitHub Releases](../../releases). Ниже команды сами определяют **актуальный Latest release**, находят нужный asset, скачивают его во `/tmp` и устанавливают — вручную копировать файл на роутер не нужно. Используется штатный `jsonfilter`, который входит в OpenWrt.\n\n### OpenWrt 24.10 и старее — opkg, одной командой\n\n```sh\nU="$(wget -qO- https://api.github.com/repos/Medvedolog/luci-app-podkop-bot/releases/latest | jsonfilter -e '@.assets[*].browser_download_url' | grep '_all\\.ipk$' | head -n1)"; [ -n "$U" ] && wget -O /tmp/luci-app-podkop-bot.ipk "$U" && opkg install /tmp/luci-app-podkop-bot.ipk\n```\n\n### OpenWrt 25.12 и новее — apk, одной командой\n\n```sh\nU="$(wget -qO- https://api.github.com/repos/Medvedolog/luci-app-podkop-bot/releases/latest | jsonfilter -e '@.assets[*].browser_download_url' | grep '\\.apk$' | head -n1)"; [ -n "$U" ] && wget -O /tmp/luci-app-podkop-bot.apk "$U" && apk add --allow-untrusted /tmp/luci-app-podkop-bot.apk\n```\n\nДля локального APK из GitHub Releases правильный флаг — `--allow-untrusted`, не `--unrestricted`: до настройки доверенного feed-индекса одиночный APK не имеет доверенной индексной подписи. После установки через пакет очищается кэш LuCI; при необходимости обновите страницу.\n'''
           assert s.count(old)==1, 'README install block not found'
           p.write_text(s.replace(old,new,1))
 
-          # CI: fail early and clearly on tag releases if signing identity is not bootstrapped.
           p=Path('.github/workflows/ci.yml'); s=p.read_text()
-          old='''  release:\n    name: Sign and publish\n    needs: [build, verify]\n    if: startsWith(github.ref, 'refs/tags/')\n    permissions:\n      contents: write\n    uses: owfeed/owfeed/.github/workflows/package.yml@v0.5.1\n    secrets:\n      sign-key: ${{ secrets.PODKOP_BOT_SIGN_KEY }}\n      usign-key: ${{ secrets.PODKOP_BOT_USIGN_KEY }}\n    with:\n      owfeed-version: v0.5.1\n      verify-with: keys/podkop-bot-release.pub\n'''
-          new='''  release-preflight:\n    name: Release signing preflight\n    needs: [build, verify]\n    if: startsWith(github.ref, 'refs/tags/')\n    runs-on: ubuntu-latest\n    env:\n      PODKOP_BOT_SIGN_KEY: ${{ secrets.PODKOP_BOT_SIGN_KEY }}\n      PODKOP_BOT_USIGN_KEY: ${{ secrets.PODKOP_BOT_USIGN_KEY }}\n    steps:\n      - uses: actions/checkout@v7\n      - name: Verify persistent author signing identity\n        run: |\n          set -eu\n          test -s keys/podkop-bot-sign.pub.pem || { echo 'missing keys/podkop-bot-sign.pub.pem; run tools/setup-keys.sh once and commit the public keys'; exit 1; }\n          test -s keys/podkop-bot-release.pub || { echo 'missing keys/podkop-bot-release.pub; run tools/setup-keys.sh once and commit the public keys'; exit 1; }\n          test -n "${PODKOP_BOT_SIGN_KEY:-}" || { echo 'missing Actions secret PODKOP_BOT_SIGN_KEY; run tools/setup-keys.sh once'; exit 1; }\n          test -n "${PODKOP_BOT_USIGN_KEY:-}" || { echo 'missing Actions secret PODKOP_BOT_USIGN_KEY; run tools/setup-keys.sh once'; exit 1; }\n\n  release:\n    name: Sign and publish\n    needs: [build, verify, release-preflight]\n    if: startsWith(github.ref, 'refs/tags/')\n    permissions:\n      contents: write\n    uses: owfeed/owfeed/.github/workflows/package.yml@v0.5.1\n    secrets:\n      sign-key: ${{ secrets.PODKOP_BOT_SIGN_KEY }}\n      usign-key: ${{ secrets.PODKOP_BOT_USIGN_KEY }}\n    with:\n      owfeed-version: v0.5.1\n      verify-with: keys/podkop-bot-release.pub\n'''
-          assert s.count(old)==1, 'CI release block not found'
-          p.write_text(s.replace(old,new,1))
+          marker='''  release:\n    name: Sign and publish\n    needs: [build, verify]\n'''
+          assert s.count(marker)==1, 'CI release marker not found'
+          pre='''  release-preflight:\n    name: Release signing preflight\n    needs: [build, verify]\n    if: startsWith(github.ref, 'refs/tags/')\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v7\n      - name: Verify committed public signing keys\n        run: |\n          set -eu\n          test -s keys/podkop-bot-sign.pub.pem || { echo 'missing keys/podkop-bot-sign.pub.pem; run tools/setup-keys.sh once and commit the public keys'; exit 1; }\n          test -s keys/podkop-bot-release.pub || { echo 'missing keys/podkop-bot-release.pub; run tools/setup-keys.sh once and commit the public keys'; exit 1; }\n\n'''
+          s=s.replace(marker,pre+'''  release:\n    name: Sign and publish\n    needs: [build, verify, release-preflight]\n''',1)
+          p.write_text(s)
 
-          # Setup helper: verify that secrets were actually created and make the required git step explicit.
           p=Path('tools/setup-keys.sh'); s=p.read_text()
           old='''gh secret set PODKOP_BOT_SIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-sign.pem"\ngh secret set PODKOP_BOT_USIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-release.key"\n\nmkdir -p keys\ncp "$WORK/podkop-bot-sign.pub.pem" keys/podkop-bot-sign.pub.pem\ncp "$WORK/podkop-bot-release.pub" keys/podkop-bot-release.pub\n'''
-          new='''gh secret set PODKOP_BOT_SIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-sign.pem"\ngh secret set PODKOP_BOT_USIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-release.key"\n\n# gh deliberately does not reveal secret values, but the names must be visible\n# after creation. Fail here instead of discovering a missing key in a tag release.\nfor name in PODKOP_BOT_SIGN_KEY PODKOP_BOT_USIGN_KEY; do\n    gh secret list --repo "$REPO" | awk '{print $1}' | grep -Fxq "$name" || {\n        echo "GitHub Actions secret was not created: $name" >&2\n        exit 1\n    }\ndone\n\nmkdir -p keys\ncp "$WORK/podkop-bot-sign.pub.pem" keys/podkop-bot-sign.pub.pem\ncp "$WORK/podkop-bot-release.pub" keys/podkop-bot-release.pub\n'''
+          new='''gh secret set PODKOP_BOT_SIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-sign.pem"\ngh secret set PODKOP_BOT_USIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-release.key"\n\nfor name in PODKOP_BOT_SIGN_KEY PODKOP_BOT_USIGN_KEY; do\n    gh secret list --repo "$REPO" | awk '{print $1}' | grep -Fxq "$name" || {\n        echo "GitHub Actions secret was not created: $name" >&2\n        exit 1\n    }\ndone\n\nmkdir -p keys\ncp "$WORK/podkop-bot-sign.pub.pem" keys/podkop-bot-sign.pub.pem\ncp "$WORK/podkop-bot-release.pub" keys/podkop-bot-release.pub\n'''
           assert s.count(old)==1, 'setup-keys block not found'
           s=s.replace(old,new,1)
           old='''PUBLIC — commit these files:\n  keys/podkop-bot-sign.pub.pem\n  keys/podkop-bot-release.pub\n\nGitHub secrets set:\n'''
@@ -42,11 +41,10 @@ jobs:
           assert s.count(old)==1, 'setup message block not found'
           p.write_text(s.replace(old,new,1))
 
-          # Release docs: correct terminology and document the current prerequisite precisely.
           p=Path('RELEASING.md'); s=p.read_text()
           s=s.replace('OpenWrt 25.12+ — APKv3/ADB (`dist/noarch/*.apk`);', 'OpenWrt 25.12+ — APKv3 (`dist/noarch/*.apk`);')
           old='''## Создание релиза\n\nПеред тегом убедитесь, что `version.txt`, `PKG_VERSION` в `Makefile` и `LUCI_APP_VERSION` в rpcd содержат одну базовую версию.\n'''
-          new='''## Создание релиза\n\n### Один раз: bootstrap подписей для owfeed\n\nПеред первым **owfeed-совместимым** релизом на доверенной машине выполните `./tools/setup-keys.sh`. Он создаёт постоянную пару EC prime256v1 для подписи APK и постоянную usign-пару для `manifest.txt`, кладёт приватные ключи только в GitHub Actions Secrets (`PODKOP_BOT_SIGN_KEY`, `PODKOP_BOT_USIGN_KEY`) и оставляет в `keys/` только публичные половины. Публичные файлы необходимо закоммитить до создания release tag.\n\nЭто не опциональная косметика: community owfeed принимает upstream-артефакт по подписанному manifest и закреплённому публичному ключу. Новый `release-preflight` останавливает tag-release до публикации, если хотя бы один secret или публичный ключ отсутствует.\n\nПеред тегом убедитесь, что `version.txt`, `PKG_VERSION` в `Makefile` и `LUCI_APP_VERSION` в rpcd содержат одну базовую версию.\n'''
+          new='''## Создание релиза\n\n### Один раз: bootstrap подписей для owfeed\n\nПеред первым **owfeed-совместимым** релизом на доверенной машине выполните `./tools/setup-keys.sh`. Он создаёт постоянную EC prime256v1 пару для подписи APK и постоянную usign-пару для `manifest.txt`, загружает приватные ключи в GitHub Actions Secrets (`PODKOP_BOT_SIGN_KEY`, `PODKOP_BOT_USIGN_KEY`) и оставляет в `keys/` только публичные половины. Публичные файлы необходимо закоммитить до создания release tag.\n\nCommunity owfeed принимает upstream-артефакт по подписанному manifest и закреплённому публичному ключу. `release-preflight` теперь останавливает tag-release до публикации, если публичные ключи не закоммичены; reusable workflow owfeed отдельно откажется публиковать релиз, если приватные secrets отсутствуют.\n\nПеред тегом убедитесь, что `version.txt`, `PKG_VERSION` в `Makefile` и `LUCI_APP_VERSION` в rpcd содержат одну базовую версию.\n'''
           assert s.count(old)==1, 'RELEASING create block not found'
           p.write_text(s.replace(old,new,1))
           PY
@@ -57,9 +55,10 @@ jobs:
           from pathlib import Path
           r=Path('README.md').read_text()
           assert 'apk add --allow-untrusted /tmp/luci-app-podkop-bot.apk' in r
-          assert "grep '_all\\\\.ipk$'" not in r
+          assert "grep '_all\\.ipk$'" in r
           c=Path('.github/workflows/ci.yml').read_text()
           assert 'release-preflight:' in c
+          assert 'needs: [build, verify, release-preflight]' in c
           assert 'keys/podkop-bot-sign.pub.pem' in c
           assert 'keys/podkop-bot-release.pub' in c
           PY

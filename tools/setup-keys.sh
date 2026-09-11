@@ -42,6 +42,13 @@ fi
 gh secret set PODKOP_BOT_SIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-sign.pem"
 gh secret set PODKOP_BOT_USIGN_KEY --repo "$REPO" < "$WORK/podkop-bot-release.key"
 
+for name in PODKOP_BOT_SIGN_KEY PODKOP_BOT_USIGN_KEY; do
+    gh secret list --repo "$REPO" | awk '{print $1}' | grep -Fxq "$name" || {
+        echo "GitHub Actions secret was not created: $name" >&2
+        exit 1
+    }
+done
+
 mkdir -p keys
 cp "$WORK/podkop-bot-sign.pub.pem" keys/podkop-bot-sign.pub.pem
 cp "$WORK/podkop-bot-release.pub" keys/podkop-bot-release.pub
@@ -53,9 +60,14 @@ PRIVATE — save outside the repository/password manager, then delete $WORK:
   $WORK/podkop-bot-sign.pem
   $WORK/podkop-bot-release.key
 
-PUBLIC — commit these files:
+PUBLIC — commit these files BEFORE the next release tag:
   keys/podkop-bot-sign.pub.pem
   keys/podkop-bot-release.pub
+
+Suggested commands:
+  git add keys/podkop-bot-sign.pub.pem keys/podkop-bot-release.pub
+  git commit -m "chore: add owfeed author signing keys"
+  git push
 
 GitHub secrets set:
   PODKOP_BOT_SIGN_KEY

@@ -37,6 +37,12 @@ function pbInjectCss() {
 	if (document.getElementById('pb-css')) return;
 	document.querySelector('head').appendChild(E('link', { 'id':'pb-css', 'rel':'stylesheet', 'type':'text/css', 'href':L.resource('css/podkop-bot/podkop-bot.css') }));
 }
+function timeoutLabel(r) {
+	var ms = parseInt(r && r.latency_ms || 0, 10);
+	var sec = ms > 0 ? (ms / 1000).toFixed(1) : '5.0';
+	var where = (r && r.reason === 'connect_timeout') ? _('connect timeout') : _('request timeout');
+	return _('TIMEOUT') + ' · ' + where + ' · ' + sec + ' s';
+}
 
 return view.extend({
 	loadData: function() {
@@ -192,13 +198,13 @@ return view.extend({
 		return card(_('Тестовый WARP SOCKS'),[
 			pre,
 			E('p',{'class':'pb-hint-90'},_('WARPSCOUT socks — тестовый туннель без reconnect/failover. Его локальный socks5h можно использовать в Runtime → Тест сервисов как обычный маршрут проверки.')),
-			row(_('Состояние'),rt.running?dot('green',_('работает')+(rt.rss_mb!=null?(' · RSS '+rt.rss_mb+' MB'):'')):dot('grey',rt.state||_('остановлен'))),
+			row(_('WARP tunnel'),rt.running?dot('green',_('OK')+(rt.rss_mb!=null?(' · RSS '+rt.rss_mb+' MB'):'')):dot('grey',rt.state||_('остановлен'))),
 			row(_('Endpoint'),rt.endpoint||((st.config&&st.config.active_endpoint)||'—')),
 			row(_('Protocol'),String(rt.protocol||((st.config&&st.config.protocol)||'—')).toUpperCase()),
 			row(_('SOCKS'),rt.proxy||('socks5h://127.0.0.1:'+((st.config&&st.config.socks_port)||18191))),
 			row(_('Telegram API'),tgLast),
 			(rt.telegram&&rt.telegram.proxy?row(_('Telegram test route'),rt.telegram.proxy):E('span',{})),
-			(rt.telegram&&rt.telegram.error?row(_('Telegram error'),rt.telegram.error):E('span',{})),
+			(rt.telegram&&rt.telegram.error?row(_('Telegram detail'),rt.telegram.error):E('span',{})),
 			E('div',{'class':'pb-action-row','style':'display:flex;gap:.5em;flex-wrap:wrap;margin-top:.7em;'},[start,stop,tg]),status
 		]);
 	},
@@ -206,7 +212,7 @@ return view.extend({
 	logsCard: function() {
 		this._actionLogPre=logPre(); this._rtLogPre=logPre();
 		return card(_('Журналы'),[
-			E('p',{'class':'pb-hint-90'},_('Журналы последней операции сохраняются после её завершения. Таблицы WARPSCOUT не переносятся по строкам; при необходимости прокручивайте их по горизонтали.')),
+			E('p',{'class':'pb-hint-90'},_('Журналы последней операции сохраняются после её завершения. Форматирование и переводы строк WARPSCOUT сохраняются; широкие таблицы прокручиваются по горизонтали.')),
 			E('details',{},[E('summary',{'style':'cursor:pointer;'},_('Последний Discovery / account log')),this._actionLogPre]),
 			E('details',{'style':'margin-top:.6em;'},[E('summary',{'style':'cursor:pointer;'},_('Последний WARP SOCKS log')),this._rtLogPre])
 		]);
@@ -222,6 +228,7 @@ return view.extend({
 		if(!r) return dot('red',_('нет результата'));
 		var s=r.status||'';
 		if(s==='OK') return dot('green',_('OK')+(r.http?(' · HTTP '+r.http):'')+(r.latency_ms?(' · '+r.latency_ms+' ms'):''));
+		if(s==='TIMEOUT') return dot('red',timeoutLabel(r));
 		if(s==='RATE_LIMITED') return dot('yellow',_('Telegram доступен · rate limited (429)'));
 		if(s==='AUTH_ERROR') return dot('yellow',_('Telegram доступен · ошибка авторизации (401)'));
 		if(s==='API_DENIED') return dot('yellow',_('Telegram доступен · API denied (403)'));

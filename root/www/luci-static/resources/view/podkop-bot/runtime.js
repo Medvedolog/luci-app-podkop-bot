@@ -91,6 +91,9 @@ return view.extend({
 				this.tierProxies.push({ endpoint: t3, label: _('tier3 · свой прокси') + ' — ' + t3h });
 			}
 		}
+		if (this.warpRuntime && this.warpRuntime.running && this.warpRuntime.proxy) {
+			this.tierProxies.push({ endpoint: this.warpRuntime.proxy, label: _('WARP Rescue · WARPSCOUT') + ' — ' + this.warpRuntime.proxy });
+		}
 		this.selectedProxy = '';
 		this.selectedProxyLabel = '';
 
@@ -150,10 +153,9 @@ return view.extend({
 		var cpToggle = E('button', { 'class':'cbi-button', 'click': function() { var open = cpForm.style.display !== 'none'; cpForm.style.display = open ? 'none' : 'block'; this.textContent = open ? _('Ручной прокси ▸') : _('Ручной прокси ▾'); } }, _('Ручной прокси ▸'));
 
 		return E('div', {}, [
-			E('h2', {}, _('Runtime — активный сервер')),
-			E('p', { 'class':'pb-muted' }, _('Проверка туннеля: страна и провайдер выхода, доступность 12 сервисов и их регионы, скорость, признаки блокировок ТСПУ. Маршрут — это через что идёт проверка: секция Podkop, транспортный или ручной прокси.')),
+			E('h2', {}, _('Runtime — тест сервисов')),
+			E('p', { 'class':'pb-muted' }, _('Проверка туннеля: страна и провайдер выхода, доступность 12 сервисов и их регионы, скорость, признаки блокировок ТСПУ. Маршрут — это через что идёт проверка: секция Podkop, транспортный, WARP или ручной прокси.')),
 			E('p', { 'style':'color:#c60;font-size:90%;margin-top:-.4em;' }, _('⚠ Полная проверка идёт 15–60 секунд и нагружает роутер (параллельные запросы + загрузка до 8 МиБ через туннель). Быстрая кнопка Telegram API проверяет только реальный getMe и почти не создаёт трафика.')),
-			this.renderWarpRuntime(),
 			selectorRow,
 			E('div', { 'style':'margin:.6em 0;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ runBtn, batchBtn, cpToggle, tgBtn ]),
 			cpForm,
@@ -191,7 +193,7 @@ return view.extend({
 			row(_('Local SOCKS'), E('span', {}, rt && rt.proxy || ('socks5h://127.0.0.1:' + (cfg.socks_port || 18191)))),
 			row(_('Telegram API'), tgNode),
 			row(_('Telegram test age'), E('span', {}, tgChecked)),
-			E('div', { 'style':'margin-top:.7em;' }, [ E('a', { 'class':'cbi-button', 'href':L.url('admin/services/podkop-bot/warpscout') }, _('Открыть WARP Rescue')) ])
+			E('div', { 'style':'margin-top:.7em;' }, [ E('a', { 'class':'cbi-button', 'href':L.url('admin/services/podkop-bot/transport/warpscout') }, _('Открыть WARP Rescue')) ])
 		]);
 	},
 

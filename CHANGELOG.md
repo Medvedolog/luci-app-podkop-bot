@@ -16,6 +16,45 @@
 
 ## luci-app-podkop-bot
 
+### 0.19.17 — anti-flap, security, diagnostics and native OpenWrt packages
+
+- **[0.19.17 / anti-flap]** Исправлен ложный уход POLL на аварийный Direct из-за слишком быстро устаревавшего follower-sample: freshness теперь соответствует реальному циклу follower, а существующий hysteresis сохраняет быстрый recovery без смешивания POLL и FAST.
+- **[0.19.17 / runtime]** Полный Outbound-тест показывает 12 внешних сервисов и работает в background worker; отдельная кнопка проверки Telegram Bot API сохранена в Runtime.
+- **[0.19.17 / logging]** В LuCI и Telegram доступны уровни журнала `Тихий / Обычный / Отладочный`; обычный режим убирает рутинную телеметрию и оставляет изменения состояния follower плюс редкую сводку.
+- **[0.19.17 / security]** Anonymous `sender_chat` admins are opt-in; default is disabled.
+- **[0.19.17 / security]** Executable bot uploads require a fresh 5-minute private-chat session owned by the primary administrator; extra admins and anonymous sender_chat identities cannot upload code.
+- **[0.19.17 / security]** Unauthorized actors are rate-limited and temporarily blocked in RAM after repeated attempts; optional persistent UCI blocklists are supported by `blocked_user_ids` and `blocked_sender_chat_ids`.
+- **[0.19.17 / security]** Attacker-controlled Telegram message bodies are no longer written verbatim to syslog.
+
+- **[0.19.16 / transport]** Vendored bot now probes Telegram `getMe` concurrently through tier1, every tier2 fallback/auto-section and tier3. On reserve/degraded POLL routes the follower refreshes every health tick.
+- **[0.19.16 / anti-flap]** One failed POLL proxy cascade is held when the follower still has a fresh successful Telegram sample; a second consecutive failure may demote to Direct. FAST remains independent.
+- **[0.19.16 / journal]** Localized probe/route display values are kept out of syslog; source checks reject known presentation variables and display helpers in logger calls.
+
+- **[Сборка]** nFPM заменён на owfeed: OpenWrt 25.12+ получает настоящий APKv3/ADB, 24.10 — IPK из того же staged tree.
+- **[CI]** Перед релизом source checks и package assertions дополняются установкой свежесобранных пакетов через owlab на OpenWrt 25.12.5 и 24.10.8; только затем reusable owfeed workflow может подписать и опубликовать релиз.
+- **[Подписи]** Подготовлены постоянный EC package-signing key и usign release-manifest key через `tools/setup-keys.sh`; приватные ключи хранятся только в GitHub Secrets/у владельца, публичные предназначены для pinning в community feed.
+- **[Баг]** Vendored install.sh 2.6.2 ищет APK release asset по `.apk`, а не старому nFPM-суффиксу `_noarch.apk`, поэтому `update-luci` понимает имена native owfeed APKv3 и остаётся совместим со старыми релизами.
+
+### 0.19.15 — исправление зависания Outbound probe
+
+- **[Баг]** Полный Outbound-тест больше не зависает на шаге 3/4: `probe_services()` теперь ожидает только PID своих 12 service-workers, а не выполняет голый `wait`, который также ждал постоянно работающий watchdog.
+- **[Отзывчивость]** Полный тест выполняется в background worker, поэтому Telegram polling loop продолжает принимать `/start` и другие команды во время диагностики.
+- **[Журнал]** События бота и runtime-диагностики пишутся в syslog на английском; локализованные названия маршрутов остаются только в Telegram/LuCI. Добавлены progress/result строки по всем четырём стадиям и 12 сервисам без вывода bot token.
+- **[Runtime]** Кнопка «Проверить Telegram API» перенесена в конец панели действий.
+
+### 0.19.14 — полный Outbound-тест из Status и Telegram-aware transport probe
+
+- **[Баг]** Кнопка «Полный тест Outbound» в Telegram Status теперь правильно маршрутизируется в существующий диагностический `ask_probe_outbound`/`cmd_probe_outbound_back_*` flow. Раньше новый callback `ask_probe_outbound_status` не был внесён в главный router и проваливался в общий `ask_*`, поэтому показывал `probe_outbound_status?`, а «Да» вызывало несуществующий `do_probe_outbound_status`.
+- **[Интерфейс]** Экран подтверждения явно сообщает, что это тот же тест, что «Диагностика → Проверить прокси», перечисляет 12 сервисов, предупреждает о 20–60 секундах работы и о трафике до 8 МБ через туннель плюс до 8 МБ через прямой WAN для сравнения.
+- **[Диагностика]** Vendored bot синхронизирован со standalone 0.19.14; транспортные проверки Telegram используют реальный Bot API `getMe`, а полный Outbound-тест сохраняет 12-service/8 MiB схему.
+
+### 0.19.13 — transport-state: POLL и FAST разделены
+
+- **[Баг]** Вендорный `podkop_bot` обновлён до **0.19.13**: состояние длинного `getUpdates` (POLL) больше не смешивается с короткими `sendMessage`/callback (FAST), поэтому отправка алерта вотчдогом не может сама породить ложную пару «Direct → восстановлено».
+- **[Баг]** `transport_state` больше не принимает watchdog `last_ok` за активный Telegram-маршрут. Авторитетный путь — `poll_route`; `route` и `last_ok` сохранены как backward-compatible aliases к нему. Для старого бота без нового state-contract вывод честно остаётся `unknown`.
+- **[Интерфейс]** Карточка транспорта показывает POLL и FAST раздельно и подсвечивает в fallback-цепочке именно POLL. Это позволяет увидеть случай «короткий запрос проходит, long-poll не держится» без ложного восстановления.
+- **[Планово]** `vendor.sha256`, `Makefile`, `nfpm.yaml`, `version.txt`, README, `LUCI_APP_VERSION` и проверки версии в обоих workflow синхронизированы с **0.19.13**.
+
 ### 0.19.12 — запись в UCI больше не отменяется из-за замка
 
 - **[Баг]** Общий замок, добавленный в 0.19.11, при неудаче захвата **отменял запись**, а не просто шёл дальше без него. Правка молча терялась, а в журнале оставалось `uci commit failed` — будто коммит выполнялся и упал. На сборках BusyBox, чей `flock` не принимает `-w`, захват отказывал мгновенно, поэтому терялась каждая запись. Теперь коммит выполняется при любом исходе: потерять настройку хуже, чем изредка разойтись с другим писателем. Перед отказом делается вторая попытка без `-w`, и сообщение больше не утверждает, что замок «занят».

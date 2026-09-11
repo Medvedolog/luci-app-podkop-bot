@@ -12,7 +12,7 @@
  * per-service reachability (incl. TSPU/RKN blocks), download speed, and TSPU
  * 16 KB block detection. Reuses the bot's probe logic via the active_probe rpc.
  *
- * The probe is slow (downloads 1 MB, hits several services) so it runs on demand
+ * The full probe is slow (downloads 8 MiB, hits several services) so it runs on demand
  * and is cached; opening the tab shows the cached result immediately, a button
  * runs a fresh probe.
  */
@@ -20,6 +20,7 @@
 var callActiveProbe = rpc.declare({ object:'podkop_bot', method:'active_probe', params:['cached','section','proxy','label'] });
 var callRuntimeSections = rpc.declare({ object:'podkop_bot', method:'runtime_sections' });
 var callTransportState = rpc.declare({ object:'podkop_bot', method:'transport_state' });
+var callTransportProbe = rpc.declare({ object:'podkop_bot', method:'transport_probe', params:['target'] });
 var callEnsureMixedProxy = rpc.declare({ object:'podkop_bot', method:'ensure_mixed_proxy', params:['section'] });
 
 var COLOURS = { green:'#33a02c', yellow:'#e8a33d', grey:'#888888', red:'#cc2b2b' };
@@ -118,6 +119,14 @@ return view.extend({
 		}, (this.sections.length > 1 || this.tierProxies.length > 0) ? _('Проверить выбранный') : _('Проверить сейчас'));
 		this.runBtn = runBtn;
 
+		var tgBody = E('div', { 'id':'podkop-runtime-tg', 'style':'margin:.5em 0;' });
+		this.tgBody = tgBody;
+		var tgBtn = E('button', {
+			'class':'cbi-button',
+			'click': ui.createHandlerFn(this, 'runTelegramProbe')
+		}, _('Проверить Telegram API'));
+		this.tgBtn = tgBtn;
+
 		/* combined selector: two optgroups — Podkop sections, then transport
 		 * proxies. Shown when there's more than one thing to choose. */
 		var selectorRow = E('span', {});
@@ -194,13 +203,55 @@ return view.extend({
 		return E('div', {}, [
 			E('h2', {}, _('Runtime — активный сервер')),
 			E('p', { 'class':'pb-muted' }, _('Проверка туннеля: страна и провайдер выхода, доступность 12 сервисов и их регионы, скорость, признаки блокировок ТСПУ. Маршрут — это через что идёт проверка: секция Podkop, транспортный или ручной прокси.')),
-			E('p', { 'style':'color:#c60;font-size:90%;margin-top:-.4em;' }, _('⚠ Полная проверка идёт 15–40 секунд и нагружает роутер (параллельные запросы + загрузка ~3 МБ через туннель). Тест транспорт-прокси гоняет тот же полный набор.')),
+			E('p', { 'style':'color:#c60;font-size:90%;margin-top:-.4em;' }, _('⚠ Полная проверка идёт 15–60 секунд и нагружает роутер (параллельные запросы + загрузка до 8 МиБ через туннель). Быстрая кнопка Telegram API проверяет только реальный getMe и почти не создаёт трафика.')),
 			selectorRow,
-			E('div', { 'style':'margin:.6em 0;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ runBtn, batchBtn, cpToggle ]),
+			E('div', { 'style':'margin:.6em 0;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ runBtn, batchBtn, cpToggle, tgBtn ]),
 			cpForm,
+			tgBody,
 			body,
 			pbFooter()
 		]);
+	},
+
+
+	renderTelegramProbe: function(d, label) {
+		if (!d) return E('div', { 'class':'cbi-section pb-wide' }, dot('red', _('Telegram probe не завершился.')));
+		var colour = d.verified_bot_api ? 'green' : (d.telegram_reached ? 'yellow' : 'red');
+		var text;
+		if (d.verified_bot_api) {
+			text = _('Telegram Bot API подтверждён') + (d.bot_username ? (' · @' + d.bot_username) : '');
+		} else if (d.telegram_reached) {
+			text = _('Telegram отвечает, но getMe не подтверждён') + (d.reason ? (' · ' + d.reason) : '');
+		} else {
+			text = _('Telegram через этот маршрут недоступен') + (d.reason ? (' · ' + d.reason) : '');
+		}
+		return E('div', { 'class':'cbi-section pb-wide', 'style':'margin:.5em 0;padding:.65em .9em;' }, [
+			dot(colour, text),
+			E('div', { 'style':'color:#888;font-size:85%;margin-top:.3em;' },
+				(label || d.target || '') + (d.http ? (' · HTTP ' + d.http) : '') + (d.latency_ms != null ? (' · ' + d.latency_ms + ' ms') : ''))
+		]);
+	},
+
+	runTelegramProbe: function() {
+		var self = this, target = '', label = '';
+		if (this.selectedProxy) {
+			target = this.selectedProxy; label = this.selectedProxyLabel || target;
+		} else {
+			var name = this.selectedSection || '';
+			var sec = (this.sections || []).filter(function(x){ return x.name === name; })[0];
+			if (sec) { target = sec.endpoint || ''; label = sec.name + (target ? (' · ' + target) : ''); }
+		}
+		if (!target) {
+			dom.content(this.tgBody, this.renderTelegramProbe({ telegram_reached:false, reason:'mixed_proxy_disabled' }, label));
+			return;
+		}
+		this.tgBtn.disabled = true;
+		dom.content(this.tgBody, E('div', {}, dot('grey', _('Проверяю реальный Telegram getMe…'))));
+		return callTransportProbe(target).then(function(d) {
+			dom.content(self.tgBody, self.renderTelegramProbe(d, label)); self.tgBtn.disabled = false;
+		}).catch(function() {
+			dom.content(self.tgBody, self.renderTelegramProbe(null, label)); self.tgBtn.disabled = false;
+		});
 	},
 
 	/* Build an endpoint from the custom-proxy form and probe through it. Never

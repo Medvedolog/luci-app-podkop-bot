@@ -11,6 +11,11 @@ var callAction = rpc.declare({ object:'podkop_bot_warpscout', method:'action_run
 var callActionLog = rpc.declare({ object:'podkop_bot_warpscout', method:'action_log', params:['offset'] });
 var callShortlist = rpc.declare({ object:'podkop_bot_warpscout', method:'shortlist' });
 var callSelect = rpc.declare({ object:'podkop_bot_warpscout', method:'select', params:['endpoint'] });
+var callRtStatus = rpc.declare({ object:'podkop_bot_warpscout_runtime', method:'status' });
+var callRtStart = rpc.declare({ object:'podkop_bot_warpscout_runtime', method:'start' });
+var callRtStop = rpc.declare({ object:'podkop_bot_warpscout_runtime', method:'stop' });
+var callRtLog = rpc.declare({ object:'podkop_bot_warpscout_runtime', method:'log', params:['offset'] });
+var callRtTelegram = rpc.declare({ object:'podkop_bot_warpscout_runtime', method:'telegram_test' });
 
 var COLOURS = { green:'#33a02c', yellow:'#e8a33d', grey:'#888888', red:'#cc2b2b' };
 function dot(c, label) {
@@ -33,12 +38,16 @@ function pbInjectCss() {
 return view.extend({
 	load: function() {
 		pbInjectCss();
-		return Promise.all([ callStatus('').catch(function(){return {ok:false};}), callShortlist().catch(function(){return {ok:false,items:[]};}) ]);
+		return Promise.all([
+			callStatus('').catch(function(){return {ok:false};}),
+			callShortlist().catch(function(){return {ok:false,items:[]};}),
+			callRtStatus().catch(function(){return {ok:false,running:false,state:'unknown'};})
+		]);
 	},
 
 	render: function(data) {
-		var self=this, st=data[0]||{}, sl=data[1]||{items:[]};
-		this._st=st; this._sl=sl;
+		var st=data[0]||{}, sl=data[1]||{items:[]}, rt=data[2]||{};
+		this._st=st; this._sl=sl; this._rt=rt;
 		return E('div', {}, [
 			E('h2', {}, _('WARP Rescue / WARPSCOUT')),
 			E('p', { 'class':'pb-hint-90', 'style':'max-width:820px;' }, _('WARPSCOUT выполняет discovery, проверку и ранжирование WARP endpoints. LuCI только запускает штатные команды, сохраняет выбранный результат и готовит его для будущего резервного транспорта бота.')),
@@ -46,7 +55,8 @@ return view.extend({
 			this.accountCard(st),
 			this.configCard(st),
 			this.scanCard(st),
-			this.shortlistCard(sl)
+			this.shortlistCard(sl),
+			this.runtimeCard(st,rt)
 		]);
 	},
 
@@ -77,7 +87,7 @@ return view.extend({
 	},
 
 	configCard: function(st) {
-		var self=this, c=st.config||{};
+		var c=st.config||{};
 		function select(values, cur) { var s=E('select',{'class':'cbi-input-select'}); values.forEach(function(v){ s.appendChild(E('option',{value:v[0],selected:v[0]===cur?'selected':null},v[1])); }); return s; }
 		function input(v, ph) { return E('input',{type:'text','class':'cbi-input-text',value:v||'',placeholder:ph||''}); }
 		var enabled=E('input',{type:'checkbox',checked:c.enabled?'checked':null});
@@ -123,6 +133,54 @@ return view.extend({
 			]);
 		}));
 		return card(_('Shortlist'),[body]);
+	},
+
+	runtimeCard: function(st, rt) {
+		var self=this, status=E('div',{'style':'margin-top:.6em;'}), log=E('pre',{'style':'display:none;max-width:820px;max-height:240px;overflow:auto;background:var(--background-color-high,var(--background-color,var(--background,rgba(30,30,30,.96))));padding:.6em;border-radius:6px;white-space:pre-wrap;font-size:82%;margin-top:.6em;'},'');
+		var canStart=!!(st.installed&&st.account_ready&&st.config&&st.config.active_endpoint);
+		var start=E('button',{'class':'cbi-button cbi-button-action','disabled':rt.running||!canStart,'click':ui.createHandlerFn(this,function(){
+			start.disabled=true; dom.content(status,dot('yellow',_('WARPSCOUT поднимает тестовый SOCKS…'))); log.style.display='block'; log.textContent='';
+			return callRtStart().then(function(r){
+				if(!r||!r.ok){dom.content(status,dot('red',_('SOCKS не поднялся: ')+((r&&r.reason)||'?'))); start.disabled=false; return self.pollRtLog(log);}
+				dom.content(status,dot('green',_('SOCKS поднят и WARPSCOUT-процесс остаётся запущен'))); return self.pollRtLog(log).then(function(){window.setTimeout(function(){location.reload();},300);});
+			}).catch(function(){dom.content(status,dot('red',_('Ошибка RPC')));start.disabled=false;});
+		})},_('Поднять WARP SOCKS'));
+		var stop=E('button',{'class':'cbi-button','disabled':!rt.running,'click':ui.createHandlerFn(this,function(){
+			stop.disabled=true; return callRtStop().then(function(r){dom.content(status,r&&r.ok?dot('green',_('SOCKS остановлен')):dot('red',_('Не удалось остановить')));window.setTimeout(function(){location.reload();},300);}).catch(function(){stop.disabled=false;});
+		})},_('Остановить WARP SOCKS'));
+		var tg=E('button',{'class':'cbi-button','disabled':!rt.running,'click':ui.createHandlerFn(this,function(){
+			tg.disabled=true; dom.content(status,dot('grey',_('Проверяю api.telegram.org через этот SOCKS…')));
+			return callRtTelegram().then(function(r){dom.content(status,self.telegramResult(r));tg.disabled=false;}).catch(function(){dom.content(status,dot('red',_('Telegram probe не завершился')));tg.disabled=false;});
+		})},_('Проверить Telegram API'));
+		var tgLast=(rt.telegram&&rt.telegram.status)?this.telegramResult(rt.telegram):dot('grey',_('ещё не проверялся'));
+		return card(_('Тестовый WARP SOCKS'),[
+			E('p',{'class':'pb-hint-90'},_('Это штатный `warpscout socks`: один тестовый туннель без reconnect/failover. Если WARPSCOUT не смог поднять туннель изначально, процесс завершится ошибкой. Для постоянной работы этот режим не предназначен.')),
+			row(_('Состояние'),rt.running?dot('green',_('работает')):dot('grey',rt.state||_('остановлен'))),
+			row(_('Endpoint'),rt.endpoint||((st.config&&st.config.active_endpoint)||'—')),
+			row(_('Protocol'),(rt.protocol||((st.config&&st.config.protocol)||'—')).toUpperCase()),
+			row(_('SOCKS'),(rt.proxy||('socks5h://127.0.0.1:'+((st.config&&st.config.socks_port)||18191)))),
+			row(_('Telegram API'),tgLast),
+			E('div',{'class':'pb-action-row','style':'display:flex;gap:.5em;flex-wrap:wrap;margin-top:.7em;'},[start,stop,tg]),status,log
+		]);
+	},
+
+	telegramResult: function(r) {
+		if(!r) return dot('red',_('нет результата'));
+		var s=r.status||'';
+		if(s==='OK') return dot('green',_('OK')+(r.http?(' · HTTP '+r.http):''));
+		if(s==='RATE_LIMITED') return dot('yellow',_('Telegram доступен · rate limited (429)'));
+		if(s==='AUTH_ERROR') return dot('yellow',_('Telegram доступен · ошибка авторизации (401)'));
+		if(s==='API_DENIED') return dot('yellow',_('Telegram доступен · API denied (403)'));
+		if(s==='OTHER_API_RESPONSE') return dot('yellow',_('Telegram отвечает · HTTP ')+(r.http||'?'));
+		return dot('red',_('NETWORK_FAIL'));
+	},
+
+	pollRtLog: function(log) {
+		var off=0,text='';
+		return new Promise(function(resolve){
+			function tick(){callRtLog(off).then(function(r){if(r&&r.chunk){text+=r.chunk;log.textContent=text;log.scrollTop=log.scrollHeight;}if(r&&typeof r.offset==='number')off=r.offset;resolve(r);}).catch(function(){resolve(null);});}
+			tick();
+		});
 	},
 
 	runAction: function(action,target,status,log,btn) {

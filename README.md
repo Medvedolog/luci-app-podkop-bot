@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🤖 luci-app-podkop-bot
+# 🤖 luci-app-podkop-bot 0.19.17
 
 **Управление Telegram-ботом podkop_bot из LuCI — установка, обновление, транспорт и диагностика на OpenWrt**
 

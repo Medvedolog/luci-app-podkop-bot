@@ -16,8 +16,11 @@
 
 ## luci-app-podkop-bot
 
-### Unreleased — native OpenWrt packages through owfeed
+### 0.19.17 — anti-flap, security, diagnostics and native OpenWrt packages
 
+- **[0.19.17 / anti-flap]** Исправлен ложный уход POLL на аварийный Direct из-за слишком быстро устаревавшего follower-sample: freshness теперь соответствует реальному циклу follower, а существующий hysteresis сохраняет быстрый recovery без смешивания POLL и FAST.
+- **[0.19.17 / runtime]** Полный Outbound-тест показывает 12 внешних сервисов и работает в background worker; отдельная кнопка проверки Telegram Bot API сохранена в Runtime.
+- **[0.19.17 / logging]** В LuCI и Telegram доступны уровни журнала `Тихий / Обычный / Отладочный`; обычный режим убирает рутинную телеметрию и оставляет изменения состояния follower плюс редкую сводку.
 - **[0.19.17 / security]** Anonymous `sender_chat` admins are opt-in; default is disabled.
 - **[0.19.17 / security]** Executable bot uploads require a fresh 5-minute private-chat session owned by the primary administrator; extra admins and anonymous sender_chat identities cannot upload code.
 - **[0.19.17 / security]** Unauthorized actors are rate-limited and temporarily blocked in RAM after repeated attempts; optional persistent UCI blocklists are supported by `blocked_user_ids` and `blocked_sender_chat_ids`.

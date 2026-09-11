@@ -28,6 +28,11 @@
           "log",
           "action_log",
           "shortlist"
+        ],
+        "podkop_bot_warpscout_runtime": [
+          "status",
+          "log",
+          "telegram_test"
         ]
       },
       "uci": [
@@ -55,6 +60,10 @@
           "account_import",
           "action_run",
           "select"
+        ],
+        "podkop_bot_warpscout_runtime": [
+          "start",
+          "stop"
         ]
       },
       "uci": [

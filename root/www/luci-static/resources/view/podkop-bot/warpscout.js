@@ -73,7 +73,7 @@ return view.extend({
 	accountCard: function(st) {
 		var self=this, status=E('div', { 'style':'margin-top:.5em;' });
 		var log=E('pre', { 'style':'display:none;max-width:820px;max-height:280px;overflow:auto;background:var(--background-color-high,var(--background-color,var(--background,rgba(30,30,30,.96))));padding:.6em;border-radius:6px;white-space:pre-wrap;font-size:82%;margin-top:.6em;' }, '');
-		var reg=E('button', { 'class':'cbi-button cbi-button-action', 'disabled':!st.installed, 'click':ui.createHandlerFn(this,function(){ return self.runAction('register','',status,log,reg); }) }, st.account_ready ? _('Перерегистрировать account') : _('Создать WARP account'));
+		var reg=E('button', { 'class':'cbi-button cbi-button-action', 'disabled':!st.installed ? 'disabled' : null, 'click':ui.createHandlerFn(this,function(){ return self.runAction('register','',status,log,reg); }) }, st.account_ready ? _('Перерегистрировать account') : _('Создать WARP account'));
 		var imp=E('button', { 'class':'cbi-button', 'click':ui.createHandlerFn(this,function(){
 			dom.content(status,dot('grey',_('Загрузка account JSON…')));
 			return ui.uploadFile('/tmp/warpscout-account-upload.json', null, _('Файл будет проверен как JSON и сохранён с правами 0600. Секреты не выводятся в LuCI и журнал.')).then(function(){
@@ -112,8 +112,8 @@ return view.extend({
 
 	scanCard: function(st) {
 		var self=this,status=E('div',{'style':'margin-top:.5em;'}),log=E('pre',{'style':'display:none;max-width:820px;max-height:320px;overflow:auto;background:var(--background-color-high,var(--background-color,var(--background,rgba(30,30,30,.96))));padding:.6em;border-radius:6px;white-space:pre-wrap;font-size:82%;margin-top:.6em;'},'');
-		var scan=E('button',{'class':'cbi-button cbi-button-action','disabled':!(st.installed&&st.account_ready),'click':ui.createHandlerFn(this,function(){return self.runAction('scan','',status,log,scan);})},_('Сканировать endpoints'));
-		var target=E('button',{'class':'cbi-button','disabled':!(st.installed&&st.account_ready&&st.config&&st.config.active_endpoint),'click':ui.createHandlerFn(this,function(){return self.runAction('target',(st.config&&st.config.active_endpoint)||'',status,log,target);})},_('Перепроверить выбранный (--target)'));
+		var scan=E('button',{'class':'cbi-button cbi-button-action','disabled':!(st.installed&&st.account_ready) ? 'disabled' : null,'click':ui.createHandlerFn(this,function(){return self.runAction('scan','',status,log,scan);})},_('Сканировать endpoints'));
+		var target=E('button',{'class':'cbi-button','disabled':!(st.installed&&st.account_ready&&st.config&&st.config.active_endpoint) ? 'disabled' : null,'click':ui.createHandlerFn(this,function(){return self.runAction('target',(st.config&&st.config.active_endpoint)||'',status,log,target);})},_('Перепроверить выбранный (--target)'));
 		return card(_('Discovery'), [
 			E('p',{'class':'pb-hint-90'},_('Полный scan запускается штатным WARPSCOUT с -P. Быстрая перепроверка использует --target на уже выбранном endpoint. Результаты NODE / NODE LOCATION / SEEN AS / tunnel ping / loss берутся из отчёта WARPSCOUT.')),
 			E('div',{'class':'pb-action-row','style':'display:flex;gap:.5em;flex-wrap:wrap;'},[scan,target]),status,log
@@ -138,17 +138,17 @@ return view.extend({
 	runtimeCard: function(st, rt) {
 		var self=this, status=E('div',{'style':'margin-top:.6em;'}), log=E('pre',{'style':'display:none;max-width:820px;max-height:240px;overflow:auto;background:var(--background-color-high,var(--background-color,var(--background,rgba(30,30,30,.96))));padding:.6em;border-radius:6px;white-space:pre-wrap;font-size:82%;margin-top:.6em;'},'');
 		var canStart=!!(st.installed&&st.account_ready&&st.config&&st.config.active_endpoint);
-		var start=E('button',{'class':'cbi-button cbi-button-action','disabled':rt.running||!canStart,'click':ui.createHandlerFn(this,function(){
+		var start=E('button',{'class':'cbi-button cbi-button-action','disabled':(rt.running||!canStart) ? 'disabled' : null,'click':ui.createHandlerFn(this,function(){
 			start.disabled=true; dom.content(status,dot('yellow',_('WARPSCOUT поднимает тестовый SOCKS…'))); log.style.display='block'; log.textContent='';
 			return callRtStart().then(function(r){
 				if(!r||!r.ok){dom.content(status,dot('red',_('SOCKS не поднялся: ')+((r&&r.reason)||'?'))); start.disabled=false; return self.pollRtLog(log);}
 				dom.content(status,dot('green',_('SOCKS поднят и WARPSCOUT-процесс остаётся запущен'))); return self.pollRtLog(log).then(function(){window.setTimeout(function(){location.reload();},300);});
 			}).catch(function(){dom.content(status,dot('red',_('Ошибка RPC')));start.disabled=false;});
 		})},_('Поднять WARP SOCKS'));
-		var stop=E('button',{'class':'cbi-button','disabled':!rt.running,'click':ui.createHandlerFn(this,function(){
+		var stop=E('button',{'class':'cbi-button','disabled':!rt.running ? 'disabled' : null,'click':ui.createHandlerFn(this,function(){
 			stop.disabled=true; return callRtStop().then(function(r){dom.content(status,r&&r.ok?dot('green',_('SOCKS остановлен')):dot('red',_('Не удалось остановить')));window.setTimeout(function(){location.reload();},300);}).catch(function(){stop.disabled=false;});
 		})},_('Остановить WARP SOCKS'));
-		var tg=E('button',{'class':'cbi-button','disabled':!rt.running,'click':ui.createHandlerFn(this,function(){
+		var tg=E('button',{'class':'cbi-button','disabled':!rt.running ? 'disabled' : null,'click':ui.createHandlerFn(this,function(){
 			tg.disabled=true; dom.content(status,dot('grey',_('Проверяю api.telegram.org через этот SOCKS…')));
 			return callRtTelegram().then(function(r){dom.content(status,self.telegramResult(r));tg.disabled=false;}).catch(function(){dom.content(status,dot('red',_('Telegram probe не завершился')));tg.disabled=false;});
 		})},_('Проверить Telegram API'));

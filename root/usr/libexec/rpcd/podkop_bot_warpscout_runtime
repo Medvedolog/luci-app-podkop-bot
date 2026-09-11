@@ -1,0 +1,155 @@
+#!/bin/sh
+# rpcd exec plugin for ephemeral WARPSCOUT SOCKS runtime and Telegram API probe.
+# WARPSCOUT owns tunnel setup/validation; this wrapper only starts/stops the
+# upstream test SOCKS process and checks whether api.telegram.org is usable
+# through that concrete route.
+
+BIN="/usr/bin/warpscout"
+STATE_DIR="/tmp/podkop_bot"
+PERSIST_DIR="/etc/podkop_bot"
+CONFIG_FILE="$PERSIST_DIR/warpscout.conf"
+ACCOUNT_FILE="$PERSIST_DIR/warpscout-account.json"
+PID_FILE="$STATE_DIR/warpscout_socks.pid"
+LOG_FILE="$STATE_DIR/warpscout_socks.log"
+STATE_FILE="$STATE_DIR/warpscout_socks.state"
+TG_STATE_FILE="$STATE_DIR/warpscout_telegram.state"
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '; }
+json_str() { printf '"%s"' "$(json_escape "$1")"; }
+cfg_get() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | head -n1; }
+valid_endpoint() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$'; }
+
+pid_value() {
+	[ -s "$PID_FILE" ] || return 1
+	_p=$(cat "$PID_FILE" 2>/dev/null)
+	case "$_p" in ''|*[!0-9]*) return 1;; esac
+	printf '%s' "$_p"
+}
+is_running() { _p=$(pid_value) || return 1; kill -0 "$_p" 2>/dev/null; }
+
+runtime_json() {
+	_ep=$(cfg_get active_endpoint); _proto=$(cfg_get protocol); [ -n "$_proto" ] || _proto=awg
+	_port=$(cfg_get socks_port); case "$_port" in ''|*[!0-9]*) _port=18191;; esac
+	_running=false; _pid=0
+	if is_running; then _running=true; _pid=$(pid_value); else rm -f "$PID_FILE" 2>/dev/null; fi
+	_state=$(cat "$STATE_FILE" 2>/dev/null | head -n1); [ -n "$_state" ] || _state=stopped
+	_tg_status=""; _tg_http=""; _tg_ms=""; _tg_checked=""
+	if [ -s "$TG_STATE_FILE" ]; then
+		_tg_status=$(sed -n 's/^status=//p' "$TG_STATE_FILE" | head -n1)
+		_tg_http=$(sed -n 's/^http=//p' "$TG_STATE_FILE" | head -n1)
+		_tg_ms=$(sed -n 's/^latency_ms=//p' "$TG_STATE_FILE" | head -n1)
+		_tg_checked=$(sed -n 's/^checked_at=//p' "$TG_STATE_FILE" | head -n1)
+	fi
+	printf '{"ok":true,"running":%s,"state":%s,"pid":%s,"endpoint":%s,"protocol":%s,"listen":"127.0.0.1","port":%s,"proxy":%s,"telegram":{"status":%s,"http":%s,"latency_ms":%s,"checked_at":%s}}\n' \
+		"$_running" "$(json_str "$_state")" "$_pid" "$(json_str "$_ep")" "$(json_str "$_proto")" "$_port" "$(json_str "socks5h://127.0.0.1:$_port")" \
+		"$(json_str "$_tg_status")" "$(json_str "$_tg_http")" "$(json_str "$_tg_ms")" "$(json_str "$_tg_checked")"
+}
+
+method_status() { read -r _in 2>/dev/null; runtime_json; }
+
+method_start() {
+	read -r _in 2>/dev/null
+	[ -x "$BIN" ] || { printf '{"ok":false,"reason":"not_installed"}\n'; return; }
+	[ -s "$ACCOUNT_FILE" ] || { printf '{"ok":false,"reason":"account_missing"}\n'; return; }
+	_ep=$(cfg_get active_endpoint); valid_endpoint "$_ep" || { printf '{"ok":false,"reason":"no_active_endpoint"}\n'; return; }
+	_proto=$(cfg_get protocol); case "$_proto" in wg|awg|masque|masque-h2) :;; *) _proto=awg;; esac
+	_port=$(cfg_get socks_port); case "$_port" in ''|*[!0-9]*) _port=18191;; esac
+	[ "$_port" -ge 1024 ] 2>/dev/null && [ "$_port" -le 65535 ] 2>/dev/null || { printf '{"ok":false,"reason":"bad_port"}\n'; return; }
+	if is_running; then printf '{"ok":true,"already_running":true}\n'; return; fi
+
+	: > "$LOG_FILE"
+	printf 'starting\n' > "$STATE_FILE"
+	(
+		exec "$BIN" socks -a "$ACCOUNT_FILE" -e "$_ep" -p "$_proto" -l 127.0.0.1 -P "$_port"
+	) >> "$LOG_FILE" 2>&1 &
+	_pid=$!
+	printf '%s\n' "$_pid" > "$PID_FILE"
+
+	# Upstream `socks` exits on initial tunnel setup failure. We only wait long
+	# enough to distinguish that startup failure from a live test proxy; no
+	# independent WARP health engine is layered on top of WARPSCOUT.
+	sleep 3
+	if kill -0 "$_pid" 2>/dev/null; then
+		printf 'running\n' > "$STATE_FILE"
+		printf '{"ok":true,"running":true,"pid":%s,"endpoint":%s,"port":%s}\n' "$_pid" "$(json_str "$_ep")" "$_port"
+	else
+		wait "$_pid" 2>/dev/null; _rc=$?
+		rm -f "$PID_FILE"
+		printf 'failed %s\n' "$_rc" > "$STATE_FILE"
+		printf '{"ok":false,"reason":"socks_start_failed","exit_code":%s}\n' "$_rc"
+	fi
+}
+
+method_stop() {
+	read -r _in 2>/dev/null
+	if _pid=$(pid_value); then
+		kill "$_pid" 2>/dev/null || true
+		_i=0; while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 20 ]; do sleep 0.1; _i=$((_i+1)); done
+		kill -9 "$_pid" 2>/dev/null || true
+	fi
+	rm -f "$PID_FILE"
+	printf 'stopped\n' > "$STATE_FILE"
+	printf '{"ok":true,"running":false}\n'
+}
+
+method_log() {
+	read -r _in 2>/dev/null
+	_off=$(printf '%s' "$_in" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p'); [ -n "$_off" ] || _off=0
+	_size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' '); [ -n "$_size" ] || _size=0
+	[ "$_off" -le "$_size" ] 2>/dev/null || _off=0
+	_chunk=""; [ "$_size" -gt "$_off" ] 2>/dev/null && _chunk=$(tail -c +$((_off+1)) "$LOG_FILE" 2>/dev/null | head -c 32768)
+	_new=$((_off+${#_chunk}))
+	printf '{"ok":true,"chunk":%s,"offset":%s}\n' "$(json_str "$_chunk")" "$_new"
+}
+
+method_telegram_test() {
+	read -r _in 2>/dev/null
+	is_running || { printf '{"ok":false,"reason":"socks_not_running","status":"NETWORK_FAIL"}\n'; return; }
+	_port=$(cfg_get socks_port); case "$_port" in ''|*[!0-9]*) _port=18191;; esac
+	_token=$(uci -q get podkop_bot.settings.bot_token 2>/dev/null)
+	[ -n "$_token" ] || { printf '{"ok":false,"reason":"bot_token_missing","status":"AUTH_ERROR"}\n'; return; }
+	command -v curl >/dev/null 2>&1 || { printf '{"ok":false,"reason":"curl_missing","status":"NETWORK_FAIL"}\n'; return; }
+
+	_body="$STATE_DIR/warpscout_telegram_body.$$"
+	_t0=$(date +%s 2>/dev/null || echo 0)
+	_http=$(curl -sS -o "$_body" -w '%{http_code}' -x "socks5h://127.0.0.1:$_port" --connect-timeout 5 --max-time 12 "https://api.telegram.org/bot${_token}/getMe" 2>/dev/null)
+	_rc=$?
+	_t1=$(date +%s 2>/dev/null || echo 0); _ms=$(( (_t1-_t0) * 1000 ))
+	_status="OTHER_API_RESPONSE"; _reachable=true; _verified=false
+	if [ "$_rc" -ne 0 ] || [ -z "$_http" ] || [ "$_http" = 000 ]; then
+		_status="NETWORK_FAIL"; _reachable=false; _http=000
+	elif [ "$_http" = 200 ] && jq -e '.ok == true' "$_body" >/dev/null 2>&1; then
+		_status="OK"; _verified=true
+	elif [ "$_http" = 429 ]; then
+		_status="RATE_LIMITED"
+	elif [ "$_http" = 401 ]; then
+		_status="AUTH_ERROR"
+	elif [ "$_http" = 403 ]; then
+		_status="API_DENIED"
+	fi
+	rm -f "$_body" 2>/dev/null
+	_now=$(date +%s 2>/dev/null || echo 0)
+	{
+		printf 'status=%s\n' "$_status"
+		printf 'http=%s\n' "$_http"
+		printf 'latency_ms=%s\n' "$_ms"
+		printf 'checked_at=%s\n' "$_now"
+	} > "$TG_STATE_FILE"
+	printf '{"ok":true,"status":%s,"telegram_reached":%s,"verified_bot_api":%s,"http":%s,"latency_ms":%s,"checked_at":%s}\n' \
+		"$(json_str "$_status")" "$_reachable" "$_verified" "$(json_str "$_http")" "$_ms" "$_now"
+}
+
+case "$1" in
+	list)
+		echo '{ "status": {}, "start": {}, "stop": {}, "log": { "offset": 0 }, "telegram_test": {} }'
+		;;
+	call)
+		case "$2" in
+			status) method_status;; start) method_start;; stop) method_stop;; log) method_log;; telegram_test) method_telegram_test;;
+			*) echo '{"error":"unknown method"}'; exit 1;;
+		esac
+		;;
+	*) echo '{"error":"unknown command"}'; exit 1;;
+esac

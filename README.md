@@ -93,20 +93,21 @@ rpcd вызывает `install.sh` для операций со службой �
 
 ## Установка
 
-### opkg (OpenWrt до 24.10 включительно)
+Готовые пакеты публикуются в [GitHub Releases](../../releases). Ниже команды сами определяют **актуальный Latest release**, находят нужный asset, скачивают его во `/tmp` и устанавливают — вручную копировать файл на роутер не нужно. Используется штатный `jsonfilter`, который входит в OpenWrt.
+
+### OpenWrt 24.10 и старее — opkg, одной командой
 
 ```sh
-opkg update
-opkg install luci-app-podkop-bot_<версия>-r1_all.ipk
+U="$(wget -qO- https://api.github.com/repos/Medvedolog/luci-app-podkop-bot/releases/latest | jsonfilter -e '@.assets[*].browser_download_url' | grep '_all\.ipk$' | head -n1)"; [ -n "$U" ] && wget -O /tmp/luci-app-podkop-bot.ipk "$U" && opkg install /tmp/luci-app-podkop-bot.ipk
 ```
 
-### apk (OpenWrt 25.12 и новее)
+### OpenWrt 25.12 и новее — apk, одной командой
 
 ```sh
-apk add --allow-untrusted luci-app-podkop-bot-<версия>-r1.apk
+U="$(wget -qO- https://api.github.com/repos/Medvedolog/luci-app-podkop-bot/releases/latest | jsonfilter -e '@.assets[*].browser_download_url' | grep '\.apk$' | head -n1)"; [ -n "$U" ] && wget -O /tmp/luci-app-podkop-bot.apk "$U" && apk add --allow-untrusted /tmp/luci-app-podkop-bot.apk
 ```
 
-Готовые пакеты — на странице [Releases](../../releases). После установки очистите кэш LuCI (приложение делает это в postinst автоматически) и при необходимости обновите страницу.
+Для локального APK из GitHub Releases правильный флаг — `--allow-untrusted`, не `--unrestricted`: до настройки доверенного feed-индекса одиночный APK не имеет доверенной индексной подписи. После установки через пакет очищается кэш LuCI; при необходимости обновите страницу.
 
 ### Зависимости
 

@@ -2,7 +2,7 @@
 
 Этот репозиторий собирает два нативных для OpenWrt формата из одного staged tree:
 
-- OpenWrt 25.12+ — APKv3/ADB (`dist/noarch/*.apk`);
+- OpenWrt 25.12+ — APKv3 (`dist/noarch/*.apk`);
 - OpenWrt 24.10 — IPK (`dist/all/*.ipk`).
 
 `owfeed` заменяет nFPM. Версия релиза берётся из git tag, нормализуется для пакетного менеджера в `X.Y.Z-rN`, а содержимое пакета формируется из `root/` и `scripts/` через `tools/stage.sh`.
@@ -44,6 +44,12 @@ sources -> build -> verify -> release
 В build/verify jobs секретных ключей нет. Они доступны только release job.
 
 ## Создание релиза
+
+### Один раз: bootstrap подписей для owfeed
+
+Перед первым **owfeed-совместимым** релизом на доверенной машине выполните `./tools/setup-keys.sh`. Он создаёт постоянную EC prime256v1 пару для подписи APK и постоянную usign-пару для `manifest.txt`, загружает приватные ключи в GitHub Actions Secrets (`PODKOP_BOT_SIGN_KEY`, `PODKOP_BOT_USIGN_KEY`) и оставляет в `keys/` только публичные половины. Публичные файлы необходимо закоммитить до создания release tag.
+
+Community owfeed принимает upstream-артефакт по подписанному manifest и закреплённому публичному ключу. Release pipeline проверяет наличие публичных ключей до вызова reusable workflow; сам owfeed отдельно откажется публиковать релиз, если приватные secrets отсутствуют.
 
 Перед тегом убедитесь, что `version.txt`, `PKG_VERSION` в `Makefile` и `LUCI_APP_VERSION` в rpcd содержат одну базовую версию.
 

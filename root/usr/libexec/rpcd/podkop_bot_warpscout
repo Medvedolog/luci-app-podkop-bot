@@ -145,10 +145,16 @@ method_run() {
 log_json() {
 	_log="$1"; _statef="$2"; _off="$3"; [ -n "$_off" ] || _off=0
 	_size=$(wc -c < "$_log" 2>/dev/null | tr -d ' '); [ -n "$_size" ] || _size=0; [ "$_off" -le "$_size" ] 2>/dev/null || _off=0
-	_chunk=""; [ "$_size" -gt "$_off" ] 2>/dev/null && _chunk=$(tail -c +$((_off + 1)) "$_log" 2>/dev/null | head -c 32768)
-	_new=$((_off + ${#_chunk})); _state=$(cat "$_statef" 2>/dev/null | head -n1); _done=false; _rc=-1
+	_bytes=$((_size-_off)); [ "$_bytes" -gt 32768 ] 2>/dev/null && _bytes=32768
+	if [ "$_bytes" -gt 0 ] 2>/dev/null; then
+		_chunk_json=$(tail -c +$((_off+1)) "$_log" 2>/dev/null | head -c "$_bytes" | jq -Rs . 2>/dev/null)
+		[ -n "$_chunk_json" ] || _chunk_json='""'
+	else
+		_chunk_json='""'
+	fi
+	_new=$((_off+_bytes)); _state=$(cat "$_statef" 2>/dev/null | head -n1); _done=false; _rc=-1
 	case "$_state" in done\ *) _done=true; _rc=${_state#done };; error\ *) _done=true; _rc=${_state#error };; esac
-	printf '{"ok":true,"chunk":%s,"offset":%s,"done":%s,"exit_code":%s}\n' "$(json_str "$_chunk")" "$_new" "$_done" "$_rc"
+	printf '{"ok":true,"chunk":%s,"offset":%s,"done":%s,"exit_code":%s}\n' "$_chunk_json" "$_new" "$_done" "$_rc"
 }
 method_log() { read -r _input 2>/dev/null; _off=$(printf '%s' "$_input" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p'); log_json "$UPDATE_LOG" "$UPDATE_STATE" "$_off"; }
 method_action_log() { read -r _input 2>/dev/null; _off=$(printf '%s' "$_input" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p'); log_json "$ACTION_LOG" "$ACTION_STATE" "$_off"; }

@@ -31,7 +31,7 @@ packages:
     version-from: file:./dist/VERSION
     files: ./dist/root
 
-    description: "LuCI web interface for installing, configuring and diagnosing the podkop_bot Telegram management service on OpenWrt."
+    description: "LuCI web interface for installation, configuration and diagnostics of the podkop_bot Telegram management service for Podkop and compatible forks on OpenWrt."
     depends: [libc, luci-base, jq, curl]
     license: GPL-2.0-or-later
     url: https://github.com/Medvedolog/luci-app-podkop-bot

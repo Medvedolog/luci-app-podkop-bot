@@ -17,7 +17,7 @@
 		"action": { "type": "firstchild" }
 	},
 	"admin/services/podkop-bot/transport/main": {
-		"title": "Транспорт", "order": 5,
+		"title": "Proxy Pool", "order": 5,
 		"action": { "type": "view", "path": "podkop-bot/transport" }
 	},
 	"admin/services/podkop-bot/transport/warpscout": {

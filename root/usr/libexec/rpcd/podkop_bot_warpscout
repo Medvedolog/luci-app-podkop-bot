@@ -1,23 +1,67 @@
 #!/bin/sh
-# rpcd exec plugin for WARPSCOUT installation/update lifecycle.
-# Deliberately limited to the Update page: detection, version check, manual
-# install/update through the official upstream installer, and temporary logs.
+# rpcd exec plugin for WARPSCOUT management.
+# WARPSCOUT owns WARP discovery/validation/ranking; LuCI only orchestrates it,
+# parses its report, stores selected state and exposes manual operations.
 
 BIN="/usr/bin/warpscout"
 STATE_DIR="/tmp/podkop_bot"
-LOG_FILE="$STATE_DIR/warpscout_update.log"
-STATE_FILE="$STATE_DIR/warpscout_update.state"
-PID_FILE="$STATE_DIR/warpscout_update.pid"
+PERSIST_DIR="/etc/podkop_bot"
+CONFIG_FILE="$PERSIST_DIR/warpscout.conf"
+ACCOUNT_FILE="$PERSIST_DIR/warpscout-account.json"
+SHORTLIST_FILE="$PERSIST_DIR/warpscout-shortlist.tsv"
+UPLOAD_ACCOUNT="/tmp/warpscout-account-upload.json"
+REPORT_FILE="$STATE_DIR/warpscout-report.txt"
+
+UPDATE_LOG="$STATE_DIR/warpscout_update.log"
+UPDATE_STATE="$STATE_DIR/warpscout_update.state"
+UPDATE_PID="$STATE_DIR/warpscout_update.pid"
 INSTALLER_TMP="$STATE_DIR/warpscout-install.sh"
 INSTALLER_URL="https://raw.githubusercontent.com/vernette/warpscout/master/install.sh"
 RELEASE_API="https://api.github.com/repos/vernette/warpscout/releases/latest"
 RELEASES_URL="https://github.com/vernette/warpscout/releases"
 
-mkdir -p "$STATE_DIR" 2>/dev/null
+ACTION_LOG="$STATE_DIR/warpscout_action.log"
+ACTION_STATE="$STATE_DIR/warpscout_action.state"
+ACTION_PID="$STATE_DIR/warpscout_action.pid"
+
+mkdir -p "$STATE_DIR" "$PERSIST_DIR" 2>/dev/null
+chmod 700 "$PERSIST_DIR" 2>/dev/null
 
 json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '
 }
+json_str() { printf '"%s"' "$(json_escape "$1")"; }
+
+cfg_get() {
+	_key="$1"
+	[ -f "$CONFIG_FILE" ] || return 0
+	sed -n "s/^${_key}=//p" "$CONFIG_FILE" | head -n1
+}
+cfg_defaults() {
+	[ -f "$CONFIG_FILE" ] && return 0
+	cat > "$CONFIG_FILE" <<'EOF'
+enabled=0
+policy=manual
+protocol=awg
+socks_port=18191
+node=
+country=
+exclude_node=
+exclude_country=
+active_endpoint=
+EOF
+	chmod 600 "$CONFIG_FILE" 2>/dev/null
+}
+cfg_write() {
+	_key="$1"; _val="$2"
+	cfg_defaults
+	_tmp="$STATE_DIR/warpscout.conf.$$"
+	awk -F= -v k="$_key" -v v="$_val" 'BEGIN{done=0} $1==k{print k"="v;done=1;next}{print} END{if(!done)print k"="v}' "$CONFIG_FILE" > "$_tmp" || return 1
+	mv "$_tmp" "$CONFIG_FILE" || return 1
+	chmod 600 "$CONFIG_FILE" 2>/dev/null
+}
+valid_filter() { case "$1" in *[!A-Za-z0-9,_-]*) return 1;; esac; return 0; }
+valid_endpoint() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$'; }
 
 installed_version() {
 	[ -x "$BIN" ] || return 1
@@ -25,32 +69,19 @@ installed_version() {
 	[ -n "$_v" ] || return 1
 	printf '%s' "$_v"
 }
-
 fetch_stdout() {
 	_url="$1"
-	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL --connect-timeout 8 --max-time 20 "$_url" 2>/dev/null && return 0
-	fi
-	if command -v wget >/dev/null 2>&1; then
-		wget -qO- -T 20 "$_url" 2>/dev/null && return 0
-	fi
+	if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 8 --max-time 20 "$_url" 2>/dev/null && return 0; fi
+	if command -v wget >/dev/null 2>&1; then wget -qO- -T 20 "$_url" 2>/dev/null && return 0; fi
 	return 1
 }
-
-fetch_file() {
-	_url="$1"; _dst="$2"
+fetch_file_url() {
+	_url="$1"; _dst="$2"; rm -f "$_dst" 2>/dev/null
+	if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 8 --max-time 30 -o "$_dst" "$_url" 2>/dev/null && [ -s "$_dst" ] && return 0; fi
 	rm -f "$_dst" 2>/dev/null
-	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL --connect-timeout 8 --max-time 30 -o "$_dst" "$_url" 2>/dev/null && [ -s "$_dst" ] && return 0
-	fi
-	rm -f "$_dst" 2>/dev/null
-	if command -v wget >/dev/null 2>&1; then
-		wget -q -T 30 -O "$_dst" "$_url" 2>/dev/null && [ -s "$_dst" ] && return 0
-	fi
-	rm -f "$_dst" 2>/dev/null
-	return 1
+	if command -v wget >/dev/null 2>&1; then wget -q -T 30 -O "$_dst" "$_url" 2>/dev/null && [ -s "$_dst" ] && return 0; fi
+	rm -f "$_dst" 2>/dev/null; return 1
 }
-
 latest_version() {
 	_j=$(fetch_stdout "$RELEASE_API") || return 1
 	_t=$(printf '%s' "$_j" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
@@ -58,112 +89,167 @@ latest_version() {
 	printf '%s' "${_t#v}"
 }
 
+shortlist_count() { [ -s "$SHORTLIST_FILE" ] && grep -c '^[0-9]' "$SHORTLIST_FILE" 2>/dev/null || echo 0; }
+shortlist_json() {
+	printf '['; _first=1
+	[ -s "$SHORTLIST_FILE" ] && while IFS='|' read -r ep epping tunping loss seen node location checked; do
+		[ -n "$ep" ] || continue
+		[ "$_first" = 1 ] || printf ','
+		_first=0
+		printf '{"endpoint":%s,"endpoint_ping":%s,"tunnel_ping":%s,"loss":%s,"seen_as":%s,"node":%s,"node_location":%s,"checked_at":%s}' \
+			"$(json_str "$ep")" "$(json_str "$epping")" "$(json_str "$tunping")" "$(json_str "$loss")" "$(json_str "$seen")" "$(json_str "$node")" "$(json_str "$location")" "$(json_str "$checked")"
+	done
+	printf ']'
+}
+
 method_status() {
-	read -r _input 2>/dev/null
+	read -r _input 2>/dev/null; cfg_defaults
 	_cur=""; _latest=""; _installed=false
 	if _cur=$(installed_version); then _installed=true; fi
 	_latest=$(latest_version 2>/dev/null || true)
-	_upd=false
-	if [ -n "$_cur" ] && [ -n "$_latest" ] && [ "$_cur" != "$_latest" ]; then _upd=true; fi
-	printf '{"ok":true,"installed":%s,"current":"%s","latest":"%s","update_available":%s,"releases_url":"%s"}\n' \
-		"$_installed" "$(json_escape "$_cur")" "$(json_escape "$_latest")" "$_upd" "$RELEASES_URL"
+	_upd=false; [ -n "$_cur" ] && [ -n "$_latest" ] && [ "$_cur" != "$_latest" ] && _upd=true
+	_account=false; [ -s "$ACCOUNT_FILE" ] && jq -e 'type=="object"' "$ACCOUNT_FILE" >/dev/null 2>&1 && _account=true
+	printf '{"ok":true,"installed":%s,"current":%s,"latest":%s,"update_available":%s,"releases_url":%s,"account_ready":%s,"config":{"enabled":%s,"policy":%s,"protocol":%s,"socks_port":%s,"node":%s,"country":%s,"exclude_node":%s,"exclude_country":%s,"active_endpoint":%s},"shortlist_count":%s}\n' \
+		"$_installed" "$(json_str "$_cur")" "$(json_str "$_latest")" "$_upd" "$(json_str "$RELEASES_URL")" "$_account" \
+		"$( [ "$(cfg_get enabled)" = 1 ] && echo true || echo false )" "$(json_str "$(cfg_get policy)")" "$(json_str "$(cfg_get protocol)")" "$(cfg_get socks_port)" \
+		"$(json_str "$(cfg_get node)")" "$(json_str "$(cfg_get country)")" "$(json_str "$(cfg_get exclude_node)")" "$(json_str "$(cfg_get exclude_country)")" "$(json_str "$(cfg_get active_endpoint)")" "$(shortlist_count)"
 }
 
-is_running() {
-	[ -s "$PID_FILE" ] || return 1
-	_pid=$(cat "$PID_FILE" 2>/dev/null)
-	case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
-	kill -0 "$_pid" 2>/dev/null
-}
+pid_alive() { _pf="$1"; [ -s "$_pf" ] || return 1; _p=$(cat "$_pf" 2>/dev/null); case "$_p" in ''|*[!0-9]*) return 1;; esac; kill -0 "$_p" 2>/dev/null; }
 
-run_install_worker() {
+run_update_worker() {
 	{
 		echo "[warpscout] downloading official installer"
-		if ! fetch_file "$INSTALLER_URL" "$INSTALLER_TMP"; then
-			echo "[warpscout][error] installer download failed"
-			echo "[warpscout-update-exit] 20"
-			printf 'error 20\n' > "$STATE_FILE"
-			rm -f "$PID_FILE" "$INSTALLER_TMP" 2>/dev/null
-			return
-		fi
-		if ! head -n1 "$INSTALLER_TMP" 2>/dev/null | grep -q '^#!'; then
-			echo "[warpscout][error] downloaded installer has no shebang"
-			echo "[warpscout-update-exit] 21"
-			printf 'error 21\n' > "$STATE_FILE"
-			rm -f "$PID_FILE" "$INSTALLER_TMP" 2>/dev/null
-			return
-		fi
+		if ! fetch_file_url "$INSTALLER_URL" "$INSTALLER_TMP"; then echo "[warpscout][error] installer download failed"; echo "[warpscout-update-exit] 20"; printf 'error 20\n' > "$UPDATE_STATE"; rm -f "$UPDATE_PID" "$INSTALLER_TMP"; return; fi
+		if ! head -n1 "$INSTALLER_TMP" 2>/dev/null | grep -q '^#!'; then echo "[warpscout][error] downloaded installer has no shebang"; echo "[warpscout-update-exit] 21"; printf 'error 21\n' > "$UPDATE_STATE"; rm -f "$UPDATE_PID" "$INSTALLER_TMP"; return; fi
 		echo "[warpscout] running upstream install.sh"
-		/bin/sh "$INSTALLER_TMP"
-		_rc=$?
-		rm -f "$INSTALLER_TMP" 2>/dev/null
-		if [ "$_rc" -ne 0 ]; then
-			echo "[warpscout][error] upstream installer exited $_rc"
-			echo "[warpscout-update-exit] $_rc"
-			printf 'error %s\n' "$_rc" > "$STATE_FILE"
-			rm -f "$PID_FILE" 2>/dev/null
-			return
-		fi
+		/bin/sh "$INSTALLER_TMP"; _rc=$?; rm -f "$INSTALLER_TMP"
+		if [ "$_rc" -ne 0 ]; then echo "[warpscout][error] upstream installer exited $_rc"; echo "[warpscout-update-exit] $_rc"; printf 'error %s\n' "$_rc" > "$UPDATE_STATE"; rm -f "$UPDATE_PID"; return; fi
 		_v=$(installed_version 2>/dev/null || true)
-		if [ -z "$_v" ]; then
-			echo "[warpscout][error] /usr/bin/warpscout missing or version check failed after install"
-			echo "[warpscout-update-exit] 22"
-			printf 'error 22\n' > "$STATE_FILE"
-			rm -f "$PID_FILE" 2>/dev/null
-			return
-		fi
-		echo "[warpscout] installed version $_v"
-		echo "[warpscout-update-exit] 0"
-		printf 'done 0\n' > "$STATE_FILE"
-		rm -f "$PID_FILE" 2>/dev/null
-	} >> "$LOG_FILE" 2>&1
+		if [ -z "$_v" ]; then echo "[warpscout][error] binary/version check failed after install"; echo "[warpscout-update-exit] 22"; printf 'error 22\n' > "$UPDATE_STATE"; rm -f "$UPDATE_PID"; return; fi
+		echo "[warpscout] installed version $_v"; echo "[warpscout-update-exit] 0"; printf 'done 0\n' > "$UPDATE_STATE"; rm -f "$UPDATE_PID"
+	} >> "$UPDATE_LOG" 2>&1
 }
-
 method_run() {
-	if is_running; then
-		printf '{"ok":false,"reason":"already_running"}\n'
-		return
-	fi
-	: > "$LOG_FILE"
-	printf 'running\n' > "$STATE_FILE"
-	run_install_worker &
-	_pid=$!
-	printf '%s\n' "$_pid" > "$PID_FILE"
-	printf '{"ok":true,"pid":%s}\n' "$_pid"
+	pid_alive "$UPDATE_PID" && { printf '{"ok":false,"reason":"already_running"}\n'; return; }
+	: > "$UPDATE_LOG"; printf 'running\n' > "$UPDATE_STATE"; run_update_worker & _pid=$!; printf '%s\n' "$_pid" > "$UPDATE_PID"; printf '{"ok":true,"pid":%s}\n' "$_pid"
 }
 
-method_log() {
-	read -r _input 2>/dev/null
-	_off=$(printf '%s' "$_input" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p')
-	[ -n "$_off" ] || _off=0
-	_size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' '); [ -n "$_size" ] || _size=0
-	[ "$_off" -le "$_size" ] 2>/dev/null || _off=0
-	_chunk=""
-	if [ "$_size" -gt "$_off" ] 2>/dev/null; then
-		_chunk=$(tail -c +$((_off + 1)) "$LOG_FILE" 2>/dev/null | head -c 32768)
-	fi
-	_new=$((_off + ${#_chunk}))
-	_state=$(cat "$STATE_FILE" 2>/dev/null | head -n1)
-	_done=false; _rc=-1
-	case "$_state" in
-		done\ *) _done=true; _rc=${_state#done } ;;
-		error\ *) _done=true; _rc=${_state#error } ;;
-	esac
-	printf '{"ok":true,"chunk":"%s","offset":%s,"done":%s,"exit_code":%s}\n' \
-		"$(json_escape "$_chunk")" "$_new" "$_done" "$_rc"
+log_json() {
+	_log="$1"; _statef="$2"; _off="$3"; [ -n "$_off" ] || _off=0
+	_size=$(wc -c < "$_log" 2>/dev/null | tr -d ' '); [ -n "$_size" ] || _size=0; [ "$_off" -le "$_size" ] 2>/dev/null || _off=0
+	_chunk=""; [ "$_size" -gt "$_off" ] 2>/dev/null && _chunk=$(tail -c +$((_off + 1)) "$_log" 2>/dev/null | head -c 32768)
+	_new=$((_off + ${#_chunk})); _state=$(cat "$_statef" 2>/dev/null | head -n1); _done=false; _rc=-1
+	case "$_state" in done\ *) _done=true; _rc=${_state#done };; error\ *) _done=true; _rc=${_state#error };; esac
+	printf '{"ok":true,"chunk":%s,"offset":%s,"done":%s,"exit_code":%s}\n' "$(json_str "$_chunk")" "$_new" "$_done" "$_rc"
 }
+method_log() { read -r _input 2>/dev/null; _off=$(printf '%s' "$_input" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p'); log_json "$UPDATE_LOG" "$UPDATE_STATE" "$_off"; }
+method_action_log() { read -r _input 2>/dev/null; _off=$(printf '%s' "$_input" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p'); log_json "$ACTION_LOG" "$ACTION_STATE" "$_off"; }
+
+method_config_set() {
+	read -r _in 2>/dev/null
+	_key=$(printf '%s' "$_in" | jq -r '.key // ""' 2>/dev/null); _val=$(printf '%s' "$_in" | jq -r '.value // ""' 2>/dev/null)
+	case "$_key" in
+		enabled) case "$_val" in 0|1) :;; *) printf '{"ok":false,"reason":"bad_value"}\n'; return;; esac;;
+		policy) case "$_val" in manual|reserve|emergency) :;; *) printf '{"ok":false,"reason":"bad_value"}\n'; return;; esac;;
+		protocol) case "$_val" in wg|awg|masque|masque-h2) :;; *) printf '{"ok":false,"reason":"bad_value"}\n'; return;; esac;;
+		socks_port) case "$_val" in ''|*[!0-9]*) printf '{"ok":false,"reason":"bad_value"}\n'; return;; esac; [ "$_val" -ge 1024 ] 2>/dev/null && [ "$_val" -le 65535 ] 2>/dev/null || { printf '{"ok":false,"reason":"bad_value"}\n'; return; };;
+		node|country|exclude_node|exclude_country) valid_filter "$_val" || { printf '{"ok":false,"reason":"bad_value"}\n'; return; };;
+		active_endpoint) [ -z "$_val" ] || valid_endpoint "$_val" || { printf '{"ok":false,"reason":"bad_value"}\n'; return; };;
+		*) printf '{"ok":false,"reason":"bad_key"}\n'; return;;
+	esac
+	cfg_write "$_key" "$_val" || { printf '{"ok":false,"reason":"write_failed"}\n'; return; }
+	printf '{"ok":true}\n'
+}
+
+method_account_import() {
+	[ -s "$UPLOAD_ACCOUNT" ] || { printf '{"ok":false,"reason":"upload_missing"}\n'; return; }
+	if ! jq -e 'type=="object"' "$UPLOAD_ACCOUNT" >/dev/null 2>&1; then rm -f "$UPLOAD_ACCOUNT"; printf '{"ok":false,"reason":"invalid_json"}\n'; return; fi
+	cp "$UPLOAD_ACCOUNT" "$ACCOUNT_FILE" || { rm -f "$UPLOAD_ACCOUNT"; printf '{"ok":false,"reason":"write_failed"}\n'; return; }
+	chmod 600 "$ACCOUNT_FILE"; rm -f "$UPLOAD_ACCOUNT"; printf '{"ok":true}\n'
+}
+
+build_scan_args() {
+	_proto=$(cfg_get protocol); [ -n "$_proto" ] || _proto=awg
+	set -- -a "$ACCOUNT_FILE" -p "$_proto" -P -o "$REPORT_FILE"
+	_n=$(cfg_get node); [ -n "$_n" ] && set -- "$@" -node "$_n"
+	_c=$(cfg_get country); [ -n "$_c" ] && set -- "$@" -country "$_c"
+	_en=$(cfg_get exclude_node); [ -n "$_en" ] && set -- "$@" -exclude-node "$_en"
+	_ec=$(cfg_get exclude_country); [ -n "$_ec" ] && set -- "$@" -exclude-country "$_ec"
+	printf '%s\n' "$@"
+}
+
+parse_report() {
+	[ -s "$REPORT_FILE" ] || return 1
+	_now=$(date +%s 2>/dev/null || echo 0); _tmp="$STATE_DIR/warpscout-shortlist.$$"; : > "$_tmp"
+	# The upstream report is a fixed-column, script-friendly flat table. Take the
+	# first three working rows; they are already sorted by WARPSCOUT quality.
+	awk -v now="$_now" '
+		BEGIN{rows=0;inrows=0}
+		/^ENDPOINT[[:space:]]+ENDPOINT PING/{inrows=1;next}
+		/^#/ {if(inrows && rows>0) exit; next}
+		/^[[:space:]]*$/ {if(inrows && rows>0) exit; next}
+		inrows && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/ {
+			ep=$1; epp=$2; tun=$3; loss=$4; seen=$5; node=$6;
+			loc=""; for(i=7;i<=NF;i++){loc=loc (loc?" ":"") $i}
+			print ep "|" epp "|" tun "|" loss "|" seen "|" node "|" loc "|" now;
+			rows++; if(rows>=3) exit
+		}' "$REPORT_FILE" > "$_tmp"
+	[ -s "$_tmp" ] || { rm -f "$_tmp"; return 1; }
+	mv "$_tmp" "$SHORTLIST_FILE"; chmod 600 "$SHORTLIST_FILE"
+	_active=$(cfg_get active_endpoint); if [ -z "$_active" ] || ! grep -q "^${_active}|" "$SHORTLIST_FILE" 2>/dev/null; then _active=$(cut -d'|' -f1 "$SHORTLIST_FILE" | head -n1); cfg_write active_endpoint "$_active"; fi
+	return 0
+}
+
+run_action_worker() {
+	_act="$1"; _target="$2"
+	{
+		_rc=0
+		case "$_act" in
+			register)
+				echo "[warpscout] registering WARP account"
+				"$BIN" register -a "$ACCOUNT_FILE" || _rc=$?
+				[ "$_rc" -eq 0 ] && chmod 600 "$ACCOUNT_FILE" 2>/dev/null
+				;;
+			scan|target)
+				echo "[warpscout] starting ${_act}"
+				rm -f "$REPORT_FILE"
+				_proto=$(cfg_get protocol); [ -n "$_proto" ] || _proto=awg
+				set -- -a "$ACCOUNT_FILE" -p "$_proto" -P -o "$REPORT_FILE"
+				_n=$(cfg_get node); [ -n "$_n" ] && set -- "$@" -node "$_n"
+				_c=$(cfg_get country); [ -n "$_c" ] && set -- "$@" -country "$_c"
+				_en=$(cfg_get exclude_node); [ -n "$_en" ] && set -- "$@" -exclude-node "$_en"
+				_ec=$(cfg_get exclude_country); [ -n "$_ec" ] && set -- "$@" -exclude-country "$_ec"
+				[ "$_act" = target ] && set -- "$@" -target "${_target%:*}"
+				"$BIN" scan "$@" || _rc=$?
+				if [ "$_rc" -eq 0 ]; then parse_report || _rc=31; fi
+				;;
+			*) _rc=30;;
+		esac
+		if [ "$_rc" -eq 0 ]; then echo "[warpscout-action-exit] 0"; printf 'done 0\n' > "$ACTION_STATE"; else echo "[warpscout-action-exit] $_rc"; printf 'error %s\n' "$_rc" > "$ACTION_STATE"; fi
+		rm -f "$ACTION_PID"
+	} >> "$ACTION_LOG" 2>&1
+}
+method_action_run() {
+	read -r _in 2>/dev/null; _act=$(printf '%s' "$_in" | jq -r '.action // ""' 2>/dev/null); _target=$(printf '%s' "$_in" | jq -r '.target // ""' 2>/dev/null)
+	[ -x "$BIN" ] || { printf '{"ok":false,"reason":"not_installed"}\n'; return; }
+	pid_alive "$ACTION_PID" && { printf '{"ok":false,"reason":"already_running"}\n'; return; }
+	case "$_act" in register) :;; scan) [ -s "$ACCOUNT_FILE" ] || { printf '{"ok":false,"reason":"account_missing"}\n'; return; };; target) [ -n "$_target" ] || _target=$(cfg_get active_endpoint); valid_endpoint "$_target" || { printf '{"ok":false,"reason":"bad_target"}\n'; return; };; *) printf '{"ok":false,"reason":"bad_action"}\n'; return;; esac
+	: > "$ACTION_LOG"; printf 'running\n' > "$ACTION_STATE"; run_action_worker "$_act" "$_target" & _pid=$!; printf '%s\n' "$_pid" > "$ACTION_PID"; printf '{"ok":true,"pid":%s}\n' "$_pid"
+}
+
+method_shortlist() { printf '{"ok":true,"active":%s,"items":' "$(json_str "$(cfg_get active_endpoint)")"; shortlist_json; printf '}\n'; }
+method_select() { read -r _in 2>/dev/null; _ep=$(printf '%s' "$_in" | jq -r '.endpoint // ""' 2>/dev/null); valid_endpoint "$_ep" || { printf '{"ok":false,"reason":"bad_endpoint"}\n'; return; }; grep -q "^${_ep}|" "$SHORTLIST_FILE" 2>/dev/null || { printf '{"ok":false,"reason":"not_in_shortlist"}\n'; return; }; cfg_write active_endpoint "$_ep"; printf '{"ok":true}\n'; }
 
 case "$1" in
 	list)
-		echo '{ "status": { "force": "x" }, "run": {}, "log": { "offset": 0 } }'
+		echo '{ "status": { "force": "x" }, "run": {}, "log": { "offset": 0 }, "config_set": { "key":"x", "value":"x" }, "account_import": {}, "action_run": { "action":"x", "target":"x" }, "action_log": { "offset":0 }, "shortlist": {}, "select": { "endpoint":"x" } }'
 		;;
 	call)
 		case "$2" in
-			status) method_status ;;
-			run)    method_run ;;
-			log)    method_log ;;
-			*) echo '{"error":"unknown method"}'; exit 1 ;;
+			status) method_status;; run) method_run;; log) method_log;; config_set) method_config_set;; account_import) method_account_import;; action_run) method_action_run;; action_log) method_action_log;; shortlist) method_shortlist;; select) method_select;;
+			*) echo '{"error":"unknown method"}'; exit 1;;
 		esac
 		;;
-	*) echo '{"error":"unknown command"}'; exit 1 ;;
+	*) echo '{"error":"unknown command"}'; exit 1;;
 esac

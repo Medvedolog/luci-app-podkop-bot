@@ -67,9 +67,6 @@ method_start() {
 	_pid=$!
 	printf '%s\n' "$_pid" > "$PID_FILE"
 
-	# Upstream `socks` exits on initial tunnel setup failure. We only wait long
-	# enough to distinguish that startup failure from a live test proxy; no
-	# independent WARP health engine is layered on top of WARPSCOUT.
 	sleep 3
 	if kill -0 "$_pid" 2>/dev/null; then
 		printf 'running\n' > "$STATE_FILE"

@@ -1,0 +1,26 @@
+name: tmp-publish-0.19.17-tag
+on:
+  push:
+    branches: [release/0.19.17-tag]
+permissions:
+  contents: write
+jobs:
+  tag:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create release tag on main release commit
+        run: |
+          set -eu
+          target=913aa97c371d94d837e1b12f123f874e863eb32a
+          git fetch origin main --tags
+          test "$(git rev-parse origin/main)" = "$target"
+          if git rev-parse -q --verify refs/tags/0.19.17 >/dev/null; then
+            echo "tag 0.19.17 already exists"
+            exit 1
+          fi
+          git tag 0.19.17 "$target"
+          git push origin refs/tags/0.19.17

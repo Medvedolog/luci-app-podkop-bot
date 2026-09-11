@@ -14,6 +14,10 @@
 	},
 	"admin/services/podkop-bot/transport": {
 		"title": "Транспорт", "order": 20,
+		"action": { "type": "firstchild" }
+	},
+	"admin/services/podkop-bot/transport/main": {
+		"title": "Транспорт", "order": 5,
 		"action": { "type": "view", "path": "podkop-bot/transport" }
 	},
 	"admin/services/podkop-bot/transport/warpscout": {

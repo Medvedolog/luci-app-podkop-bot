@@ -19,7 +19,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '; }
 json_str() { printf '"%s"' "$(json_escape "$1")"; }
 cfg_get() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | head -n1; }
-valid_endpoint() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}$'; }
+valid_endpoint() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$'; }
 
 pid_value() {
 	[ -s "$PID_FILE" ] || return 1

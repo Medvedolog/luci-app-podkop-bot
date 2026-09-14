@@ -1,0 +1,56 @@
+#!/bin/sh
+# Short launcher for podkop_update_run. The existing backend performs potentially
+# long direct/proxy preflight and install.sh download before it returns. Run that
+# RPC server-side so LuCI can immediately switch to the existing log poller.
+BACKEND="/usr/libexec/rpcd/podkop_bot"
+STATE_DIR="/tmp/podkop_bot"
+PID_FILE="$STATE_DIR/podkop_update_launcher.pid"
+RESULT_FILE="$STATE_DIR/podkop_update_launcher.result"
+CORE_LOCK="/tmp/podkop_core_update.lock"
+CORE_LOG="/tmp/podkop_core_update.log"
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+pid_alive(){ [ -s "$PID_FILE" ] || return 1; p=$(cat "$PID_FILE" 2>/dev/null); case "$p" in ''|*[!0-9]*) return 1;; esac; kill -0 "$p" 2>/dev/null; }
+
+method_start(){
+  read -r _in 2>/dev/null
+  if pid_alive; then printf '{"ok":false,"reason":"already_running"}\n'; return; fi
+  rm -f "$PID_FILE" "$RESULT_FILE" 2>/dev/null
+  (
+    out=$(printf '{}\n' | "$BACKEND" call podkop_update_run 2>/dev/null)
+    printf '%s\n' "$out" > "$RESULT_FILE"
+    if printf '%s' "$out" | grep -q '"ok":false'; then
+      printf '[launcher] %s\n' "$out" >> "$CORE_LOG" 2>/dev/null
+    fi
+    rm -f "$PID_FILE" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  p=$!; printf '%s\n' "$p" > "$PID_FILE"
+  # Wait only for handoff to the existing core-update lock, never for network.
+  n=0
+  while [ "$n" -lt 20 ]; do
+    [ -d "$CORE_LOCK" ] && break
+    [ -s "$RESULT_FILE" ] && break
+    sleep 0.1
+    n=$((n+1))
+  done
+  if [ -s "$RESULT_FILE" ]; then
+    r=$(cat "$RESULT_FILE" 2>/dev/null)
+    if printf '%s' "$r" | grep -q '"ok":false'; then printf '%s\n' "$r"; return; fi
+  fi
+  printf '{"ok":true,"started":true,"launcher_pid":%s}\n' "$p"
+}
+
+method_status(){
+  read -r _in 2>/dev/null
+  running=false; pid=0
+  if pid_alive; then running=true; pid=$(cat "$PID_FILE" 2>/dev/null); fi
+  result='null'; [ -s "$RESULT_FILE" ] && result=$(cat "$RESULT_FILE" 2>/dev/null)
+  case "$result" in \{*\}) :;; *) result='null';; esac
+  printf '{"ok":true,"running":%s,"pid":%s,"result":%s}\n' "$running" "$pid" "$result"
+}
+
+case "$1" in
+  list) echo '{"start":{},"status":{}}' ;;
+  call) case "$2" in start) method_start;; status) method_status;; *) echo '{"error":"unknown method"}'; exit 1;; esac ;;
+  *) echo '{"error":"unknown command"}'; exit 1 ;;
+esac

@@ -1,0 +1,176 @@
+#!/bin/sh
+# Advisory Telegram Bot API route qualification.
+# Uses a dedicated transient WARP SOCKS port so the persistent Rescue SOCKS can
+# remain ON-AIR while shortlist candidates are qualified.
+
+BIN="/usr/bin/warpscout"
+STATE_DIR="/tmp/podkop_bot"
+PERSIST_DIR="/etc/podkop_bot"
+CONFIG_FILE="$PERSIST_DIR/warpscout.conf"
+ACCOUNT_FILE="$PERSIST_DIR/warpscout-account.json"
+SHORTLIST_FILE="$PERSIST_DIR/warpscout-shortlist.tsv"
+RUNTIME_PID_FILE="$STATE_DIR/warpscout_socks.pid"
+ACTION_PID_FILE="$STATE_DIR/warpscout_action.pid"
+SCAN_STATE="$STATE_DIR/warpscout_tgscan.state"
+SCAN_PID="$STATE_DIR/warpscout_tgscan.pid"
+SCAN_LOG="$STATE_DIR/warpscout_tgscan.log"
+SCAN_RESULTS="$STATE_DIR/warpscout_tgscan.results"
+SCAN_INPUT="$STATE_DIR/warpscout_tgscan.input"
+SCAN_PLAN="$STATE_DIR/warpscout_tgscan.plan"
+SCAN_SOCKS_PID="$STATE_DIR/warpscout_tgscan_socks.pid"
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+json_escape(){ printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '; }
+json_str(){ printf '"%s"' "$(json_escape "$1")"; }
+cfg_get(){ [ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | head -n1; }
+valid_endpoint(){ printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$'; }
+mask_proxy(){ printf '%s' "$1" | sed -E 's|(://[^:@/]+:)[^@/]*@|\1***@|'; }
+section_id(){ _s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_]+/_/g; s/^_+//; s/_+$//'); [ -n "$_s" ] || _s=route; printf 'section_%s' "$_s"; }
+pid_from_file(){ _f="$1"; [ -s "$_f" ] || return 1; _p=$(cat "$_f" 2>/dev/null); case "$_p" in ''|*[!0-9]*) return 1;; esac; printf '%s' "$_p"; }
+pid_alive_file(){ _p=$(pid_from_file "$1") || return 1; kill -0 "$_p" 2>/dev/null; }
+
+handoff_runtime(){
+	pid_alive_file "$RUNTIME_PID_FILE" || return 0
+	ubus call podkop_bot_warpscout_runtime stop '{}' >/dev/null 2>&1 || return 1
+	_n=0; while pid_alive_file "$RUNTIME_PID_FILE" && [ "$_n" -lt 3 ]; do sleep 1; _n=$((_n+1)); done
+	pid_alive_file "$RUNTIME_PID_FILE" && return 1
+	return 0
+}
+
+state_write(){
+	_state="$1"; _current="$2"; _total="$3"; _route="$4"; _phase="$5"; _valid="$6"; _reachable="$7"; _failed="$8"; _started="$9"
+	_route=$(mask_proxy "$_route"); _now=$(date +%s 2>/dev/null || echo 0); _tmp="$SCAN_STATE.$$"
+	{
+		printf 'state=%s\n' "$_state"; printf 'current=%s\n' "$_current"; printf 'total=%s\n' "$_total"; printf 'endpoint=%s\n' "$_route"; printf 'phase=%s\n' "$_phase"
+		printf 'passed=%s\n' "$_valid"; printf 'reachable=%s\n' "$_reachable"; printf 'failed=%s\n' "$_failed"; printf 'started_at=%s\n' "$_started"; printf 'updated_at=%s\n' "$_now"
+	} >"$_tmp" && mv "$_tmp" "$SCAN_STATE"
+}
+state_get(){ [ -s "$SCAN_STATE" ] && sed -n "s/^$1=//p" "$SCAN_STATE" | head -n1; }
+
+stop_scan_socks(){
+	if _p=$(pid_from_file "$SCAN_SOCKS_PID"); then
+		kill "$_p" 2>/dev/null || true; _i=0
+		while kill -0 "$_p" 2>/dev/null && [ "$_i" -lt 2 ]; do sleep 1; _i=$((_i+1)); done
+		kill -9 "$_p" 2>/dev/null || true
+	fi
+	rm -f "$SCAN_SOCKS_PID" 2>/dev/null
+}
+append_result(){ _line="$1"; _tmp="$SCAN_RESULTS.$$"; [ -s "$SCAN_RESULTS" ] && cat "$SCAN_RESULTS" >"$_tmp" || : >"$_tmp"; printf '%s\n' "$_line" >>"$_tmp" && mv "$_tmp" "$SCAN_RESULTS"; }
+
+probe_telegram(){
+	_proxy="$1"; _token="$2"; _body="$STATE_DIR/tgroute_body.$$"; _err="$STATE_DIR/tgroute_error.$$"
+	_meta=$(curl -sS -o "$_body" -w '%{http_code}|%{time_total}' --proxy "$_proxy" --connect-timeout 5 --max-time 12 "https://api.telegram.org/bot${_token}/getMe" 2>"$_err"); _rc=$?
+	_http=${_meta%%|*}; _secs=${_meta#*|}; _ms=$(awk -v t="$_secs" 'BEGIN{if(t+0>=0)printf "%d",(t*1000)+0.5;else print 0}' 2>/dev/null); case "$_ms" in ''|*[!0-9]*) _ms=0;; esac
+	_errtxt=$(head -c 240 "$_err" 2>/dev/null | tr '\n\r\t|' '    '); [ -n "$_token" ] && _errtxt=$(printf '%s' "$_errtxt" | sed "s/${_token}/<redacted>/g")
+	_status=FAIL; _reason="curl_error_${_rc}"
+	if [ "$_rc" -eq 28 ]; then _http=000; case "$_errtxt" in *[Cc]onnection\ timed\ out*) _reason=connect_timeout;; *) _reason=request_timeout;; esac
+	elif [ "$_rc" -ne 0 ] || [ -z "$_http" ] || [ "$_http" = 000 ]; then _http=000
+	elif [ "$_http" = 200 ] && jq -e '.ok == true' "$_body" >/dev/null 2>&1; then _status=VALID; _reason=ok
+	elif [ "$_http" = 429 ]; then _status=REACHABLE_RATE_LIMITED; _reason=http_429
+	elif [ "$_http" = 401 ]; then _status=REACHABLE_AUTH; _reason=http_401
+	elif [ "$_http" = 403 ]; then _status=REACHABLE_DENIED; _reason=http_403
+	else _reason="http_${_http}"
+	fi
+	rm -f "$_body" "$_err" 2>/dev/null
+	printf '%s|%s|%s|%s|%s\n' "$_status" "$_reason" "$_http" "$_ms" "$_errtxt"
+}
+
+build_input(){
+	_tmp="$SCAN_INPUT.$$"; : >"$_tmp"; _ts=$(ubus call podkop_bot transport_state '{}' 2>/dev/null)
+	_base_port=$(cfg_get socks_port); case "$_base_port" in ''|*[!0-9]*) _base_port=18191;; esac
+	if [ -n "$_ts" ]; then
+		_t1=$(printf '%s' "$_ts" | jq -r 'if (.tier1.mixed_proxy_enabled == true) then (.tier1.endpoint // "") else "" end' 2>/dev/null)
+		[ -n "$_t1" ] && printf 'proxy|tier1|Mixed Proxy|%s||||||\n' "$_t1" >>"$_tmp"
+	fi
+	_rs=$(ubus call podkop_bot runtime_sections '{}' 2>/dev/null)
+	if [ -n "$_rs" ]; then
+		_primary=$(printf '%s' "$_rs" | jq -r '.primary_section // ""' 2>/dev/null)
+		printf '%s' "$_rs" | jq -r --arg p "$_primary" '.sections[]? | select(.name != $p and .enabled_for_runtime == true and (.endpoint // "") != "") | [(.name // "route"), (.endpoint // "")] | @tsv' 2>/dev/null |
+		while IFS="	" read -r _name _ep; do [ -n "$_ep" ] || continue; _sid=$(section_id "$_name"); printf 'proxy|%s|Podkop section %s|%s||||||\n' "$_sid" "$_name" "$_ep"; done >>"$_tmp"
+	fi
+	if [ -n "$_ts" ]; then
+		_i=0
+		printf '%s' "$_ts" | jq -r '.tier2_fallback_socks[]? // empty' 2>/dev/null | while IFS= read -r _fb; do
+			[ -n "$_fb" ] || continue
+			case "$_fb" in *'#WARP-SCOUT'*|*"127.0.0.1:${_base_port}"*) continue;; esac
+			_i=$((_i+1)); printf 'proxy|tier2_%s|Reserve #%s|%s||||||\n' "$_i" "$_i" "$_fb"
+		done >>"$_tmp"
+		_t3=$(printf '%s' "$_ts" | jq -r '.tier3_custom_proxy // ""' 2>/dev/null); [ -n "$_t3" ] && printf 'proxy|tier3|Custom Proxy|%s||||||\n' "$_t3" >>"$_tmp"
+	fi
+	if [ -x "$BIN" ] && [ -s "$ACCOUNT_FILE" ] && [ -s "$SHORTLIST_FILE" ]; then
+		_i=0
+		while IFS='|' read -r _ep _epping _tunping _loss _seen _node _loc _checked; do valid_endpoint "$_ep" || continue; _i=$((_i+1)); printf 'warp|warpscout_%s|WARP #%s|%s|%s|%s|%s|%s|%s|%s\n' "$_i" "$_i" "$_ep" "$_epping" "$_tunping" "$_loss" "$_seen" "$_node" "$_loc" >>"$_tmp"; done <"$SHORTLIST_FILE"
+	fi
+	_count=$(wc -l <"$_tmp" 2>/dev/null | tr -d ' '); case "$_count" in ''|0|*[!0-9]*) rm -f "$_tmp"; return 1;; esac
+	mv "$_tmp" "$SCAN_INPUT" || { rm -f "$_tmp"; return 1; }; cp "$SCAN_INPUT" "$SCAN_PLAN" 2>/dev/null || true; printf '%s' "$_count"
+}
+
+worker_cancelled(){
+	stop_scan_socks; _cur=$(state_get current); _total=$(state_get total); _route=$(state_get endpoint); _valid=$(state_get passed); _reachable=$(state_get reachable); _failed=$(state_get failed); _started=$(state_get started_at)
+	state_write cancelled "${_cur:-0}" "${_total:-0}" "$_route" cancelled "${_valid:-0}" "${_reachable:-0}" "${_failed:-0}" "${_started:-0}"; echo '[tgroutes] cancelled'; rm -f "$SCAN_PID" "$SCAN_INPUT" 2>/dev/null; exit 143
+}
+
+run_worker(){
+	_total="$1"; _port="$2"; _proto="$3"; _token="$4"; _started="$5"; trap worker_cancelled TERM INT HUP
+	_valid=0; _reachable=0; _failed=0; _idx=0
+	while IFS='|' read -r _kind _source _label _target _epping _tunping _loss _seen _node _loc; do
+		[ -n "$_target" ] || continue; _idx=$((_idx+1)); _display=$(mask_proxy "$_target"); _proxy="$_target"
+		if [ "$_kind" = warp ]; then
+			state_write running "$_idx" "$_total" "$_label · $_target" tunnel_start "$_valid" "$_reachable" "$_failed" "$_started"; echo "[tgroutes] ${_idx}/${_total} $_source $_target: starting WARP SOCKS on $_port"
+			stop_scan_socks; ( exec "$BIN" socks -a "$ACCOUNT_FILE" -e "$_target" -p "$_proto" -l 127.0.0.1 -P "$_port" ) >>"$SCAN_LOG" 2>&1 &
+			_spid=$!; printf '%s\n' "$_spid" >"$SCAN_SOCKS_PID"; sleep 3
+			if ! kill -0 "$_spid" 2>/dev/null; then _now=$(date +%s 2>/dev/null || echo 0); append_result "$_kind|$_source|$_label|$_display|FAIL|socks_start_failed|000|0|$_now|$_epping|$_tunping|$_loss|$_seen|$_node|$_loc"; _failed=$((_failed+1)); stop_scan_socks; continue; fi
+			_proxy="socks5h://127.0.0.1:$_port"
+		else
+			state_write running "$_idx" "$_total" "$_label" telegram_test "$_valid" "$_reachable" "$_failed" "$_started"; echo "[tgroutes] ${_idx}/${_total} $_source: Telegram Bot API"
+		fi
+		state_write running "$_idx" "$_total" "$_label · $_display" telegram_test "$_valid" "$_reachable" "$_failed" "$_started"
+		_probe=$(probe_telegram "$_proxy" "$_token"); _status=$(printf '%s' "$_probe"|cut -d'|' -f1); _reason=$(printf '%s' "$_probe"|cut -d'|' -f2); _http=$(printf '%s' "$_probe"|cut -d'|' -f3); _ms=$(printf '%s' "$_probe"|cut -d'|' -f4); _detail=$(printf '%s' "$_probe"|cut -d'|' -f5-); _now=$(date +%s 2>/dev/null || echo 0)
+		append_result "$_kind|$_source|$_label|$_display|$_status|$_reason|$_http|$_ms|$_now|$_epping|$_tunping|$_loss|$_seen|$_node|$_loc"
+		case "$_status" in VALID) _valid=$((_valid+1));; REACHABLE_*) _reachable=$((_reachable+1));; *) _failed=$((_failed+1));; esac
+		echo "[tgroutes] $_source: $_status reason=$_reason http=$_http latency_ms=$_ms${_detail:+ detail=$_detail}"
+		[ "$_kind" = warp ] && { state_write running "$_idx" "$_total" "$_label · $_target" cleanup "$_valid" "$_reachable" "$_failed" "$_started"; stop_scan_socks; }
+	done <"$SCAN_INPUT"
+	stop_scan_socks; state_write done "$_total" "$_total" "" done "$_valid" "$_reachable" "$_failed" "$_started"; echo "[tgroutes] done: valid=$_valid reachable_nonvalid=$_reachable failed=$_failed total=$_total"; rm -f "$SCAN_PID" "$SCAN_INPUT" 2>/dev/null
+}
+
+method_telegram_scan_start(){
+	read -r _in 2>/dev/null
+	command -v curl >/dev/null 2>&1 || { printf '{"ok":false,"reason":"curl_missing"}\n'; return; }; command -v jq >/dev/null 2>&1 || { printf '{"ok":false,"reason":"jq_missing"}\n'; return; }; command -v ubus >/dev/null 2>&1 || { printf '{"ok":false,"reason":"ubus_missing"}\n'; return; }
+	pid_alive_file "$SCAN_PID" && { printf '{"ok":false,"reason":"already_running"}\n'; return; }; pid_alive_file "$ACTION_PID_FILE" && { printf '{"ok":false,"reason":"warpscout_action_running"}\n'; return; }
+	handoff_runtime || { printf '{"ok":false,"reason":"runtime_handoff_failed"}\n'; return; }
+	_token=$(uci -q get podkop_bot.settings.bot_token 2>/dev/null); [ -n "$_token" ] || { printf '{"ok":false,"reason":"bot_token_missing"}\n'; return; }
+	_base=$(cfg_get socks_port); case "$_base" in ''|*[!0-9]*) _base=18191;; esac; _port=$((_base+1)); [ "$_port" -le 65535 ] 2>/dev/null || _port=18192
+	_proto=$(cfg_get protocol); case "$_proto" in wg|awg|masque|masque-h2) :;; *) _proto=awg;; esac
+	_total=$(build_input) || { printf '{"ok":false,"reason":"no_routes"}\n'; return; }
+	: >"$SCAN_LOG"; : >"$SCAN_RESULTS"; _started=$(date +%s 2>/dev/null || echo 0); state_write running 0 "$_total" "" queued 0 0 0 "$_started"
+	run_worker "$_total" "$_port" "$_proto" "$_token" "$_started" >>"$SCAN_LOG" 2>&1 & _pid=$!; printf '%s\n' "$_pid" >"$SCAN_PID"
+	printf '{"ok":true,"pid":%s,"total":%s,"scan_port":%s}\n' "$_pid" "$_total" "$_port"
+}
+
+method_telegram_scan_status(){
+	read -r _in 2>/dev/null; _state=$(state_get state); [ -n "$_state" ] || _state=idle; _cur=$(state_get current); [ -n "$_cur" ] || _cur=0; _total=$(state_get total); [ -n "$_total" ] || _total=0; _route=$(state_get endpoint); _phase=$(state_get phase); _valid=$(state_get passed); [ -n "$_valid" ] || _valid=0; _reachable=$(state_get reachable); [ -n "$_reachable" ] || _reachable=0; _failed=$(state_get failed); [ -n "$_failed" ] || _failed=0; _started=$(state_get started_at); [ -n "$_started" ] || _started=0; _updated=$(state_get updated_at); [ -n "$_updated" ] || _updated=0; _running=false; pid_alive_file "$SCAN_PID" && _running=true; [ "$_state" = running ] && [ "$_running" = false ] && _state=stale
+	printf '{"ok":true,"state":%s,"running":%s,"current":%s,"total":%s,"endpoint":%s,"phase":%s,"passed":%s,"reachable":%s,"failed":%s,"started_at":%s,"updated_at":%s}\n' "$(json_str "$_state")" "$_running" "$_cur" "$_total" "$(json_str "$_route")" "$(json_str "$_phase")" "$_valid" "$_reachable" "$_failed" "$_started" "$_updated"
+}
+
+parse_pipe_file(){
+	_file="$1"; _mode="$2"
+	jq -Rsc --arg mode "$_mode" '
+		split("\n") | map(select(length>0) | split("|") as $f | select(($f|length)>=4) |
+		if $mode=="results" then {
+			provider:($f[0] // ""),source_id:($f[1] // ""),label:($f[2] // ""),endpoint:($f[3] // ""),status:($f[4] // ""),reason:($f[5] // ""),http:($f[6] // ""),latency_ms:(($f[7] // "0") | tonumber? // 0),checked_at:(($f[8] // "0") | tonumber? // 0),endpoint_ping:($f[9] // ""),tunnel_ping:($f[10] // ""),loss:($f[11] // ""),seen_as:($f[12] // ""),node:($f[13] // ""),node_location:($f[14] // "")
+		} else {
+			provider:($f[0] // ""),source_id:($f[1] // ""),label:($f[2] // ""),endpoint:($f[3] // ""),endpoint_ping:($f[4] // ""),tunnel_ping:($f[5] // ""),loss:($f[6] // ""),seen_as:($f[7] // ""),node:($f[8] // ""),node_location:($f[9] // "")
+		} end)' "$_file" 2>/dev/null
+}
+method_telegram_scan_results(){ read -r _in 2>/dev/null; [ -s "$SCAN_RESULTS" ] || { printf '{"ok":true,"items":[],"raw_count":0}\n'; return; }; _raw=$(wc -l <"$SCAN_RESULTS"|tr -d ' '); _items=$(parse_pipe_file "$SCAN_RESULTS" results); [ -n "$_items" ] || { printf '{"ok":false,"reason":"parse_error","raw_count":%s,"items":[]}\n' "${_raw:-0}"; return; }; _parsed=$(printf '%s' "$_items"|jq 'length' 2>/dev/null); [ "${_parsed:-0}" -gt 0 ] 2>/dev/null || { printf '{"ok":false,"reason":"parse_error","raw_count":%s,"items":[]}\n' "${_raw:-0}"; return; }; printf '{"ok":true,"raw_count":%s,"items":%s}\n' "${_raw:-0}" "$_items"; }
+method_telegram_scan_plan(){ read -r _in 2>/dev/null; [ -s "$SCAN_PLAN" ] || { printf '{"ok":true,"items":[]}\n'; return; }; _items=$(parse_pipe_file "$SCAN_PLAN" plan); [ -n "$_items" ] || _items='[]'; printf '{"ok":true,"items":%s}\n' "$_items"; }
+method_telegram_scan_cancel(){ read -r _in 2>/dev/null; if _p=$(pid_from_file "$SCAN_PID"); then kill "$_p" 2>/dev/null || true; fi; stop_scan_socks; _cur=$(state_get current); _total=$(state_get total); _route=$(state_get endpoint); _valid=$(state_get passed); _reachable=$(state_get reachable); _failed=$(state_get failed); _started=$(state_get started_at); state_write cancelled "${_cur:-0}" "${_total:-0}" "$_route" cancelled "${_valid:-0}" "${_reachable:-0}" "${_failed:-0}" "${_started:-0}"; rm -f "$SCAN_PID" "$SCAN_INPUT" 2>/dev/null; printf '{"ok":true,"state":"cancelled"}\n'; }
+method_telegram_scan_log(){ read -r _in 2>/dev/null; _off=$(printf '%s' "$_in"|sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p'); [ -n "$_off" ] || _off=0; _size=$(wc -c <"$SCAN_LOG" 2>/dev/null|tr -d ' '); [ -n "$_size" ] || _size=0; [ "$_off" -le "$_size" ] 2>/dev/null || _off=0; _bytes=$((_size-_off)); [ "$_bytes" -gt 32768 ] 2>/dev/null && _bytes=32768; if [ "$_bytes" -gt 0 ] 2>/dev/null; then _chunk=$(tail -c +$((_off+1)) "$SCAN_LOG" 2>/dev/null|head -c "$_bytes"|jq -Rs . 2>/dev/null); [ -n "$_chunk" ] || _chunk='""'; else _chunk='""'; fi; printf '{"ok":true,"chunk":%s,"offset":%s}\n' "$_chunk" "$((_off+_bytes))"; }
+
+case "$1" in
+	list) echo '{"telegram_scan_start":{},"telegram_scan_status":{},"telegram_scan_results":{},"telegram_scan_plan":{},"telegram_scan_cancel":{},"telegram_scan_log":{"offset":0}}';;
+	call) case "$2" in telegram_scan_start)method_telegram_scan_start;;telegram_scan_status)method_telegram_scan_status;;telegram_scan_results)method_telegram_scan_results;;telegram_scan_plan)method_telegram_scan_plan;;telegram_scan_cancel)method_telegram_scan_cancel;;telegram_scan_log)method_telegram_scan_log;;*)echo '{"error":"unknown method"}';exit 1;;esac;;
+	*) echo '{"error":"unknown command"}'; exit 1;;
+esac

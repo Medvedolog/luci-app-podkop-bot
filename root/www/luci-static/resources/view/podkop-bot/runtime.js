@@ -4,576 +4,90 @@
 'require ui';
 'require dom';
 
-/*
- * luci-app-podkop-bot — Runtime (active outbound diagnostics)
- *
- * Shows what podkop/plus and the Clash view do NOT: a live probe of the USER's
- * active tunnel through the active section's Mixed Proxy — exit geo/provider,
- * per-service reachability (incl. TSPU/RKN blocks), download speed, and TSPU
- * 16 KB block detection. Reuses the bot's probe logic via the active_probe rpc.
- *
- * The full probe is slow (downloads 8 MiB, hits several services) so it runs on demand
- * and is cached; opening the tab shows the cached result immediately, a button
- * runs a fresh probe.
- */
-
 var callActiveProbe = rpc.declare({ object:'podkop_bot', method:'active_probe', params:['cached','section','proxy','label'] });
 var callRuntimeSections = rpc.declare({ object:'podkop_bot', method:'runtime_sections' });
 var callTransportState = rpc.declare({ object:'podkop_bot', method:'transport_state' });
 var callTransportProbe = rpc.declare({ object:'podkop_bot', method:'transport_probe', params:['target'] });
 var callEnsureMixedProxy = rpc.declare({ object:'podkop_bot', method:'ensure_mixed_proxy', params:['section'] });
+var callWarpStatus = rpc.declare({ object:'podkop_bot_warpscout', method:'status', params:['force'] });
+var callWarpShortlist = rpc.declare({ object:'podkop_bot_warpscout', method:'shortlist' });
+var callWarpConfigSet = rpc.declare({ object:'podkop_bot_warpscout', method:'config_set', params:['key','value'] });
+var callWarpRtStatus = rpc.declare({ object:'podkop_bot_warpscout_runtime', method:'status' });
+var callWarpRtStart = rpc.declare({ object:'podkop_bot_warpscout_runtime', method:'start', params:['endpoint'] });
+var callWarpRtStop = rpc.declare({ object:'podkop_bot_warpscout_runtime', method:'stop' });
+var callRescueStatus = rpc.declare({ object:'podkop_bot_warpscout_rescue', method:'status' });
+var callTgStatus = rpc.declare({ object:'podkop_bot_warpscout_tgscan', method:'telegram_scan_status' });
+var callTgResults = rpc.declare({ object:'podkop_bot_warpscout_tgscan', method:'telegram_scan_results' });
+var callTgPlan = rpc.declare({ object:'podkop_bot_warpscout_tgscan', method:'telegram_scan_plan' });
+var callTgStart = rpc.declare({ object:'podkop_bot_warpscout_tgscan', method:'telegram_scan_start' });
+var callTgCancel = rpc.declare({ object:'podkop_bot_warpscout_tgscan', method:'telegram_scan_cancel' });
 
 var COLOURS = { green:'#33a02c', yellow:'#e8a33d', grey:'#888888', red:'#cc2b2b' };
-function dot(c, label) {
-	return E('span', { 'style':'display:inline-flex;align-items:flex-start;gap:.4em;' }, [
-		E('span', { 'style':'width:.7em;height:.7em;border-radius:50%;display:inline-block;flex:none;margin-top:.28em;background:'+(COLOURS[c]||COLOURS.grey)+';' }),
-		E('span', {}, label)
-	]);
-}
-function pbInjectCss() {
-	if (document.getElementById('pb-css')) return;
-	document.querySelector('head').appendChild(E('link', {
-		'id':'pb-css', 'rel':'stylesheet', 'type':'text/css',
-		'href': L.resource('css/podkop-bot/podkop-bot.css')
-	}));
-}
-
-function row(label, valNode) {
-	return E('div', { 'class':'pb-row pb-row--plain' }, [
-		E('span', { 'class':'pb-row-label' }, label),
-		E('span', { 'class':'pb-row-val' }, [ valNode ])
-	]);
-}
-
-
-function pbFooter() {
-	var callAppInfo = rpc.declare({ object: 'podkop_bot', method: 'app_info' });
-	var span = E('span', {}, '');
-	var box = E('div', { 'style': 'max-width:820px;margin-top:1.2em;padding-top:.6em;border-top:1px solid rgba(127,127,127,.15);color:#888;font-size:85%;text-align:right;' }, [ span ]);
-	callAppInfo().then(function(a) {
-		if (a && a.ok) {
-			dom.content(span, [
-				E('span', {}, 'luci-app-podkop-bot v' + (a.luci_app_version || '?') + ' \u00b7 '),
-				E('a', { 'href': a.repo || 'https://github.com/Medvedolog/luci-app-podkop-bot', 'target': '_blank', 'rel': 'noopener' }, _('репозиторий'))
-			]);
-		}
-	}).catch(function(){});
-	return box;
-}
+function dot(c,label){return E('span',{'style':'display:inline-flex;align-items:flex-start;gap:.4em;'},[E('span',{'style':'width:.7em;height:.7em;border-radius:50%;display:inline-block;flex:none;margin-top:.28em;background:'+(COLOURS[c]||COLOURS.grey)+';'}),E('span',{},label)]);}
+function row(label,val){return E('div',{'class':'pb-row pb-row--plain'},[E('span',{'class':'pb-row-label'},label),E('span',{'class':'pb-row-val'},[val])]);}
+function pbInjectCss(){if(document.getElementById('pb-css'))return;document.querySelector('head').appendChild(E('link',{'id':'pb-css','rel':'stylesheet','type':'text/css','href':L.resource('css/podkop-bot/podkop-bot.css')}));}
+function ageText(ts){var n=parseInt(ts||0,10);if(!n)return '—';var s=Math.max(0,Math.floor(Date.now()/1000)-n);if(s<60)return _('только что');if(s<3600)return Math.floor(s/60)+_(' мин назад');if(s<86400)return Math.floor(s/3600)+_(' ч назад');return Math.floor(s/86400)+_(' дн назад');}
+function pbFooter(){var callAppInfo=rpc.declare({object:'podkop_bot',method:'app_info'}),span=E('span',{},''),box=E('div',{'style':'max-width:820px;margin-top:1.2em;padding-top:.6em;border-top:1px solid rgba(127,127,127,.15);color:#888;font-size:85%;text-align:right;'},[span]);callAppInfo().then(function(a){if(a&&a.ok)dom.content(span,[E('span',{},'luci-app-podkop-bot v'+(a.luci_app_version||'?')+' · '),E('a',{'href':a.repo||'https://github.com/Medvedolog/luci-app-podkop-bot','target':'_blank','rel':'noopener'},_('репозиторий'))]);}).catch(function(){});return box;}
+function tgStatusNode(x){var s=x&&x.status||'';if(s==='VALID')return dot('green','VALID');if(s.indexOf('REACHABLE_')===0)return dot('yellow',s.replace('REACHABLE_',''));if(s==='FAIL')return dot('red','FAIL');return dot('grey',_('ОЖИДАЕТ'));}
 
 return view.extend({
-	load: function() {
+	load:function(){
 		pbInjectCss();
-		/* sections list + cached probe of the active section for instant display */
 		return Promise.all([
-			callRuntimeSections().catch(function(){ return null; }),
-			callActiveProbe('true', '', '', '').catch(function(){ return null; }),
-			callTransportState().catch(function(){ return null; })
+			callRuntimeSections().catch(function(){return null;}),callActiveProbe('true','','','').catch(function(){return null;}),callTransportState().catch(function(){return null;}),callWarpStatus('').catch(function(){return null;}),callWarpShortlist().catch(function(){return null;}),callWarpRtStatus().catch(function(){return null;}),callTgStatus().catch(function(){return {state:'idle'};}),callTgResults().catch(function(){return null;}),callTgPlan().catch(function(){return {ok:false,items:[]};}),callRescueStatus().catch(function(){return {running:false,endpoint:''};})
 		]);
 	},
 
-	render: function(data) {
-		var self = this;
-		var sectionsData = data[0];
-		var probeData = data[1];
-		var transportData = data[2];
-		/* selected section: active by default; user can switch */
-		this.sections = (sectionsData && sectionsData.sections) ? sectionsData.sections : [];
-		this.selectedSection = (sectionsData && sectionsData.active_section) ? sectionsData.active_section : '';
-		this.sectionsMeta = sectionsData || {};
-
-		/* transport-tier proxies from the Transport tab: tier1 Mixed Proxy,
-		 * tier2 fallback_socks list, tier3 custom_proxy. Each becomes a probe
-		 * target (endpoint + label) alongside the Podkop sections. */
-		this.tierProxies = [];
-		if (transportData && transportData.available) {
-			var t1 = transportData.tier1;
-			/* readable labels — raw socks5h://host:port is noise for a human.
-			 * tier1 is the active section's Mixed Proxy; tier2/3 show host only. */
-			if (t1 && t1.endpoint) {
-				var t1host = t1.endpoint.replace(/^socks5h?:\/\//, '');
-				this.tierProxies.push({ endpoint: t1.endpoint, label: _('tier1 · Mixed Proxy') + ' — ' + t1host });
-			}
-			(transportData.tier2_fallback_socks || []).forEach(function(ep, i){
-				if (ep) {
-					var h = ep.replace(/^socks5h?:\/\//, '').replace(/^[^@]*@/, '');
-					self.tierProxies.push({ endpoint: ep, label: _('tier2 · резерв #') + (i+1) + ' — ' + h });
-				}
-			});
-			if (transportData.tier3_custom_proxy) {
-				var t3 = transportData.tier3_custom_proxy;
-				var t3h = t3.replace(/^socks5h?:\/\//, '').replace(/^[^@]*@/, '');
-				this.tierProxies.push({ endpoint: t3, label: _('tier3 · свой прокси') + ' — ' + t3h });
-			}
-		}
-		/* current selection state: either a section name or a proxy endpoint */
-		this.selectedProxy = '';   // '' = use section; otherwise endpoint
-		this.selectedProxyLabel = '';
-
-		var body = E('div', { 'id':'podkop-runtime-body' }, this.renderProbe(probeData));
-		this.body = body;
-
-		var runBtn = E('button', {
-			'class':'cbi-button cbi-button-action',
-			'click': ui.createHandlerFn(this, 'runProbe')
-		}, (this.sections.length > 1 || this.tierProxies.length > 0) ? _('Проверить выбранный') : _('Проверить сейчас'));
-		this.runBtn = runBtn;
-
-		var tgBody = E('div', { 'id':'podkop-runtime-tg', 'style':'margin:.5em 0;' });
-		this.tgBody = tgBody;
-		var tgBtn = E('button', {
-			'class':'cbi-button',
-			'click': ui.createHandlerFn(this, 'runTelegramProbe')
-		}, _('Проверить Telegram API'));
-		this.tgBtn = tgBtn;
-
-		/* combined selector: two optgroups — Podkop sections, then transport
-		 * proxies. Shown when there's more than one thing to choose. */
-		var selectorRow = E('span', {});
-		var totalChoices = this.sections.length + this.tierProxies.length;
-		if (totalChoices > 1) {
-			var optSections = this.sections.map(function(s){
-				return E('option', { 'value': 'sec:' + s.name, 'selected': (s.name === self.selectedSection && !self.selectedProxy) ? '' : null },
-					s.name + (s.enabled_for_runtime ? '' : _(' (без Mixed Proxy)')));
-			});
-			var groups = [ E('optgroup', { 'label': _('Маршруты Podkop') }, optSections) ];
-			if (this.tierProxies.length > 0) {
-				var optProxies = this.tierProxies.map(function(p){
-					return E('option', { 'value': 'proxy:' + p.endpoint, 'data-label': p.label }, p.label);
-				});
-				groups.push(E('optgroup', { 'label': _('Транспортные маршруты') }, optProxies));
-			}
-			var sel = E('select', { 'class':'cbi-input-select', 'style':'width:100%;max-width:420px;box-sizing:border-box;',
-				'change': ui.createHandlerFn(this, 'onTargetChange')
-			}, groups);
-			this.targetSelect = sel;
-			/* label ON TOP of a full-width select: on a phone an inline label +
-			 * select collide; stacking keeps both readable. */
-			selectorRow = E('div', { 'style':'margin-bottom:.5em;' }, [
-				E('label', { 'style':'display:block;color:#888;font-size:90%;margin-bottom:.2em;' }, _('Маршрут проверки')),
-				sel
-			]);
-		}
-
-		var batchBtn = E('span', {});
-		if (this.sections.length > 1 || this.tierProxies.length > 0) {
-			batchBtn = E('button', {
-				'class':'cbi-button',
-				'click': ui.createHandlerFn(this, 'runAllProbes')
-			}, _('Проверить все маршруты'));
-			this.batchBtn = batchBtn;
-		}
-
-		/* Collapsible custom-proxy form: probe an arbitrary SOCKS/HTTP proxy
-		 * (with optional auth) without saving it to Transport. Credentials are
-		 * used for this one probe only — backend never caches or echoes them. */
-		var cpHost = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('хост / IP') });
-		var cpPort = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('порт') });
-		var cpUser = E('input', { 'type':'text', 'class':'cbi-input-text pb-mono', 'placeholder':_('логин, необязательно') });
-		var cpPass = E('input', { 'type':'password', 'class':'cbi-input-text pb-mono', 'placeholder':_('пароль, необязательно') });
-		var cpType = E('select', { 'class':'cbi-input-select' }, [
-			E('option', { 'value':'socks5h' }, 'socks5h — DNS через прокси'),
-			E('option', { 'value':'socks5' }, 'socks5 — DNS локально'),
-			E('option', { 'value':'http' }, 'http'),
-			E('option', { 'value':'https' }, 'https')
-		]);
-		this._cp = { host: cpHost, port: cpPort, user: cpUser, pass: cpPass, type: cpType };
-		/* grid card — host/port no longer drift to opposite edges, collapses to
-		 * one column under 600px (see .pb-manual-proxy-* in podkop-bot.css). */
-		var cpForm = E('div', { 'class':'pb-manual-proxy-card', 'style':'display:none;' }, [
-			E('h3', { 'style':'margin:0 0 .6em;' }, _('Ручной прокси')),
-			E('div', { 'class':'pb-manual-proxy-grid' }, [ cpType, cpHost, cpPort ]),
-			E('div', { 'class':'pb-manual-proxy-auth' }, [ cpUser, cpPass ]),
-			E('div', { 'class':'pb-manual-proxy-actions' }, [
-				E('button', { 'class':'cbi-button cbi-button-action',
-					'click': ui.createHandlerFn(this, 'runCustomProxy') }, _('Проверить через этот прокси'))
-			]),
-			E('p', { 'class':'pb-manual-proxy-note' }, _('Логин и пароль используются только для этой проверки — не сохраняются, не кэшируются, в результате пароль маскируется. Тип — это протокол прокси (curl -x), а не «проверить HTTPS-сайт».'))
-		]);
-		this.cpForm = cpForm;
-		var cpToggle = E('button', {
-			'class':'cbi-button',
-			'click': function() {
-				var open = cpForm.style.display !== 'none';
-				cpForm.style.display = open ? 'none' : 'block';
-				this.textContent = open ? _('Ручной прокси ▸') : _('Ручной прокси ▾');
-			}
-		}, _('Ручной прокси ▸'));
-
-		return E('div', {}, [
-			E('h2', {}, _('Runtime — активный сервер')),
-			E('p', { 'class':'pb-muted' }, _('Проверка туннеля: страна и провайдер выхода, доступность 12 сервисов и их регионы, скорость, признаки блокировок ТСПУ. Маршрут — это через что идёт проверка: секция Podkop, транспортный или ручной прокси.')),
-			E('p', { 'style':'color:#c60;font-size:90%;margin-top:-.4em;' }, _('⚠ Полная проверка идёт 15–60 секунд и нагружает роутер (параллельные запросы + загрузка до 8 МиБ через туннель). Быстрая кнопка Telegram API проверяет только реальный getMe и почти не создаёт трафика.')),
-			selectorRow,
-			E('div', { 'style':'margin:.6em 0;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;' }, [ runBtn, batchBtn, cpToggle, tgBtn ]),
-			cpForm,
-			tgBody,
-			body,
-			pbFooter()
-		]);
+	render:function(data){
+		var self=this,sectionsData=data[0],probeData=data[1],transportData=data[2],initialTg=data[7];
+		this.transportState=transportData||{};this.warpStatus=data[3]||null;this.warpShortlist=data[4]||null;this.warpRuntime=data[5]||null;this.tgScanStatus=data[6]||{state:'idle'};this.tgScanResults=(initialTg&&initialTg.ok!==false)?initialTg:{ok:true,items:[]};this.tgScanPlan=data[8]||{items:[]};this.rescueStatus=data[9]||{running:false,endpoint:''};
+		this.warpItems=(this.warpShortlist&&this.warpShortlist.items)||[];this.warpRouteReady=!!(this.warpStatus&&this.warpStatus.installed&&this.warpStatus.account_ready&&this.warpItems.length);this.sections=(sectionsData&&sectionsData.sections)||[];this.selectedSection=(sectionsData&&sectionsData.active_section)||'';this.sectionsMeta=sectionsData||{};this.tierProxies=[];
+		if(transportData&&transportData.available){var t1=transportData.tier1;if(t1&&t1.endpoint)this.tierProxies.push({endpoint:t1.endpoint,label:_('tier1 · Mixed Proxy')+' — '+t1.endpoint.replace(/^socks5h?:\/\//,'')});(transportData.tier2_fallback_socks||[]).forEach(function(ep,i){if(ep&&ep.indexOf('#WARP-SCOUT')<0)self.tierProxies.push({endpoint:ep,label:_('tier2 · резерв #')+(i+1)+' — '+ep.replace(/^socks5h?:\/\//,'').replace(/^[^@]*@/,'')});});if(transportData.tier3_custom_proxy){var t3=transportData.tier3_custom_proxy;this.tierProxies.push({endpoint:t3,label:_('tier3 · свой прокси')+' — '+t3.replace(/^socks5h?:\/\//,'').replace(/^[^@]*@/,'')});}}
+		this.selectedProxy='';this.selectedProxyLabel='';this.selectedWarp=false;
+		this.body=E('div',{'id':'podkop-runtime-body'},this.renderProbe(probeData));this.tgBody=E('div',{'id':'podkop-runtime-tg','style':'margin:.7em 0;'},this.renderTgSummary());this.runBtn=E('button',{'class':'cbi-button cbi-button-action','click':ui.createHandlerFn(this,'runProbe')},(this.sections.length>1||this.tierProxies.length||this.warpRouteReady)?_('Проверить выбранный'):_('Проверить сейчас'));this.tgBtn=E('button',{'class':'cbi-button','disabled':this.tgScanStatus.running?'disabled':null,'click':ui.createHandlerFn(this,'runTelegramQualification')},_('Проверить Telegram API'));
+		var warpNextBtn=E('span',{});if(this.warpRouteReady&&this.warpItems.length>1){warpNextBtn=E('button',{'class':'cbi-button','style':'display:none;','click':ui.createHandlerFn(this,'nextWarpTestRoute')},_('Следующий WARP'));this.warpNextBtn=warpNextBtn;}
+		var selectorRow=E('span',{}),totalChoices=this.sections.length+this.tierProxies.length+(this.warpRouteReady?1:0);
+		if(totalChoices>1){var groups=[E('optgroup',{'label':_('Маршруты Podkop')},this.sections.map(function(s){return E('option',{'value':'sec:'+s.name,'selected':s.name===self.selectedSection?'':null},s.name+(s.enabled_for_runtime?'':_(' (без Mixed Proxy)')));} ))];if(this.tierProxies.length)groups.push(E('optgroup',{'label':_('Транспортные маршруты')},this.tierProxies.map(function(p){return E('option',{'value':'proxy:'+p.endpoint,'data-label':p.label},p.label);} )));if(this.warpRouteReady)groups.push(E('optgroup',{'label':'WARP'},[E('option',{'value':'warp:warpscout','data-label':_('WARP Rescue · WARPSCOUT')},_('WARP Rescue · WARPSCOUT — ручная проверка'))]));this.targetSelect=E('select',{'class':'cbi-input-select','style':'width:100%;max-width:500px;box-sizing:border-box;','change':ui.createHandlerFn(this,'onTargetChange')},groups);selectorRow=E('div',{'style':'margin-bottom:.5em;'},[E('label',{'style':'display:block;color:#888;font-size:90%;margin-bottom:.2em;'},_('Маршрут проверки')),this.targetSelect]);window.setTimeout(function(){self.syncSelectedTarget();},0);}
+		var batchBtn=E('span',{});if(totalChoices>1){batchBtn=E('button',{'class':'cbi-button','click':ui.createHandlerFn(this,'runAllProbes')},_('Проверить все маршруты'));this.batchBtn=batchBtn;}
+		var cpHost=E('input',{'type':'text','class':'cbi-input-text pb-mono','placeholder':_('хост / IP')}),cpPort=E('input',{'type':'text','class':'cbi-input-text pb-mono','placeholder':_('порт')}),cpUser=E('input',{'type':'text','class':'cbi-input-text pb-mono','placeholder':_('логин, необязательно')}),cpPass=E('input',{'type':'password','class':'cbi-input-text pb-mono','placeholder':_('пароль, необязательно')}),cpType=E('select',{'class':'cbi-input-select'},[E('option',{'value':'socks5h'},'socks5h — DNS через прокси'),E('option',{'value':'socks5'},'socks5 — DNS локально'),E('option',{'value':'http'},'http'),E('option',{'value':'https'},'https')]);this._cp={host:cpHost,port:cpPort,user:cpUser,pass:cpPass,type:cpType};var cpForm=E('div',{'class':'pb-manual-proxy-card','style':'display:none;'},[E('h3',{'style':'margin:0 0 .6em;'},_('Ручной прокси')),E('div',{'class':'pb-manual-proxy-grid'},[cpType,cpHost,cpPort]),E('div',{'class':'pb-manual-proxy-auth'},[cpUser,cpPass]),E('div',{'class':'pb-manual-proxy-actions'},[E('button',{'class':'cbi-button cbi-button-action','click':ui.createHandlerFn(this,'runCustomProxy')},_('Проверить через этот прокси'))]),E('p',{'class':'pb-manual-proxy-note'},_('Логин и пароль используются только для этой проверки — не сохраняются.'))]);this.cpForm=cpForm;var cpToggle=E('button',{'class':'cbi-button','click':function(){var open=cpForm.style.display!=='none';cpForm.style.display=open?'none':'block';this.textContent=open?_('Ручной прокси ▸'):_('Ручной прокси ▾');}},_('Ручной прокси ▸'));
+		var root=E('div',{},[E('h2',{},_('Проверка маршрутов')),E('p',{'class':'pb-muted'},_('Полная проверка измеряет доступность сервисов, географию выхода, скорость и признаки блокировок. «Проверить Telegram API» быстро проверяет все настроенные маршруты: секции Podkop/Forkop, прокси и найденные WARP-узлы.')),E('p',{'style':'color:#c60;font-size:90%;margin-top:-.4em;'},_('⚠ Полная проверка идёт 15–60 секунд и нагружает роутер. Проверка Telegram API использует только getMe и почти не создаёт трафика.')),selectorRow,E('div',{'style':'margin:.6em 0;display:flex;gap:.5em;flex-wrap:wrap;align-items:center;'},[this.runBtn,batchBtn,cpToggle,this.tgBtn,warpNextBtn]),cpForm,this.tgBody,this.body,pbFooter()]);
+		if(this.tgScanStatus.running)window.setTimeout(function(){self.scheduleTgPoll(150);},0);return root;
 	},
 
+	tgUsageTags:function(x){var t=this.transportState||{},tags=[],id=String(x.source_id||''),label=String(x.label||''),ep=String(x.endpoint||'');function match(k,n){k=String(k||'');n=String(n||'');return !!((k&&(k===id||k===label||k===ep))||(n&&(n===id||n===label||n===ep)));}if(match(t.poll_route,t.poll_route_name))tags.push('POLL');if(match(t.fast_route,t.fast_route_name))tags.push('FAST');if(this.rescueStatus&&this.rescueStatus.running&&ep===this.rescueStatus.endpoint)tags.push('ON-AIR');return tags;},
+	renderTgSummary:function(){var self=this,st=this.tgScanStatus||{},res=(this.tgScanResults&&this.tgScanResults.items)||[],plan=(this.tgScanPlan&&this.tgScanPlan.items)||[],byKey={};res.forEach(function(x){byKey[(x.source_id||'')+'|'+(x.endpoint||'')]=x;});var rows=(plan.length?plan:res).map(function(p,i){var x=byKey[(p.source_id||'')+'|'+(p.endpoint||'')]||p,checking=st.running&&parseInt(st.current||0,10)===i+1&&!x.status,status=checking?dot('yellow',_('ПРОВЕРЯЕТСЯ')):tgStatusNode(x),tags=self.tgUsageTags(x),meta=[];if(x.latency_ms)meta.push(_('Задержка TG ')+x.latency_ms+' мс');if(x.http)meta.push('HTTP '+x.http);if(x.provider==='warp'&&(x.node||x.node_location))meta.push((x.node||'—')+' · '+(x.node_location||'—'));if(x.loss)meta.push(_('Потери ')+x.loss);if(x.checked_at)meta.push(ageText(x.checked_at));return E('div',{'style':'border-top:1px solid rgba(127,127,127,.14);padding:.55em 0;'},[E('div',{'style':'display:flex;justify-content:space-between;gap:.8em;align-items:center;flex-wrap:wrap;'},[E('div',{},[E('strong',{},x.label||x.source_id||(_('маршрут ')+(i+1))),E('span',{'style':'color:#888;margin-left:.5em;'},x.endpoint||'')]),E('div',{'style':'display:flex;gap:.35em;align-items:center;flex-wrap:wrap;'},tags.map(function(z){return E('span',{'class':'label'},z);}).concat([status]))]),meta.length?E('div',{'class':'pb-hint-90','style':'margin-top:.2em;'},meta.join(' · ')):E('span',{})]);});if(!st.running&&!rows.length)return E('span',{});var head=st.running?dot('yellow',_('Проверка ')+String(st.current||0)+' / '+String(st.total||0)):((st.state==='done')?dot('green',_('Последняя проверка завершена')):dot('grey',_('Последние сохранённые результаты'))),summary='VALID '+String(st.passed||0)+' · non-VALID '+String(st.reachable||0)+' · FAIL '+String(st.failed||0);var details=E('details',{'open':st.running?'open':null},[E('summary',{'style':'cursor:pointer;font-weight:600;'},_('Маршруты и подробности')+' · '+String(rows.length)),E('div',{'style':'margin-top:.45em;'},rows)]);var controls=[];if(st.running)controls.push(E('button',{'class':'cbi-button cbi-button-negative','click':ui.createHandlerFn(this,'cancelTelegramQualification')},_('Остановить')));return E('div',{'class':'cbi-section pb-card','style':'max-width:1080px;'},[E('h3',{'style':'margin-top:0;'},_('Telegram API — все маршруты')),E('div',{'style':'display:flex;justify-content:space-between;gap:1em;flex-wrap:wrap;'},[head,E('strong',{},summary)]),st.running&&st.endpoint?E('div',{'class':'pb-hint-90','style':'margin-top:.35em;'},_('Сейчас проверяется: ')+st.endpoint):E('span',{}),details,controls.length?E('div',{'style':'margin-top:.55em;'},controls):E('span',{})]);},
+	refreshTgSummary:function(){if(this.tgBody)dom.content(this.tgBody,this.renderTgSummary());},
+	runTelegramQualification:function(){var self=this;this.tgBtn.disabled=true;return callTgStart().then(function(r){if(r&&r.ok){self.tgScanStatus={running:true,state:'running',current:0,total:r.total||0};self.tgLastResultsCurrent=-1;self.tgLastResultsAt=0;self.refreshTgSummary();self.scheduleTgPoll(250);return;}if(r&&r.reason==='already_running'){return callTgStatus().then(function(st){self.tgScanStatus=st||{running:true,state:'running'};self.refreshTgSummary();self.scheduleTgPoll(250);});}throw new Error((r&&r.reason)||'start_failed');}).catch(function(e){ui.addNotification(null,E('p',{},_('Не удалось запустить проверку Telegram API: ')+((e&&e.message)||'?')),'error');self.tgBtn.disabled=false;});},
+	cancelTelegramQualification:function(){var self=this;return callTgCancel().then(function(){return self.refreshTgFull();});},
+	scheduleTgPoll:function(ms){var self=this;if(this.tgPollTimer)window.clearTimeout(this.tgPollTimer);this.tgPollTimer=window.setTimeout(function(){self.pollTg();},ms||1500);},
+	pollTg:function(){var self=this;if(document.visibilityState!=='visible'){this.scheduleTgPoll(1500);return;}callTgStatus().then(function(st){var prev=self.tgScanStatus||{},cur=parseInt(st.current||0,10)||0,now=Date.now(),need=cur!==self.tgLastResultsCurrent||(now-(self.tgLastResultsAt||0)>4500)||(!st.running&&prev.running);self.tgScanStatus=st||{};if(!need){self.refreshTgSummary();if(st.running)self.scheduleTgPoll(1500);else self.refreshTgFull();return;}return Promise.all([callTgResults().catch(function(){return null;}),callTgPlan().catch(function(){return self.tgScanPlan;}),callRescueStatus().catch(function(){return self.rescueStatus;})]).then(function(x){if(x[0]&&x[0].ok!==false)self.tgScanResults=x[0];self.tgScanPlan=x[1]||self.tgScanPlan||{items:[]};self.rescueStatus=x[2]||self.rescueStatus;self.tgLastResultsCurrent=cur;self.tgLastResultsAt=now;self.refreshTgSummary();if(st.running)self.scheduleTgPoll(1500);else{self.tgBtn.disabled=false;return self.refreshTgFull();}});}).catch(function(){self.scheduleTgPoll(2200);});},
+	refreshTgFull:function(){var self=this;return Promise.all([callTgStatus(),callTgResults().catch(function(){return null;}),callTgPlan(),callTransportState().catch(function(){return self.transportState||{};}),callRescueStatus().catch(function(){return self.rescueStatus||{};})]).then(function(x){self.tgScanStatus=x[0]||{};if(x[1]&&x[1].ok!==false)self.tgScanResults=x[1];self.tgScanPlan=x[2]||self.tgScanPlan||{items:[]};self.transportState=x[3]||{};self.rescueStatus=x[4]||{};if(self.tgBtn)self.tgBtn.disabled=!!self.tgScanStatus.running;self.refreshTgSummary();});},
 
-	renderTelegramProbe: function(d, label) {
-		if (!d) return E('div', { 'class':'cbi-section pb-wide' }, dot('red', _('Telegram probe не завершился.')));
-		var colour = d.verified_bot_api ? 'green' : (d.telegram_reached ? 'yellow' : 'red');
-		var text;
-		if (d.verified_bot_api) {
-			text = _('Telegram Bot API подтверждён') + (d.bot_username ? (' · @' + d.bot_username) : '');
-		} else if (d.telegram_reached) {
-			text = _('Telegram отвечает, но getMe не подтверждён') + (d.reason ? (' · ' + d.reason) : '');
-		} else {
-			text = _('Telegram через этот маршрут недоступен') + (d.reason ? (' · ' + d.reason) : '');
-		}
-		return E('div', { 'class':'cbi-section pb-wide', 'style':'margin:.5em 0;padding:.65em .9em;' }, [
-			dot(colour, text),
-			E('div', { 'style':'color:#888;font-size:85%;margin-top:.3em;' },
-				(label || d.target || '') + (d.http ? (' · HTTP ' + d.http) : '') + (d.latency_ms != null ? (' · ' + d.latency_ms + ' ms') : ''))
-		]);
-	},
+	beginProgress:function(title,stage){var self=this;this.endProgress();this.progressStarted=Date.now();this.progressTitle=title;this.progressStage=stage;this.progressDraw=function(){var sec=Math.max(0,Math.floor((Date.now()-self.progressStarted)/1000));dom.content(self.body,E('div',{'class':'cbi-section pb-wide'},[dot('yellow',self.progressTitle),E('div',{'class':'pb-hint-90','style':'margin-top:.45em;'},self.progressStage+' · '+_('прошло ')+sec+_(' с'))]));};this.progressDraw();this.progressTimer=window.setInterval(this.progressDraw,1000);},
+	setProgress:function(stage){this.progressStage=stage;if(this.progressDraw)this.progressDraw();},
+	endProgress:function(){if(this.progressTimer)window.clearInterval(this.progressTimer);this.progressTimer=null;this.progressDraw=null;},
 
-	runTelegramProbe: function() {
-		var self = this, target = '', label = '';
-		if (this.selectedProxy) {
-			target = this.selectedProxy; label = this.selectedProxyLabel || target;
-		} else {
-			var name = this.selectedSection || '';
-			var sec = (this.sections || []).filter(function(x){ return x.name === name; })[0];
-			if (sec) { target = sec.endpoint || ''; label = sec.name + (target ? (' · ' + target) : ''); }
-		}
-		if (!target) {
-			dom.content(this.tgBody, this.renderTelegramProbe({ telegram_reached:false, reason:'mixed_proxy_disabled' }, label));
-			return;
-		}
-		this.tgBtn.disabled = true;
-		dom.content(this.tgBody, E('div', {}, dot('grey', _('Проверяю реальный Telegram getMe…'))));
-		return callTransportProbe(target).then(function(d) {
-			dom.content(self.tgBody, self.renderTelegramProbe(d, label)); self.tgBtn.disabled = false;
-		}).catch(function() {
-			dom.content(self.tgBody, self.renderTelegramProbe(null, label)); self.tgBtn.disabled = false;
-		});
-	},
+	renderWarpRuntime:function(){var st=this.warpStatus,sl=this.warpShortlist,rs=this.rescueStatus||{};if(!st||!st.installed)return E('span',{});var cfg=st.config||{},active=(rs.running&&rs.endpoint)||cfg.active_endpoint||'—',item=st.active_snapshot||null;if(!item)(sl&&sl.items||[]).some(function(x){if(x.endpoint===active){item=x;return true;}return false;});return E('div',{'class':'cbi-section pb-card','style':'max-width:820px;'},[E('h3',{'style':'margin-top:0;'},_('WARPSCOUT / WARP Rescue')),E('p',{'class':'pb-muted'},_('Ручная проверка использует текущий WARP-узел Rescue и после теста возвращает тот же ON-AIR узел.')),row(_('ON-AIR WARP-узел'),E('span',{},active)),row(_('Протокол'),E('span',{},String(cfg.protocol||'—').toUpperCase())),row(_('Узел'),E('span',{},item&&item.node||'—')),row(_('Расположение узла'),E('span',{},item&&item.node_location||'—')),row(_('IP выхода'),E('span',{},item&&item.seen_as||'—')),row(_('Задержка туннеля / потери'),E('span',{},(item&&item.tunnel_ping||'—')+' / '+(item&&item.loss||'—'))),E('div',{'style':'margin-top:.7em;'},[E('a',{'class':'cbi-button','href':L.url('admin/services/podkop-bot/transport/warp-revolver')},_('Открыть револьвер WARP'))])]);},
+	updateWarpNextVisibility:function(){if(this.warpNextBtn)this.warpNextBtn.style.display=this.selectedWarp?'':'none';},
+	syncSelectedTarget:function(){if(!this.targetSelect)return;var sel=this.targetSelect,v=sel.value||'';this.selectedWarp=false;if(v.indexOf('warp:')===0){this.selectedProxy='';this.selectedProxyLabel='';this.selectedSection='';this.selectedWarp=true;}else if(v.indexOf('proxy:')===0){this.selectedProxy=v.slice(6);this.selectedSection='';var opt=sel.options[sel.selectedIndex];this.selectedProxyLabel=(opt&&opt.getAttribute('data-label'))||this.selectedProxy;}else{this.selectedProxy='';this.selectedProxyLabel='';this.selectedSection=v.indexOf('sec:')===0?v.slice(4):v;}this.updateWarpNextVisibility();},
+	currentWarpEndpoint:function(){var ep=this.rescueStatus&&this.rescueStatus.running&&this.rescueStatus.endpoint||'';if(!ep)ep=this.warpStatus&&this.warpStatus.config&&this.warpStatus.config.active_endpoint||'';if(!ep&&this.warpItems&&this.warpItems.length)ep=this.warpItems[0].endpoint;return ep;},
+	ensureWarpTestRoute:function(ep){var self=this,items=this.warpItems||[];if(!this.warpRouteReady||!items.length)return Promise.reject(new Error('warp_not_ready'));var current=ep||this.currentWarpEndpoint(),exists=items.some(function(x){return x.endpoint===current;});if(!exists)current=items[0].endpoint;var stop=(this.warpRuntime&&this.warpRuntime.running&&this.warpRuntime.endpoint!==current)?callWarpRtStop():Promise.resolve({ok:true});return stop.then(function(){if(self.warpRuntime&&self.warpRuntime.running&&self.warpRuntime.endpoint===current)return self.warpRuntime;return callWarpRtStart(current).then(function(sr){if(!sr||!sr.ok)throw new Error((sr&&sr.reason)||'warp_start_failed');return callWarpRtStatus();});}).then(function(rt){self.warpRuntime=rt;return rt;});},
+	stopWarpTestRoute:function(){var self=this;return callWarpRtStop().catch(function(){return {ok:false};}).then(function(r){return Promise.all([callWarpRtStatus().catch(function(){return null;}),callRescueStatus().catch(function(){return null;})]).then(function(x){self.warpRuntime=x[0];if(x[1])self.rescueStatus=x[1];return r;});});},
+	nextWarpTestRoute:function(){var self=this,items=this.warpItems||[],result=null;this.syncSelectedTarget();if(!this.selectedWarp||items.length<2)return;var current=this.currentWarpEndpoint(),idx=-1;items.some(function(x,i){if(x.endpoint===current){idx=i;return true;}return false;});var ep=items[(idx+1+items.length)%items.length].endpoint;if(this.warpNextBtn)this.warpNextBtn.disabled=true;this.beginProgress(_('Проверка следующего WARP'),_('Этап 1/3 · запускаю тестовый SOCKS · ')+ep);return this.ensureWarpTestRoute(ep).then(function(rt){self.setProgress(_('Этап 2/3 · география + 12 сервисов + скорость'));return callActiveProbe('','',(rt&&rt.proxy)||'socks5h://127.0.0.1:18191',_('WARP · ')+ep);}).then(function(d){result=d;self.setProgress(_('Этап 3/3 · восстанавливаю ON-AIR WARP Rescue'));return self.stopWarpTestRoute();}).then(function(){self.endProgress();dom.content(self.body,self.renderProbe(result));}).catch(function(e){self.setProgress(_('Восстанавливаю WARP Rescue после ошибки…'));return self.stopWarpTestRoute().catch(function(){}).then(function(){self.endProgress();dom.content(self.body,E('div',{'class':'cbi-section pb-wide'},dot('red',_('Проверка WARP не завершилась: ')+((e&&e.message)||'?'))));});}).finally(function(){if(self.warpNextBtn)self.warpNextBtn.disabled=false;});},
 
-	/* Build an endpoint from the custom-proxy form and probe through it. Never
-	 * persists — the endpoint (with creds) is passed once to active_probe. */
-	runCustomProxy: function() {
-		var self = this;
-		var host = (this._cp.host.value || '').trim();
-		var port = (this._cp.port.value || '').trim();
-		var user = (this._cp.user.value || '').trim();
-		var pass = (this._cp.pass.value || '');
-		var type = this._cp.type.value || 'socks5h';
-		var warn = function(msg){
-			dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, dot('yellow', msg)));
-		};
-		if (['socks5h','socks5','http','https'].indexOf(type) < 0) { warn(_('Недопустимый тип прокси.')); return; }
-		if (!host) { warn(_('Укажите хост или IP.')); return; }
-		var pnum = parseInt(port, 10);
-		if (!/^[0-9]+$/.test(port) || pnum < 1 || pnum > 65535) { warn(_('Порт должен быть числом 1–65535.')); return; }
-		if (pass && !user) { warn(_('Пароль указан без логина — уберите пароль или добавьте логин.')); return; }
-		var auth = user ? (encodeURIComponent(user) + (pass ? ':' + encodeURIComponent(pass) : '') + '@') : '';
-		var endpoint = type + '://' + auth + host + ':' + port;
-		var label = type + '://' + (user ? (user + ':***@') : '') + host + ':' + port;
-		this.runBtn.disabled = true;
-		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' }, dot('grey', _('Проверка ручного прокси… (15–40 секунд)'))));
-		return callActiveProbe('', '', endpoint, label).then(function(d) {
-			dom.content(self.body, self.renderProbe(d));
-		}).catch(function(e){
-			dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, [
-				dot('red', _('Проба не завершилась (превышено время или ошибка вызова).')),
-				E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (e && e.message) ? String(e.message) : '')
-			]));
-		}).finally(function(){ self.runBtn.disabled = false; });
-	},
+	runCustomProxy:function(){var self=this,host=(this._cp.host.value||'').trim(),port=(this._cp.port.value||'').trim(),user=(this._cp.user.value||'').trim(),pass=this._cp.pass.value||'',type=this._cp.type.value||'socks5h';if(!host||!/^[0-9]+$/.test(port)||parseInt(port,10)<1||parseInt(port,10)>65535){dom.content(this.body,E('div',{'class':'cbi-section pb-wide'},dot('yellow',_('Проверьте хост и порт.'))));return;}var auth=user?(encodeURIComponent(user)+(pass?':'+encodeURIComponent(pass):'')+'@'):'',endpoint=type+'://'+auth+host+':'+port,label=type+'://'+(user?user+':***@':'')+host+':'+port;this.runBtn.disabled=true;this.beginProgress(_('Проверка ручного прокси'),_('Полная проверка · география + 12 сервисов + скорость'));return callActiveProbe('','',endpoint,label).then(function(d){self.endProgress();dom.content(self.body,self.renderProbe(d));}).catch(function(){self.endProgress();dom.content(self.body,E('div',{'class':'cbi-section pb-wide'},dot('red',_('Проверка не завершилась.'))));}).finally(function(){self.runBtn.disabled=false;});},
+	enableMixedProxy:function(section){var self=this;return callEnsureMixedProxy(section).then(function(r){if(r&&(r.ok||r.already_enabled))return callActiveProbe('',section).then(function(d){dom.content(self.body,self.renderProbe(d));});throw new Error((r&&r.reason)||'enable_failed');}).catch(function(e){dom.content(self.body,E('div',{'class':'cbi-section pb-wide'},dot('red',_('Ошибка включения Mixed Proxy: ')+((e&&e.message)||'?'))));});},
+	onTargetChange:function(){var self=this;this.syncSelectedTarget();if(this.selectedWarp){dom.content(this.body,this.renderWarpRuntime());return Promise.resolve();}if(this.selectedProxy)return callActiveProbe('true','',this.selectedProxy,this.selectedProxyLabel).then(function(d){dom.content(self.body,self.renderProbe(d));});return callActiveProbe('true',this.selectedSection,'','').then(function(d){dom.content(self.body,self.renderProbe(d));});},
+	runProbe:function(){var self=this,result=null;this.runBtn.disabled=true;if(this.batchBtn)this.batchBtn.disabled=true;this.syncSelectedTarget();if(this.selectedWarp){var ep=this.currentWarpEndpoint();this.beginProgress(_('Проверка ON-AIR WARP'),_('Этап 1/3 · запускаю тестовый SOCKS · ')+ep);return this.ensureWarpTestRoute(ep).then(function(rt){self.setProgress(_('Этап 2/3 · география + 12 сервисов + скорость'));return callActiveProbe('','',(rt&&rt.proxy)||'socks5h://127.0.0.1:18191',_('WARP Rescue · ')+ep);}).then(function(d){result=d;self.setProgress(_('Этап 3/3 · восстанавливаю ON-AIR WARP Rescue'));return self.stopWarpTestRoute();}).then(function(){self.endProgress();dom.content(self.body,self.renderProbe(result));}).catch(function(e){self.setProgress(_('Восстанавливаю WARP Rescue после ошибки…'));return self.stopWarpTestRoute().catch(function(){}).then(function(){self.endProgress();dom.content(self.body,E('div',{'class':'cbi-section pb-wide'},dot('red',_('Проверка WARP не завершилась: ')+((e&&e.message)||'?'))));});}).finally(function(){self.runBtn.disabled=false;if(self.batchBtn)self.batchBtn.disabled=false;});}var usingProxy=!!this.selectedProxy,sec=usingProxy?'':(this.selectedSection||''),prox=usingProxy?this.selectedProxy:'',lbl=usingProxy?(this.selectedProxyLabel||''):'';this.beginProgress(usingProxy?_('Проверка прокси'):_('Проверка секции '+sec),_('Полная проверка · география + 12 сервисов + скорость'));return callActiveProbe('',sec,prox,lbl).then(function(d){self.endProgress();dom.content(self.body,self.renderProbe(d));}).catch(function(){self.endProgress();dom.content(self.body,E('div',{'class':'cbi-section pb-wide'},dot('red',_('Проверка не завершилась.'))));}).finally(function(){self.runBtn.disabled=false;if(self.batchBtn)self.batchBtn.disabled=false;});},
+	runAllProbes:function(){var self=this;if(!window.confirm(_('Полная проверка всех маршрутов может выполняться до 90 секунд при большом числе прокси и заметно нагружает роутер. Продолжить?')))return Promise.resolve();this.runBtn.disabled=true;if(this.batchBtn)this.batchBtn.disabled=true;var probeable=this.sections.filter(function(s){return s.enabled_for_runtime;}),results=[],tasks=[],total=probeable.length+(this.tierProxies||[]).length+(this.warpRouteReady?1:0),n=0,chain=Promise.resolve();probeable.forEach(function(s){tasks.push({type:'section',label:s.name,run:function(){return callActiveProbe('',s.name,'','');}});});(this.tierProxies||[]).forEach(function(p){tasks.push({type:'proxy',label:p.label,run:function(){return callActiveProbe('','',p.endpoint,p.label);}});});if(this.warpRouteReady)tasks.push({type:'warp',label:_('WARP Rescue · WARPSCOUT'),run:function(){var ep=self.currentWarpEndpoint();return self.ensureWarpTestRoute(ep).then(function(rt){return callActiveProbe('','',(rt&&rt.proxy)||'socks5h://127.0.0.1:18191',_('WARP Rescue · ')+ep);}).then(function(d){return self.stopWarpTestRoute().then(function(){return d;});});}});this.beginProgress(_('Проверка всех маршрутов'),_('Подготовка · всего ')+total);tasks.forEach(function(t){chain=chain.then(function(){n++;self.setProgress(_('Маршрут ')+n+' / '+total+' · '+t.label+' · '+_('география + сервисы + скорость'));return t.run().then(function(d){results.push({sec:t.label,d:d,type:t.type});}).catch(function(e){if(t.type==='warp')return self.stopWarpTestRoute().catch(function(){}).then(function(){results.push({sec:t.label,d:null,type:t.type,reason:(e&&e.message)||'warp_test_failed'});});results.push({sec:t.label,d:null,type:t.type,reason:(e&&e.message)||'rpc_error'});});});});return chain.then(function(){self.endProgress();dom.content(self.body,self.renderBatch(results));}).finally(function(){self.endProgress();self.runBtn.disabled=false;if(self.batchBtn)self.batchBtn.disabled=false;});},
+	renderBatch:function(results){var self=this;return E('div',{'class':'cbi-section pb-card','style':'max-width:820px;'},[E('h3',{'style':'margin-top:0;'},_('Сводка по маршрутам')),E('div',{},results.map(function(r){if(!r.d)return row(r.sec,dot('red',r.type==='warp'?_('Проверка WARP не выполнена: ')+r.reason:(r.type==='proxy'?_('Проверка прокси не выполнена: ')+r.reason:_('Проверка секции не выполнена: ')+r.reason)));if(r.d.available===false){var reason=r.d.reason||r.reason||'unavailable';return row(r.sec,dot('yellow',r.type==='section'&&reason==='mixed_proxy_off'?_('Mixed Proxy выключен'):(r.type==='warp'?_('Маршрут WARP недоступен: ')+reason:_('Маршрут недоступен: ')+reason)));}var d=r.d,g=d.geo||{},tg=(d.services||[]).filter(function(s){return s.name==='Telegram API';})[0],tgTxt=tg?(', Telegram '+(tg.status==='ok'?'ok':tg.status)):'',name=self.serverName(d),speed=(d.speed&&d.speed.mbps)?d.speed.mbps+' Mbps':'';return row(r.sec,E('span',{},name+' · '+(g.country||'—')+tgTxt+(speed?' · '+speed:'')));}))]);},
 
-	/* Enable Mixed Proxy for a section (explicit user action from the degraded
-	 * screen). Backend assigns a free non-colliding port. On success, re-fetch the
-	 * sections list and run a fresh probe of the now-enabled section. */
-	enableMixedProxy: function(section) {
-		var self = this;
-		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' },
-			dot('grey', _('Включаю Mixed Proxy для секции ') + section + '…')));
-		return callEnsureMixedProxy(section).then(function(r) {
-			if (r && (r.ok || r.already_enabled)) {
-				return callRuntimeSections().catch(function(){ return self.sectionsMeta; }).then(function(sd) {
-					if (sd && sd.sections) { self.sections = sd.sections; self.sectionsMeta = sd; }
-					return callActiveProbe('', section).then(function(d) {
-						dom.content(self.body, self.renderProbe(d));
-					});
-				});
-			}
-			dom.content(self.body, E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(232,163,61,.4);border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
-				dot('yellow', _('Не удалось включить Mixed Proxy')),
-				E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (r && r.detail) ? r.detail : (r && r.reason ? r.reason : ''))
-			]));
-		}).catch(function(e){
-			dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, [
-				dot('red', _('Ошибка включения Mixed Proxy')),
-				E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (e && e.message) ? String(e.message) : '')
-			]));
-		});
-	},
-
-	/* Switching section shows that section's cached probe immediately (per-section
-	 * cache). No fresh probe — user presses "Проверить выбранную" for that. If the
-	 * section has no cache yet, show the empty state. */
-	/* target = either "sec:<name>" or "proxy:<endpoint>". Parse the prefix and
-	 * remember the selection; show the cached probe if one exists. */
-	onTargetChange: function(ev) {
-		var self = this;
-		var v = ev.target.value || '';
-		if (v.indexOf('proxy:') === 0) {
-			this.selectedProxy = v.slice(6);
-			this.selectedSection = '';
-			var opt = ev.target.options[ev.target.selectedIndex];
-			this.selectedProxyLabel = (opt && opt.getAttribute('data-label')) || this.selectedProxy;
-			return callActiveProbe('true', '', this.selectedProxy, this.selectedProxyLabel).then(function(d) {
-				dom.content(self.body, self.renderProbe(d));
-			}).catch(function(){ dom.content(self.body, self.renderProbe(null)); });
-		}
-		this.selectedProxy = '';
-		this.selectedProxyLabel = '';
-		this.selectedSection = (v.indexOf('sec:') === 0) ? v.slice(4) : v;
-		return callActiveProbe('true', this.selectedSection, '', '').then(function(d) {
-			dom.content(self.body, self.renderProbe(d));
-		}).catch(function() {
-			dom.content(self.body, self.renderProbe(null));
-		});
-	},
-
-	runProbe: function() {
-		var self = this;
-		this.runBtn.disabled = true;
-		if (this.batchBtn) this.batchBtn.disabled = true;
-		var usingProxy = !!this.selectedProxy;
-		var sec = usingProxy ? '' : (this.selectedSection || '');
-		var prox = usingProxy ? this.selectedProxy : '';
-		var lbl = usingProxy ? (this.selectedProxyLabel || '') : '';
-		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' }, dot('grey', _('Проверка… (15–40 секунд)'))));
-		return callActiveProbe('', sec, prox, lbl).then(function(d) {
-			dom.content(self.body, self.renderProbe(d));
-		}).catch(function(e){
-			dom.content(self.body, E('div', { 'class':'cbi-section pb-wide' }, [
-				dot('red', _('Проба не завершилась (превышено время или ошибка вызова).')),
-				E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' }, (e && e.message) ? String(e.message) : '')
-			]));
-		}).finally(function(){ self.runBtn.disabled = false; if (self.batchBtn) self.batchBtn.disabled = false; });
-	},
-
-	/* Probe every runtime-capable section SEQUENTIALLY (roadmap 5: weak routers,
-	 * don't hammer curl/jq/Clash in parallel). Shows a compact summary. */
-	runAllProbes: function() {
-		var self = this;
-		this.runBtn.disabled = true;
-		if (this.batchBtn) this.batchBtn.disabled = true;
-		var probeable = this.sections.filter(function(s){ return s.enabled_for_runtime; });
-		var results = [];
-		dom.content(this.body, E('div', { 'class':'cbi-section pb-wide' },
-			dot('grey', _('Последовательная проверка маршрутов…'))));
-
-		var chain = Promise.resolve();
-		/* sections first (probe via their Mixed Proxy) */
-		probeable.forEach(function(s){
-			chain = chain.then(function(){
-				return callActiveProbe('', s.name, '', '').then(function(d){ results.push({ sec:s.name, d:d }); })
-					.catch(function(){ results.push({ sec:s.name, d:null }); });
-			});
-		});
-		/* then transport-tier proxies from the Transport tab (tier1/2/3) */
-		(this.tierProxies || []).forEach(function(p){
-			chain = chain.then(function(){
-				return callActiveProbe('', '', p.endpoint, p.label).then(function(d){ results.push({ sec:p.label, d:d, isProxy:true }); })
-					.catch(function(){ results.push({ sec:p.label, d:null, isProxy:true }); });
-			});
-		});
-		return chain.then(function(){
-			dom.content(self.body, self.renderBatch(results));
-		}).finally(function(){ self.runBtn.disabled = false; if (self.batchBtn) self.batchBtn.disabled = false; });
-	},
-
-	renderBatch: function(results) {
-		var self = this;
-		return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
-			E('h3', { 'style':'margin-top:0;' }, _('Сводка по маршрутам')),
-			E('div', {}, results.map(function(r){
-				if (!r.d || r.d.available === false) {
-					return row(r.sec, dot('grey', _('нет данных / Mixed Proxy выключен')));
-				}
-				var d = r.d, g = d.geo || {};
-				var tg = (d.services || []).filter(function(s){ return s.name === 'Telegram API'; })[0];
-				var tgTxt = tg ? (', Telegram ' + (tg.status === 'ok' ? 'ok' : tg.status)) : '';
-				var name = self.serverName(d);
-				var speed = (d.speed && d.speed.mbps) ? (d.speed.mbps + ' Mbps') : '';
-				return row(r.sec, E('span', {}, name + ' · ' + (g.country || '—') + tgTxt + (speed ? (' · ' + speed) : '')));
-			}))
-		]);
-	},
-
-	renderProbe: function(d) {
-		var self = this;
-		if (!d) {
-			return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' },
-				dot('grey', _('Нет данных по этой секции — нажмите кнопку проверки')));
-		}
-		if (d.available === false) {
-			var reasons = {
-				mixed_proxy_off: _('Mixed Proxy не включён на этой секции.'),
-				no_cache: _('Нет сохранённого результата по этому маршруту — нажмите кнопку проверки.'),
-				no_section: _('Секция не найдена.'),
-				uci_missing: _('Podkop не установлен или не настроен.')
-			};
-			var kids = [ dot('yellow', reasons[d.reason] || d.detail || _('Проба недоступна')) ];
-			/* Offer to enable Mixed Proxy for this section (assigns a free port that
-			 * doesn't collide with other sections). Explicit button — we don't touch
-			 * Podkop config silently. */
-			if (d.reason === 'mixed_proxy_off') {
-				var sec = d.section || self.selectedSection || '';
-				kids.push(E('div', { 'style':'margin-top:.7em;' }, [
-					E('button', {
-						'class':'cbi-button cbi-button-action',
-						'click': ui.createHandlerFn(self, 'enableMixedProxy', sec)
-					}, _('Включить Mixed Proxy для секции ') + sec),
-					E('div', { 'style':'color:#888;font-size:85%;margin-top:.4em;' },
-						_('Будет назначен свободный порт (без пересечения с другими секциями). Изменение вносится в конфигурацию Podkop.'))
-				]));
-			}
-			return E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid rgba(232,163,61,.4);border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, kids);
-		}
-
-		var geo = d.geo || {};
-		var age = d.checked_at ? this.ago(d.checked_at) : '';
-		var flag = this.flag(geo.country);
-		var countryLabel = (geo.country || '—');
-
-		return E('div', {}, [
-			/* Active server (outbound) */
-			E('div', { 'class':'cbi-section', 'style':'max-width:820px;border:1px solid var(--border-color-medium,rgba(127,127,127,.2));border-radius:8px;padding:1em 1.2em;background:var(--background-color-high,var(--background-color,var(--background,rgba(40,40,40,.94))));' }, [
-				E('h3', { 'style':'margin-top:0;' }, _('Активный сервер (outbound)')),
-				/* proxy mode has no sing-box "server" — show only the Target row
-				 * (was duplicating the same endpoint in both Server and Target). */
-				(d.section === '__proxy__')
-					? row(_('Маршрут'), E('span', {}, d.proxy_human || d.endpoint || _('транспорт-прокси')))
-					: row(_('Сервер'), this.serverDisplay(d, flag)),
-				(d.section !== '__proxy__' && d.server_delay != null && d.server_delay > 0)
-					? row(_('Задержка до сервера'), dot(d.server_delay < 300 ? 'green' : 'yellow', d.server_delay + _(' мс')))
-					: E('span', {}),
-				(d.section === '__proxy__')
-					? E('span', {})
-					: row(_('Секция'), E('span', {}, d.section || '—')),
-				row(_('Страна выхода'), E('span', {}, countryLabel)),
-				row(_('Провайдер'), E('span', {}, geo.org || '—')),
-				row(_('IP выхода'), E('span', {}, geo.ip || '—')),
-				(d.section === '__proxy__')
-					? E('span', {})
-					: row(_('Серверов в секции'), E('span', {}, String(d.servers != null ? d.servers : '—'))),
-				(d.abuse && d.abuse !== 'unknown')
-					? row(_('Тип IP'), d.abuse === 'clean'
-						? dot('green', _('резидентный / чистый'))
-						: dot('yellow', ({datacenter:_('датацентр/хостинг'), google_captcha:_('Google просит капчу'), proxy:_('прокси/VPN')}[d.abuse_why] || _('помечен'))))
-					: E('span', {}),
-				E('div', { 'style':'color:#888;font-size:82%;margin-top:.5em;' }, _('Транспорт к серверу: ') + (d.endpoint || '—'))
-			]),
-
-			/* Services */
-			E('div', { 'class':'cbi-section pb-card' }, [
-				E('h3', { 'style':'margin-top:0;margin-bottom:.6em;' }, _('Сервисы через туннель')),
-				E('div', { 'style':'display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.4em;' },
-					(d.services || []).map(function(s) {
-						var c = (s.status === 'ok') ? 'green'
-							: (s.status === 'blocked') ? 'yellow'
-							: (s.status === 'na') ? 'grey'
-							: (s.status === 'timeout') ? 'grey' : 'yellow';
-						var ms = (s.ms != null && s.ms > 0) ? (' · ' + s.ms + _(' мс')) : '';
-						var geo = (s.geo && s.geo.trim()) ? (' · ' + s.geo) : '';
-						/* N/A = probe didn't finish within the deadline; show it
-						 * plainly instead of a misleading code/latency. */
-						var label = (s.status === 'na')
-							? (s.name + ' · N/A')
-							: (s.name + (s.code && s.code !== '000' ? (' ' + s.code) : '') + ms + geo);
-						/* justify-content:flex-start keeps the dot hugging its label
-						 * instead of the grid cell stretching them to opposite edges
-						 * on narrow screens. */
-						return E('div', { 'style':'justify-self:start;' }, dot(c, label));
-					}))
-			]),
-
-			/* Speed + TSPU */
-			this.speedCard(d.speed || {}),
-
-			age ? E('div', { 'style':'max-width:820px;color:#888;font-size:85%;text-align:right;margin-top:.5em;' },
-				_('Данные: ') + (d.section === '__proxy__' ? (d.proxy_human || _('транспорт-прокси')) : (_('секция ') + (d.section || '—'))) + ' · ' + age) : E('span', {}),
-			(this.selectedSection && d.section && this.selectedSection !== d.section)
-				? E('div', { 'style':'max-width:820px;color:#e8a33d;font-size:85%;text-align:right;margin-top:.2em;' },
-					_('Выбрана секция ') + this.selectedSection + _(', показан кеш секции ') + d.section + _('. Нажмите «Проверить выбранную».'))
-				: E('span', {})
-		]);
-	},
-
-	speedCard: function(sp) {
-		var status = sp.status || 'unknown';
-		var node, note;
-		if (status === 'ok') {
-			node = dot('green', (sp.mbps || '0') + ' Mbps');
-			note = _('Туннель работает, блокировки скорости не обнаружено.');
-		} else if (status === 'block16k') {
-			node = dot('yellow', _('обрыв на ~16 КБ'));
-			note = _('Похоже на блокировку ТСПУ/РКН: соединение рвётся после ~16 КБ. Крупные загрузки через этот выход работать не будут.');
-		} else if (status === 'blocked') {
-			node = dot('red', _('нет передачи данных'));
-			note = _('Через активный выход данные не идут — туннель не работает или полностью заблокирован.');
-		} else {
-			node = dot('grey', _('неизвестно'));
-			note = '';
-		}
-		return E('div', { 'class':'cbi-section pb-card' }, [
-			E('h3', { 'style':'margin-top:0;' }, _('Скорость и блокировки ТСПУ')),
-			row(_('Скорость / статус'), node),
-			note ? E('p', { 'style':'color:#888;font-size:90%;margin:.4em 0 0;' }, note) : E('span', {})
-		]);
-	},
-
-	/* ISO-3166 alpha-2 → flag emoji, built reliably in JS (busybox printf can't). */
-	/* sing-box tag → readable server label. "main-1-out" → "Сервер №1".
-	 * The full pretty name from the proxy link is a deferred feature. */
-	/* Prefer the human name from the subscription link; fall back to the tag
-	 * turned into "Сервер №N", then the raw tag. */
-	serverName: function(d) {
-		if (d.proxy_human && d.proxy_human.trim()) return d.proxy_human;
-		return this.serverLabel(d.proxy_name);
-	},
-
-	/* Compose "flag name", but don't prepend the geo flag if the resolved name
-	 * already starts with a regional-indicator flag emoji (subscription names
-	 * often embed their own flag, e.g. "🇷🇺 Russia") — avoids "🇷🇺 🇷🇺 Russia". */
-	serverDisplay: function(d, flag) {
-		var name = this.serverName(d);
-		var startsWithFlag = /^[\u{1F1E6}-\u{1F1FF}]{2}/u.test(name);
-		if (flag && !startsWithFlag) return flag + ' ' + name;
-		return name;
-	},
-
-	serverLabel: function(tag) {
-		if (!tag) return _('неизвестен');
-		var m = tag.match(/^(.+)-(\d+)-out$/);
-		if (m) return _('Сервер №') + m[2] + ' · ' + tag;
-		if (/-out$/.test(tag)) return tag;
-		return tag;
-	},
-
-	flag: function(cc) {
-		if (!cc || !/^[A-Za-z]{2}$/.test(cc)) return '';
-		var up = cc.toUpperCase();
-		return String.fromCodePoint(0x1F1E6 + up.charCodeAt(0) - 65,
-		                            0x1F1E6 + up.charCodeAt(1) - 65);
-	},
-
-	ago: function(ts) {
-		var s = Math.floor(Date.now()/1000) - ts;
-		if (s < 60) return _('только что');
-		if (s < 3600) return Math.floor(s/60) + _(' мин назад');
-		if (s < 86400) return Math.floor(s/3600) + _(' ч назад');
-		return Math.floor(s/86400) + _(' дн назад');
-	},
-
-	handleSave: null, handleSaveApply: null, handleReset: null
+	renderProbe:function(d){var self=this;if(!d)return E('div',{'class':'cbi-section pb-card','style':'max-width:820px;'},dot('grey',_('Нет данных по этому маршруту — нажмите кнопку проверки')));if(d.available===false){var reasons={mixed_proxy_off:_('Mixed Proxy не включён на этой секции.'),no_cache:_('Нет сохранённого результата — нажмите кнопку проверки.'),no_section:_('Секция не найдена.'),uci_missing:_('Podkop не установлен или не настроен.')},kids=[dot('yellow',reasons[d.reason]||d.detail||_('Проверка недоступна'))];if(d.reason==='mixed_proxy_off'){var sec=d.section||self.selectedSection||'';kids.push(E('div',{'style':'margin-top:.7em;'},[E('button',{'class':'cbi-button cbi-button-action','click':ui.createHandlerFn(self,'enableMixedProxy',sec)},_('Включить Mixed Proxy для секции ')+sec)]));}return E('div',{'class':'cbi-section pb-card','style':'max-width:820px;'},kids);}var geo=d.geo||{},age=d.checked_at?this.ago(d.checked_at):'',flag=this.flag(geo.country),countryLabel=geo.country||'—';return E('div',{},[E('div',{'class':'cbi-section pb-card','style':'max-width:820px;'},[E('h3',{'style':'margin-top:0;'},_('Активный выход')),(d.section==='__proxy__')?row(_('Маршрут'),E('span',{},d.proxy_human||d.endpoint||_('транспортный прокси'))):row(_('Сервер'),this.serverDisplay(d,flag)),(d.section!=='__proxy__'&&d.server_delay>0)?row(_('Задержка до сервера'),dot(d.server_delay<300?'green':'yellow',d.server_delay+_(' мс'))):E('span',{}),row(_('Страна выхода'),E('span',{},countryLabel)),row(_('Провайдер'),E('span',{},geo.org||'—')),row(_('IP выхода'),E('span',{},geo.ip||'—')),E('div',{'style':'color:#888;font-size:82%;margin-top:.5em;'},_('Транспорт к серверу: ')+(d.endpoint||'—'))]),E('div',{'class':'cbi-section pb-card'},[E('h3',{'style':'margin-top:0;margin-bottom:.6em;'},_('Сервисы через туннель')),E('div',{'style':'display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.4em;'},(d.services||[]).map(function(s){var c=s.status==='ok'?'green':(s.status==='blocked'?'yellow':'grey'),ms=s.ms>0?' · '+s.ms+_(' мс'):'',ge=s.geo&&s.geo.trim()?' · '+s.geo:'';return E('div',{'style':'justify-self:start;'},dot(c,s.name+(s.code&&s.code!=='000'?' '+s.code:'')+ms+ge));}))]),this.speedCard(d.speed||{}),age?E('div',{'style':'max-width:820px;color:#888;font-size:85%;text-align:right;margin-top:.5em;'},_('Данные: ')+age):E('span',{})]);},
+	speedCard:function(sp){var status=sp.status||'unknown',node,note;if(status==='ok'){node=dot('green',(sp.mbps||'0')+' Mbps');note=_('Туннель работает, блокировки скорости не обнаружено.');}else if(status==='block16k'){node=dot('yellow',_('обрыв на ~16 КБ'));note=_('Похоже на блокировку ТСПУ/РКН.');}else if(status==='blocked'){node=dot('red',_('нет передачи данных'));note=_('Через активный выход данные не идут.');}else{node=dot('grey',_('неизвестно'));note='';}return E('div',{'class':'cbi-section pb-card'},[E('h3',{'style':'margin-top:0;'},_('Скорость и блокировки ТСПУ')),row(_('Скорость / статус'),node),note?E('p',{'style':'color:#888;font-size:90%;margin:.4em 0 0;'},note):E('span',{})]);},
+	serverName:function(d){if(d.proxy_human&&d.proxy_human.trim())return d.proxy_human;return this.serverLabel(d.proxy_name);},
+	serverDisplay:function(d,flag){var name=this.serverName(d),starts=/^[\u{1F1E6}-\u{1F1FF}]{2}/u.test(name);return flag&&!starts?flag+' '+name:name;},
+	serverLabel:function(tag){if(!tag)return _('неизвестен');var m=tag.match(/^(.+)-(\d+)-out$/);if(m)return _('Сервер №')+m[2]+' · '+tag;return tag;},
+	flag:function(cc){if(!cc||!/^[A-Za-z]{2}$/.test(cc))return '';var up=cc.toUpperCase();return String.fromCodePoint(0x1F1E6+up.charCodeAt(0)-65,0x1F1E6+up.charCodeAt(1)-65);},
+	ago:function(ts){return ageText(ts);},
+	handleSave:null,handleSaveApply:null,handleReset:null
 });

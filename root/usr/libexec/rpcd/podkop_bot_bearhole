@@ -1,0 +1,400 @@
+#!/bin/sh
+. /usr/lib/podkop_bot/json-log.sh
+# rpcd object: podkop_bot_bearhole
+
+CTL=/usr/lib/podkop_bot/bearhole.sh
+PROXY=/usr/bin/hwelp-proxy
+BH_DIR=/tmp/podkop_bot/bearhole
+REGISTRY="$BH_DIR/routes.registry"
+RESULTS="$BH_DIR/system.results"
+STATE="$BH_DIR/state"
+LOG="$BH_DIR/bearhole.log"
+START_LOCK="$BH_DIR/start.lock"
+START_PID="$BH_DIR/start.pid"
+QUAL_LOCK="$BH_DIR/qualify.lock"
+QUAL_PID="$BH_DIR/qualify.pid"
+
+hwelp_port() {
+    _p=$(uci -q get podkop_bearhole.main.port 2>/dev/null)
+    case "$_p" in ''|*[!0-9]*) _p=1066;; esac
+    [ "$_p" -ge 1024 ] 2>/dev/null && [ "$_p" -le 65535 ] 2>/dev/null || _p=1066
+    printf '%s' "$_p"
+}
+
+gateway() { printf 'http://127.0.0.1:%s' "$(hwelp_port)"; }
+gateway_auth() { "$CTL" proxy-url 2>/dev/null; }
+
+engine_reason() {
+    [ -x "$PROXY" ] || { printf 'hwelp_missing'; return; }
+    "$PROXY" --check >/dev/null 2>&1 || { printf 'hwelp_broken'; return; }
+    printf ''
+}
+
+engine_ready() { [ -z "$(engine_reason)" ]; }
+
+ensure_bearhole_uci() {
+    [ -e /etc/config/podkop_bearhole ] || {
+        mkdir -p /etc/config || return 1
+        : > /etc/config/podkop_bearhole || return 1
+    }
+    uci -q get podkop_bearhole.main >/dev/null 2>&1 || \
+        uci -q set podkop_bearhole.main=bearhole
+}
+
+write_state() {
+    _state="$1"; _reason="$2"; _now=$(date +%s 2>/dev/null || echo 0)
+    _tmp="$STATE.$$"
+    {
+        printf 'state=%s\n' "$_state"
+        printf 'reason=%s\n' "$_reason"
+        printf 'updated_at=%s\n' "$_now"
+    } > "$_tmp" && mv "$_tmp" "$STATE"
+}
+
+log_event() {
+    logger -t podkop-bearhole "$*" 2>/dev/null || true
+    printf '%s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+cleanup_stale_qualify_lock() {
+    [ -d "$QUAL_LOCK" ] || return 0
+    _pid=$(cat "$QUAL_PID" 2>/dev/null || echo 0)
+    case "$_pid" in ''|*[!0-9]*) _pid=0;; esac
+    [ "$_pid" -gt 0 ] 2>/dev/null && kill -0 "$_pid" 2>/dev/null && return 0
+    rm -rf "$QUAL_LOCK" "$QUAL_PID" 2>/dev/null || true
+}
+
+cleanup_stale_start_lock() {
+    [ -d "$START_LOCK" ] || return 0
+    _pid=$(cat "$START_PID" 2>/dev/null || echo 0)
+    case "$_pid" in ''|*[!0-9]*) _pid=0;; esac
+    [ "$_pid" -gt 0 ] 2>/dev/null && kill -0 "$_pid" 2>/dev/null && return 0
+    rm -rf "$START_LOCK" "$START_PID" 2>/dev/null || true
+}
+
+stop_start_worker() {
+    _pid=$(cat "$START_PID" 2>/dev/null || echo 0)
+    case "$_pid" in ''|*[!0-9]*) _pid=0;; esac
+    [ "$_pid" -gt 0 ] 2>/dev/null && kill "$_pid" 2>/dev/null || true
+    rm -rf "$START_LOCK" "$START_PID" 2>/dev/null || true
+}
+
+fail_closed() {
+    _reason="$1"
+    ensure_bearhole_uci >/dev/null 2>&1 || true
+    uci -q set podkop_bearhole.main.enabled=0 >/dev/null 2>&1 || true
+    uci -q commit podkop_bearhole >/dev/null 2>&1 || true
+    /etc/init.d/podkop-bearhole stop >/dev/null 2>&1 || true
+    /etc/init.d/podkop-bearhole disable >/dev/null 2>&1 || true
+    "$CTL" system-off >/dev/null 2>&1 || true
+    write_state failed "$_reason"
+    log_event "event=bearhole_start_failed reason=$_reason"
+}
+
+progress_json() {
+    _base="$1"
+    _probing=$(printf '%s' "$_base" | jq -r '.probing // false' 2>/dev/null)
+    _started=$(printf '%s' "$_base" | jq -r '.updated_at // 0' 2>/dev/null)
+    case "$_started" in ''|*[!0-9]*) _started=0;; esac
+    _total=$(wc -l < "$REGISTRY" 2>/dev/null | tr -d ' ')
+    case "$_total" in ''|*[!0-9]*) _total=0;; esac
+    _done=0; _current=''; _label=''
+    if [ "$_probing" = true ] && [ -f "$LOG" ]; then
+        _done=$(awk -v s="$_started" '$1+0>=s && /event=bearhole_probe route=/{n++}END{print n+0}' "$LOG" 2>/dev/null)
+        _current=$(awk -v s="$_started" '$1+0>=s && /event=bearhole_probe_start route=/{for(i=2;i<=NF;i++)if($i ~ /^route=/){sub(/^route=/,"",$i);r=$i}}END{print r}' "$LOG" 2>/dev/null)
+        [ -n "$_current" ] && _label=$(awk -F'|' -v id="$_current" '$1==id{print $2;exit}' "$REGISTRY" 2>/dev/null)
+    fi
+    case "$_done" in ''|*[!0-9]*) _done=0;; esac
+    _starting=false; [ -d "$START_LOCK" ] && _starting=true
+    printf '{"starting":%s,"progress_done":%s,"progress_total":%s,"progress_route":%s,"progress_label":%s}' \
+        "$_starting" "$_done" "$_total" "$(printf '%s' "$_current" | pb_json_log_filter)" "$(printf '%s' "$_label" | pb_json_log_filter)"
+}
+
+start_worker() {
+    trap 'rm -rf "$START_LOCK" "$START_PID" 2>/dev/null' EXIT INT TERM HUP
+    cleanup_stale_qualify_lock
+    "$CTL" system-off >/dev/null 2>&1 || true
+
+    if ! engine_ready; then
+        write_state starting installing_hwelp
+        log_event 'event=bearhole_start stage=install_hwelp'
+        if ! "$CTL" install-hwelp >/dev/null 2>&1 || ! engine_ready; then
+            fail_closed hwelp_install_failed
+            return
+        fi
+    fi
+
+    rm -f "$RESULTS" "$BH_DIR/current" 2>/dev/null || true
+    write_state starting collecting_routes
+    log_event 'event=bearhole_start stage=collect_routes'
+    if ! "$CTL" bootstrap >/dev/null 2>&1; then
+        fail_closed no_routes
+        return
+    fi
+
+    _port=$(hwelp_port)
+    if [ "$(uci -q get podkop_bearhole.main.auth_enabled 2>/dev/null)" = 1 ]; then
+        _au=$(uci -q get podkop_bearhole.main.auth_user 2>/dev/null)
+        _ap=$(uci -q get podkop_bearhole.main.auth_pass 2>/dev/null)
+        if [ -z "$_au" ] || [ -z "$_ap" ]; then
+            fail_closed auth_invalid
+            return
+        fi
+    fi
+    if ! "$PROXY" -l 127.0.0.1 -p "$_port" --check-bind >/dev/null 2>&1; then
+        fail_closed port_in_use
+        return
+    fi
+
+    ensure_bearhole_uci || { fail_closed uci_init_failed; return; }
+    uci -q set podkop_bearhole.main.enabled=1 || { fail_closed uci_enable_failed; return; }
+    uci -q commit podkop_bearhole || { fail_closed uci_commit_failed; return; }
+
+    write_state starting hwelp_start
+    log_event "event=bearhole_start stage=hwelp_start port=$_port"
+    /etc/init.d/podkop-bearhole enable >/dev/null 2>&1 || true
+    /etc/init.d/podkop-bearhole restart >/dev/null 2>&1 || true
+
+    _i=0
+    while [ "$_i" -lt 20 ]; do
+        _st=$("$CTL" status 2>/dev/null || printf '{}')
+        [ "$(printf '%s' "$_st" | jq -r '.running // false' 2>/dev/null)" = true ] && break
+        sleep 1; _i=$((_i+1))
+    done
+    if [ "$_i" -ge 20 ]; then
+        fail_closed gateway_start_failed
+        return
+    fi
+
+    write_state starting system_proxy
+    log_event 'event=bearhole_start stage=system_proxy'
+    if ! "$CTL" system-on >/dev/null 2>&1; then
+        fail_closed system_proxy_apply_failed
+        return
+    fi
+    _st=$("$CTL" status 2>/dev/null || printf '{}')
+    if [ "$(printf '%s' "$_st" | jq -r '.system_applied // false' 2>/dev/null)" != true ]; then
+        fail_closed system_proxy_apply_failed
+        return
+    fi
+
+    log_event 'event=bearhole_start stage=qualify_routes'
+    "$CTL" qualify-start >/dev/null 2>&1
+    _qrc=$?
+    if [ "$_qrc" -ne 0 ] && [ "$_qrc" -ne 2 ]; then
+        fail_closed qualification_start_failed
+        return
+    fi
+
+    _i=0
+    while [ "$_i" -lt 600 ]; do
+        _st=$("$CTL" status 2>/dev/null || printf '{}')
+        _probing=$(printf '%s' "$_st" | jq -r '.probing // false' 2>/dev/null)
+        _valid=$(printf '%s' "$_st" | jq -r '.valid_routes // 0' 2>/dev/null)
+        _state=$(printf '%s' "$_st" | jq -r '.state // ""' 2>/dev/null)
+        if [ "$_probing" != true ]; then
+            if [ "$_valid" -gt 0 ] 2>/dev/null; then
+                break
+            fi
+            if [ "$_state" = degraded ] || [ "$_state" = failed ]; then
+                fail_closed no_usable_route
+                return
+            fi
+        fi
+        sleep 1; _i=$((_i+1))
+    done
+    if [ "$_i" -ge 600 ]; then
+        fail_closed route_check_timeout
+        return
+    fi
+
+    _gateway=$(gateway_auth)
+    _display=$(gateway)
+    [ -n "$_gateway" ] || { fail_closed auth_invalid; return; }
+    write_state verifying gateway_check
+    log_event "event=bearhole_start stage=gateway_check gateway=$_display"
+    if ! curl -q -4 -L -fsS --proxy "$_gateway" --connect-timeout 4 --max-time 12 \
+        -o /dev/null 'https://raw.githubusercontent.com/Medvedolog/luci-app-podkop-bot/main/version.txt' >/dev/null 2>&1; then
+        fail_closed gateway_check_failed
+        return
+    fi
+
+    write_state ready gateway_verified
+    log_event "event=bearhole_ready gateway=$_display"
+}
+
+start_async() {
+    cleanup_stale_start_lock
+    [ -d "$START_LOCK" ] && return 2
+    mkdir "$START_LOCK" 2>/dev/null || return 2
+    write_state starting requested
+    ( start_worker ) </dev/null >/dev/null 2>&1 &
+    _pid=$!
+    printf '%s\n' "$_pid" > "$START_PID"
+    return 0
+}
+
+set_port() {
+    _port="$1"
+    case "$_port" in ''|*[!0-9]*) return 2;; esac
+    [ "$_port" -ge 1024 ] 2>/dev/null && [ "$_port" -le 65535 ] 2>/dev/null || return 2
+
+    _old=$(hwelp_port)
+    [ "$_port" = "$_old" ] && return 0
+
+    _was_active=0
+    [ "$(uci -q get podkop_bearhole.main.enabled 2>/dev/null)" = 1 ] && _was_active=1
+    stop_start_worker
+    if [ "$_was_active" = 1 ]; then
+        "$CTL" disable >/dev/null 2>&1 || true
+    fi
+
+    ensure_bearhole_uci || return 1
+    uci -q set "podkop_bearhole.main.port=$_port" || return 1
+    uci -q commit podkop_bearhole || return 1
+    log_event "event=hwelp_port_changed old=$_old new=$_port"
+
+    [ "$_was_active" = 1 ] && start_async
+    return 0
+}
+
+set_proxy() {
+    _json="$1"
+    _port=$(printf '%s' "$_json" | jq -r '.port // empty' 2>/dev/null)
+    _auth=$(printf '%s' "$_json" | jq -r '.auth_enabled // false' 2>/dev/null)
+    _user=$(printf '%s' "$_json" | jq -r '.username // ""' 2>/dev/null)
+    _pass=$(printf '%s' "$_json" | jq -r '.password // ""' 2>/dev/null)
+    case "$_port" in ''|*[!0-9]*) return 2;; esac
+    [ "$_port" -ge 1024 ] 2>/dev/null && [ "$_port" -le 65535 ] 2>/dev/null || return 2
+    case "$_auth" in true|1) _auth=1;; false|0) _auth=0;; *) return 3;; esac
+    [ ${#_user} -le 128 ] 2>/dev/null || return 3
+    [ ${#_pass} -le 255 ] 2>/dev/null || return 3
+    printf '%s' "$_user$_pass" | LC_ALL=C grep -q '[[:cntrl:]]' && return 3
+
+    _oldpass=$(uci -q get podkop_bearhole.main.auth_pass 2>/dev/null)
+    [ "$_auth" = 1 ] && [ -z "$_pass" ] && _pass="$_oldpass"
+    if [ "$_auth" = 1 ] && { [ -z "$_user" ] || [ -z "$_pass" ]; }; then return 3; fi
+
+    _was_active=0
+    [ "$(uci -q get podkop_bearhole.main.enabled 2>/dev/null)" = 1 ] && _was_active=1
+    stop_start_worker
+    [ "$_was_active" = 1 ] && "$CTL" disable >/dev/null 2>&1 || true
+
+    ensure_bearhole_uci || return 1
+    uci -q set "podkop_bearhole.main.port=$_port" || return 1
+    uci -q set "podkop_bearhole.main.auth_enabled=$_auth" || return 1
+    if [ "$_auth" = 1 ]; then
+        uci -q set "podkop_bearhole.main.auth_user=$_user" || return 1
+        uci -q set "podkop_bearhole.main.auth_pass=$_pass" || return 1
+    else
+        uci -q delete podkop_bearhole.main.auth_user >/dev/null 2>&1 || true
+        uci -q delete podkop_bearhole.main.auth_pass >/dev/null 2>&1 || true
+    fi
+    uci -q commit podkop_bearhole || return 1
+    log_event "event=hwelp_proxy_config port=$_port auth=$([ "$_auth" = 1 ] && echo on || echo off)"
+    [ "$_was_active" = 1 ] && start_async
+    return 0
+}
+
+case "$1" in
+    list)
+        echo '{"status":{},"results":{},"start":{},"set_enabled":{"enabled":true},"set_port":{"port":0},"set_proxy":{"port":0,"auth_enabled":false,"username":"","password":""},"qualify_start":{},"refresh_routes":{},"log":{"offset":0}}'
+        ;;
+    call)
+        case "$2" in
+            status)
+                cat >/dev/null 2>&1 || true
+                _base=$("$CTL" status 2>/dev/null || printf '{"ok":false}')
+                _reason=$(engine_reason)
+                if [ -z "$_reason" ]; then _ready=true; else _ready=false; fi
+                _prog=$(progress_json "$_base")
+                printf '%s' "$_base" | jq -c --argjson ready "$_ready" --arg reason "$_reason" --argjson prog "$_prog" '. + {engine_ready:$ready,engine_reason:$reason} + $prog' 2>/dev/null || \
+                    printf '{"ok":false,"engine_ready":%s,"engine_reason":%s}\n' "$_ready" "$(printf '%s' "$_reason" | pb_json_log_filter)"
+                ;;
+            results)
+                cat >/dev/null 2>&1 || true
+                "$CTL" results
+                ;;
+            start)
+                cat >/dev/null 2>&1 || true
+                if start_async; then
+                    printf '{"ok":true,"started":true}\n'
+                else
+                    _rc=$?
+                    [ "$_rc" = 2 ] && printf '{"ok":true,"started":false,"reason":"already_running"}\n' || printf '{"ok":false,"reason":"start_failed"}\n'
+                fi
+                ;;
+            set_enabled)
+                # rpcd may provide compact JSON without a trailing newline; `read` then
+                # returns non-zero despite assigning data. Consume stdin fully instead.
+                _in=$(cat 2>/dev/null); [ -n "$_in" ] || _in='{}'
+                _v=$(printf '%s' "$_in" | jq -r '.enabled // false' 2>/dev/null)
+                case "$_v" in
+                    true|1)
+                        if start_async; then printf '{"ok":true,"enabled":true,"starting":true}\n'; else
+                            _rc=$?; [ "$_rc" = 2 ] && printf '{"ok":true,"enabled":true,"starting":true,"reason":"already_running"}\n' || printf '{"ok":false,"reason":"start_failed"}\n'
+                        fi
+                        ;;
+                    false|0)
+                        stop_start_worker
+                        "$CTL" disable && printf '{"ok":true,"enabled":false}\n' || printf '{"ok":false,"reason":"disable_failed"}\n'
+                        ;;
+                    *) printf '{"ok":false,"reason":"bad_value"}\n' ;;
+                esac
+                ;;
+            set_port)
+                # rpcd may provide compact JSON without a trailing newline; `read` then
+                # returns non-zero despite assigning data. Consume stdin fully instead.
+                _in=$(cat 2>/dev/null); [ -n "$_in" ] || _in='{}'
+                _port=$(printf '%s' "$_in" | jq -r '.port // empty' 2>/dev/null)
+                if set_port "$_port"; then
+                    _restarting=false; [ -d "$START_LOCK" ] && _restarting=true
+                    printf '{"ok":true,"port":%s,"restarting":%s}\n' "$(hwelp_port)" "$_restarting"
+                else
+                    _rc=$?; [ "$_rc" = 2 ] && printf '{"ok":false,"reason":"bad_port"}\n' || printf '{"ok":false,"reason":"port_save_failed"}\n'
+                fi
+                ;;
+            set_proxy)
+                # rpcd may provide compact JSON without a trailing newline; `read` then
+                # returns non-zero despite assigning data. Consume stdin fully instead.
+                _in=$(cat 2>/dev/null); [ -n "$_in" ] || _in='{}'
+                if set_proxy "$_in"; then
+                    _restarting=false; [ -d "$START_LOCK" ] && _restarting=true
+                    printf '{"ok":true,"port":%s,"restarting":%s}\n' "$(hwelp_port)" "$_restarting"
+                else
+                    _rc=$?
+                    [ "$_rc" = 2 ] && printf '{"ok":false,"reason":"bad_port"}\n' || { [ "$_rc" = 3 ] && printf '{"ok":false,"reason":"auth_invalid"}\n' || printf '{"ok":false,"reason":"proxy_save_failed"}\n'; }
+                fi
+                ;;
+            qualify_start)
+                cat >/dev/null 2>&1 || true
+                if ! engine_ready; then
+                    printf '{"ok":false,"reason":%s}\n' "$(engine_reason | pb_json_log_filter)"
+                elif "$CTL" qualify-start; then printf '{"ok":true,"started":true}\n'; else
+                    _rc=$?; [ "$_rc" = 2 ] && printf '{"ok":true,"started":false,"reason":"already_running"}\n' || printf '{"ok":false,"reason":"start_failed"}\n'
+                fi
+                ;;
+            refresh_routes)
+                cat >/dev/null 2>&1 || true
+                if "$CTL" bootstrap; then
+                    /etc/init.d/podkop-bearhole reload >/dev/null 2>&1 || true
+                    printf '{"ok":true}\n'
+                else printf '{"ok":false,"reason":"no_routes"}\n'; fi
+                ;;
+            log)
+                # rpcd may provide compact JSON without a trailing newline; `read` then
+                # returns non-zero despite assigning data. Consume stdin fully instead.
+                _in=$(cat 2>/dev/null); [ -n "$_in" ] || _in='{}'
+                _off=$(printf '%s' "$_in" | jq -r '.offset // 0' 2>/dev/null); case "$_off" in ''|*[!0-9]*) _off=0;; esac
+                if [ ! -f "$LOG" ]; then printf '{"ok":true,"offset":0,"chunk":""}\n'; exit 0; fi
+                _size=$(wc -c < "$LOG" 2>/dev/null | tr -d ' '); [ -n "$_size" ] || _size=0
+                [ "$_off" -gt "$_size" ] 2>/dev/null && _off=0
+                _chunk=$(tail -c "+$((_off + 1))" "$LOG" 2>/dev/null; printf x); _chunk=${_chunk%x}
+                _esc=$(pb_json_log_str "$_chunk")
+                printf '{"ok":true,"offset":%s,"chunk":%s}\n' "$_size" "$_esc"
+                ;;
+            *) printf '{"ok":false,"reason":"unknown_method"}\n' ;;
+        esac
+        ;;
+    *) exit 1 ;;
+esac

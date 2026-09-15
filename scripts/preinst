@@ -1,0 +1,18 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+
+# Preserve the user-owned Bearhole UCI before the old package is removed.
+if [ -f /etc/config/podkop_bearhole ]; then
+	cp -p /etc/config/podkop_bearhole /tmp/podkop_bearhole.preupgrade 2>/dev/null || true
+fi
+
+# opkg's generated prerm calls `service stop`. rc.common/procd emits a visible
+# `service delete ... Not found` when a disabled service has never been
+# registered. Register it first; the subsequent old-prerm stop is then quiet.
+for _svc in podkop-bearhole podkop-warp-rescue; do
+	[ -x "/etc/init.d/$_svc" ] || continue
+	if ! ubus call service list "{\"name\":\"$_svc\"}" 2>/dev/null | grep -q "\"$_svc\""; then
+		"/etc/init.d/$_svc" start >/dev/null 2>&1 || true
+	fi
+done
+exit 0

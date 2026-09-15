@@ -1,10 +1,59 @@
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
-chmod +x /usr/libexec/rpcd/podkop_bot 2>/dev/null
-chmod +x /usr/lib/podkop_bot/install.sh 2>/dev/null
-chmod +x /usr/lib/podkop_bot/podkop_bot 2>/dev/null
-chmod +x /usr/lib/podkop_bot/podkop_bot_init 2>/dev/null
-/etc/init.d/rpcd restart 2>/dev/null
-rm -f /tmp/luci-indexcache* 2>/dev/null
-rm -rf /tmp/luci-modulecache 2>/dev/null
+
+# Bearhole UCI is user-owned rather than a package conffile. Restore a backup
+# made by preinst if an older package manager removed/renamed it, then create
+# only missing defaults. Never overwrite operator settings.
+if [ ! -f /etc/config/podkop_bearhole ] && [ -f /tmp/podkop_bearhole.preupgrade ]; then
+	cp -p /tmp/podkop_bearhole.preupgrade /etc/config/podkop_bearhole 2>/dev/null || true
+fi
+mkdir -p /etc/config
+[ -f /etc/config/podkop_bearhole ] || : > /etc/config/podkop_bearhole
+uci -q get podkop_bearhole.main >/dev/null 2>&1 || uci -q set podkop_bearhole.main=bearhole
+uci -q get podkop_bearhole.main.enabled >/dev/null 2>&1 || uci -q set podkop_bearhole.main.enabled=0
+uci -q get podkop_bearhole.main.policy >/dev/null 2>&1 || uci -q set podkop_bearhole.main.policy=auto
+uci -q get podkop_bearhole.main.port >/dev/null 2>&1 || uci -q set podkop_bearhole.main.port=1066
+uci -q get podkop_bearhole.main.auth_enabled >/dev/null 2>&1 || uci -q set podkop_bearhole.main.auth_enabled=0
+uci -q commit podkop_bearhole >/dev/null 2>&1 || true
+rm -f /tmp/podkop_bearhole.preupgrade /etc/config/podkop_bearhole-opkg 2>/dev/null || true
+
+for _f in \
+	/usr/libexec/rpcd/podkop_bot \
+	/usr/libexec/rpcd/podkop_bot_bearhole \
+	/usr/lib/podkop_bot/install.sh \
+	/usr/lib/podkop_bot/podkop_bot \
+	/usr/lib/podkop_bot/podkop_bot_init \
+	/usr/lib/podkop_bot/bearhole.sh \
+	/usr/lib/podkop_bot/warpscout-rescue-watchdog \
+	/etc/init.d/podkop-bearhole \
+	/etc/init.d/podkop-warp-rescue
+do
+	chmod +x "$_f" 2>/dev/null || true
+done
+
+/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+
+# The watchdog itself is cheap. Whether it actually starts Rescue is controlled
+# by rescue_autostart in warpscout.conf.
+if [ -x /etc/init.d/podkop-warp-rescue ]; then
+	/etc/init.d/podkop-warp-rescue enable >/dev/null 2>&1 || true
+	/etc/init.d/podkop-warp-rescue start >/dev/null 2>&1 || true
+fi
+
+# If Bearhole was enabled before upgrade, reactivate it through the control
+# plane, not by merely spawning HWELP: qualification and gateway verification
+# must run before the system proxy is considered ready.
+if [ "$(uci -q get podkop_bearhole.main.enabled 2>/dev/null)" = "1" ] && [ -x /usr/bin/hwelp-proxy ]; then
+	/etc/init.d/podkop-bearhole enable >/dev/null 2>&1 || true
+	ubus call podkop_bot_bearhole start '{}' >/dev/null 2>&1 || /etc/init.d/podkop-bearhole start >/dev/null 2>&1 || true
+else
+	# Upgrade invariant: UCI disabled means no stale HWELP instance and no
+	# system proxy files left from the replaced package.
+	/etc/init.d/podkop-bearhole stop >/dev/null 2>&1 || true
+	/etc/init.d/podkop-bearhole disable >/dev/null 2>&1 || true
+	/usr/lib/podkop_bot/bearhole.sh system-off >/dev/null 2>&1 || true
+fi
+
+rm -f /tmp/luci-indexcache* 2>/dev/null || true
+rm -rf /tmp/luci-modulecache 2>/dev/null || true
 exit 0

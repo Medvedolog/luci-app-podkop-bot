@@ -1,0 +1,89 @@
+#!/bin/sh
+# Lightweight WARP Rescue supervisor. It only acts when Rescue is already
+# enabled and rescue_autostart is not explicitly disabled.
+
+STATE_DIR=/tmp/podkop_bot
+PERSIST_DIR=/etc/podkop_bot
+CONFIG_FILE="$PERSIST_DIR/warpscout.conf"
+RESCUE_PID="$STATE_DIR/warpscout_rescue_socks.pid"
+CONTROL_PID="$STATE_DIR/warpscout_rescue_control.pid"
+RUNTIME_PID="$STATE_DIR/warpscout_socks.pid"
+ACTION_PID="$STATE_DIR/warpscout_action.pid"
+TGSCAN_PID="$STATE_DIR/warpscout_tgscan.pid"
+RESCUE_STATE="$STATE_DIR/warpscout_rescue.state"
+RESCUE_MAG="$STATE_DIR/warpscout_rescue.magazine"
+RESCUE_MAG_PERSIST="$PERSIST_DIR/warpscout-rescue.magazine"
+BACKOFF_FILE="$STATE_DIR/warpscout_rescue_watchdog.retry"
+
+mkdir -p "$STATE_DIR" "$PERSIST_DIR" 2>/dev/null
+
+cfg_get() {
+	[ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | head -n1
+}
+pid_alive() {
+	_f="$1"; [ -s "$_f" ] || return 1
+	_p=$(cat "$_f" 2>/dev/null)
+	case "$_p" in ''|*[!0-9]*) return 1;; esac
+	kill -0 "$_p" 2>/dev/null
+}
+state_get() {
+	[ -s "$RESCUE_STATE" ] && sed -n "s/^$1=//p" "$RESCUE_STATE" | head -n1
+}
+now_s() { date +%s 2>/dev/null || echo 0; }
+
+migrate_magazine() {
+	# r36 introduced a persistent copy so an already charged revolver survives
+	# reboot. Preserve an r35-and-earlier in-RAM magazine as soon as this
+	# watchdog starts; later rebuilds are persisted by the controller itself.
+	[ -s "$RESCUE_MAG" ] || return 0
+	[ -s "$RESCUE_MAG_PERSIST" ] && return 0
+	cp "$RESCUE_MAG" "$RESCUE_MAG_PERSIST" 2>/dev/null || return 0
+	chmod 600 "$RESCUE_MAG_PERSIST" 2>/dev/null || true
+	logger -t podkop-warp-rescue "event=magazine_migrated persistence=enabled" 2>/dev/null || true
+}
+
+recover() {
+	_state=$(state_get state); [ -n "$_state" ] || _state=idle
+
+	case "$_state" in
+		paused)
+			logger -t podkop-warp-rescue "event=watchdog_recover action=resume state=paused" 2>/dev/null || true
+			ubus call podkop_bot_warpscout_rescue resume '{}' >/dev/null 2>&1 || true
+			return
+			;;
+		active|idle|stopped|firing|reloading)
+			logger -t podkop-warp-rescue "event=watchdog_recover action=trigger state=$_state" 2>/dev/null || true
+			ubus call podkop_bot_warpscout_rescue trigger '{}' >/dev/null 2>&1 || true
+			return
+			;;
+		exhausted|reload_failed|fire_failed)
+			# Failure states may require a full discovery/TG qualification cycle.
+			# Only retry them when automatic magazine reload is enabled, and never
+			# more often than once per five minutes.
+			[ "$(cfg_get rescue_auto)" = 1 ] || return
+			_now=$(now_s); _last=$(cat "$BACKOFF_FILE" 2>/dev/null)
+			case "$_last" in ''|*[!0-9]*) _last=0;; esac
+			[ $((_now-_last)) -ge 300 ] 2>/dev/null || return
+			printf '%s\n' "$_now" > "$BACKOFF_FILE"
+			logger -t podkop-warp-rescue "event=watchdog_recover action=trigger state=$_state retry=backoff" 2>/dev/null || true
+			ubus call podkop_bot_warpscout_rescue trigger '{}' >/dev/null 2>&1 || true
+			return
+			;;
+		*) return;;
+	esac
+}
+
+while :; do
+	migrate_magazine
+	_enabled=$(cfg_get enabled)
+	_autostart=$(cfg_get rescue_autostart)
+	[ "$_autostart" = 0 ] || _autostart=1
+
+	if [ "$_enabled" = 1 ] && [ "$_autostart" = 1 ]; then
+		if ! pid_alive "$RESCUE_PID" && ! pid_alive "$CONTROL_PID" && ! pid_alive "$RUNTIME_PID" && ! pid_alive "$ACTION_PID" && ! pid_alive "$TGSCAN_PID"; then
+			recover
+		fi
+	fi
+
+	sleep 10
+done

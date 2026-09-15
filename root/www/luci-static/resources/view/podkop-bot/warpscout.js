@@ -179,7 +179,7 @@ return view.extend({
 			dom.content(status,dot('red',_('Проверка не завершилась: ')+((e&&e.message)||'?')));
 		}).then(function(){
 			return callWarpRtStop().catch(function(){return null;});
-		}).finally(function(){btn.disabled=false;window.setTimeout(function(){self.refreshView();},1800);});
+		}).finally(function(){btn.disabled=false;});
 	},
 
 	shortlistCard: function(sl) {

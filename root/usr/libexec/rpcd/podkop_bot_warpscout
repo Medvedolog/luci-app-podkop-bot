@@ -1,4 +1,5 @@
 #!/bin/sh
+. /usr/lib/podkop_bot/json-log.sh
 # rpcd exec plugin for WARPSCOUT management.
 # WARPSCOUT owns WARP discovery/validation/ranking; LuCI only orchestrates it,
 # parses its report, stores selected state and exposes manual operations.
@@ -176,7 +177,7 @@ log_json() {
 	_size=$(wc -c < "$_log" 2>/dev/null | tr -d ' '); [ -n "$_size" ] || _size=0; [ "$_off" -le "$_size" ] 2>/dev/null || _off=0
 	_bytes=$((_size-_off)); [ "$_bytes" -gt 32768 ] 2>/dev/null && _bytes=32768
 	if [ "$_bytes" -gt 0 ] 2>/dev/null; then
-		_chunk_json=$(tail -c +$((_off+1)) "$_log" 2>/dev/null | head -c "$_bytes" | jq -Rs . 2>/dev/null)
+		_chunk_json=$(tail -c +$((_off+1)) "$_log" 2>/dev/null | head -c "$_bytes" | pb_json_log_filter)
 		[ -n "$_chunk_json" ] || _chunk_json='""'
 	else
 		_chunk_json='""'

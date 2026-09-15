@@ -5,25 +5,27 @@
       "ubus": {
         "podkop_bot": ["status", "logs", "bot_logs", "test_telegram", "test_github", "resources", "check_update", "luci_update_check", "transport_state", "transport_probe", "singbox_info", "list_interfaces", "active_probe", "app_info", "runtime_sections", "podkop_update_check", "luci_update_log", "podkop_update_log"],
         "podkop_bot_probe": ["active_probe_status", "active_probe_result"],
-        "podkop_bot_update_async": ["status"],
+        "podkop_bot_update_async": ["status", "vendored_status", "hwelp_status"],
         "podkop_bot_warpscout": ["status", "log", "action_log", "shortlist"],
         "podkop_bot_warpscout_runtime": ["status", "log", "telegram_test"],
         "podkop_bot_warpscout_tgscan": ["telegram_scan_status", "telegram_scan_plan", "telegram_scan_results", "telegram_scan_log"],
-        "podkop_bot_warpscout_rescue": ["status", "magazine", "log"]
+        "podkop_bot_warpscout_rescue": ["status", "magazine", "log"],
+        "podkop_bot_bearhole": ["status", "results", "log"]
       },
-      "uci": ["podkop_bot"]
+      "uci": ["podkop_bot", "podkop_bearhole"]
     },
     "write": {
       "ubus": {
         "podkop_bot": ["service", "installer", "ensure_mixed_proxy", "update_upload", "update_paste", "set_transport_policy", "fallback_crud", "set_uci_field", "set_tier1_port", "luci_update_run", "podkop_update_run"],
         "podkop_bot_probe": ["active_probe_start", "active_probe_cancel"],
-        "podkop_bot_update_async": ["start"],
+        "podkop_bot_update_async": ["start", "vendored_install", "hwelp_install"],
         "podkop_bot_warpscout": ["run", "remove", "config_set", "account_import", "action_run", "select"],
         "podkop_bot_warpscout_runtime": ["start", "stop"],
         "podkop_bot_warpscout_tgscan": ["telegram_scan_start", "telegram_scan_cancel"],
-        "podkop_bot_warpscout_rescue": ["set", "trigger", "next", "fire", "reload", "stop"]
+        "podkop_bot_warpscout_rescue": ["set", "trigger", "next", "fire", "reload", "stop"],
+        "podkop_bot_bearhole": ["start", "set_enabled", "set_port", "set_proxy", "qualify_start", "refresh_routes"]
       },
-      "uci": ["podkop_bot"]
+      "uci": ["podkop_bot", "podkop_bearhole"]
     }
   }
 }

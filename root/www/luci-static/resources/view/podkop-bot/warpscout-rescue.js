@@ -20,6 +20,11 @@ function row(label,val){return E('div',{'class':'pb-row pb-row--plain'},[E('span
 function pbInjectCss(){if(document.getElementById('pb-css'))return;document.querySelector('head').appendChild(E('link',{'id':'pb-css','rel':'stylesheet','type':'text/css','href':L.resource('css/podkop-bot/podkop-bot.css')}));}
 function rescueError(reason){var m={warpscout_disabled:_('WARP Rescue выключен'),not_ready:_('WARPSCOUT или учётная запись WARP ещё не готовы'),controller_busy:_('револьвер уже выполняет другую команду'),qualification_running:_('сейчас выполняется проверка Telegram API'),discovery_running:_('сейчас выполняется поиск WARP-узлов'),runtime_handoff_failed:_('не удалось освободить тестовый WARP SOCKS'),bad_endpoint:_('некорректный WARP-узел'),not_in_magazine:_('этого WARP-узла нет в текущем магазине')};return m[reason]||reason||'?';}
 function ago(ts){var n=parseInt(ts||0,10);if(!n)return '—';var s=Math.max(0,Math.floor(Date.now()/1000)-n);if(s<60)return _('только что');if(s<3600)return Math.floor(s/60)+_(' мин назад');if(s<86400)return Math.floor(s/3600)+_(' ч назад');return Math.floor(s/86400)+_(' дн назад');}
+function magazineLoader(){
+	var cells=[];
+	for(var i=0;i<6;i++)cells.push(E('span',{'class':'pb-mag-load-cell','style':'animation-delay:'+(i*140)+'ms;'},'■'));
+	return E('span',{'class':'pb-mag-load','title':_('Магазин перезаряжается'),'aria-label':_('Магазин перезаряжается')},[E('span',{'class':'pb-mag-load-cells'},cells),E('span',{'class':'pb-mag-load-text'},_('патроны в барабан…'))]);
+}
 
 return view.extend({
 	loadData:function(){return Promise.all([callWarpStatus('').catch(function(){return null;}),callRescueStatus().catch(function(){return null;}),callRescueMagazine().catch(function(){return {ok:false,items:[]};})]);},
@@ -67,30 +72,34 @@ return view.extend({
 	renderBody:function(data){
 		var self=this,st=data[0],rs=data[1]||{},mag=data[2]||{items:[]};
 		if(!st||!st.installed)return E('div',{},[E('h2',{},_('Револьвер WARP')),E('div',{'class':'cbi-section pb-card','style':'max-width:820px;'},[dot('grey',_('WARPSCOUT не установлен')),E('div',{'style':'margin-top:.7em;'},[E('a',{'class':'cbi-button','href':L.url('admin/services/podkop-bot/update')},_('Открыть «Обновление»'))])])]);
-		var cfg=st.config||{},enabled=!!cfg.enabled,auto=E('input',{type:'checkbox',checked:rs.auto?'checked':null}),actionStatus=E('div',{'style':'margin-top:.6em;'});
+		var cfg=st.config||{},enabled=!!cfg.enabled,auto=E('input',{type:'checkbox',checked:rs.auto?'checked':null}),autostart=E('input',{type:'checkbox',checked:rs.autostart?'checked':null}),actionStatus=E('div',{'style':'margin-top:.6em;'});
 		function act(call,label,disabled){return E('button',{'class':'cbi-button','disabled':(rs.busy||disabled)?'disabled':null,'click':ui.createHandlerFn(self,function(){dom.content(actionStatus,dot('yellow',label+' · '+_('команда отправлена…')));return call().then(function(r){if(r&&r.ok){dom.content(actionStatus,dot('yellow',label+' · '+_('выполняется…')));self.watchOperation();}else dom.content(actionStatus,dot('red',_('Ошибка: ')+rescueError(r&&r.reason)));}).catch(function(){dom.content(actionStatus,dot('red',_('Ошибка RPC')));});})},label);}
 		var powerBtn=E('button',{'class':'cbi-button '+(enabled?'cbi-button-negative':'cbi-button-positive'),'disabled':rs.busy?'disabled':null,'click':ui.createHandlerFn(this,function(){dom.content(actionStatus,dot('yellow',enabled?_('Останавливаю WARP…'):_('Запускаю WARP…')));var p=enabled?callRescueStop():callRescueTrigger();return p.then(function(r){if(r&&r.ok){dom.content(actionStatus,dot('yellow',enabled?_('WARP останавливается…'):_('WARP запускается…')));self.watchOperation();}else dom.content(actionStatus,dot('red',_('Ошибка: ')+rescueError(r&&r.reason)));}).catch(function(){dom.content(actionStatus,dot('red',_('Ошибка RPC')));});})},enabled?_('Остановить WARP'):_('Запустить WARP'));
-		var saveAuto=E('button',{'class':'cbi-button cbi-button-apply','disabled':rs.busy?'disabled':null,'click':ui.createHandlerFn(this,function(){return callRescueSet('rescue_auto',auto.checked?'1':'0').then(function(){return self.refreshView();});})},_('Применить автоперезарядку'));
+		var saveAuto=E('button',{'class':'cbi-button cbi-button-apply','disabled':rs.busy?'disabled':null,'click':ui.createHandlerFn(this,function(){return callRescueSet('rescue_auto',auto.checked?'1':'0').then(function(r){if(!r||!r.ok)throw new Error((r&&r.reason)||'write_failed');return callRescueSet('rescue_autostart',autostart.checked?'1':'0');}).then(function(r){if(!r||!r.ok)throw new Error((r&&r.reason)||'write_failed');return self.refreshView();}).catch(function(e){dom.content(actionStatus,dot('red',_('Ошибка настроек автоматики: ')+((e&&e.message)||'?')));});})},_('Применить автоматику'));
 		var busyLabel=String(rs.state||_('работает'));
 		if(rs.busy&&rs.state==='reloading'){
-			var phase={manual:_('этап 1/4 · подготовка'),discovery:_('этап 1/4 · поиск WARP-узлов'),qualification:_('этап 2/4 · проверка Telegram API'),building:_('этап 3/4 · сбор магазина')};
+			var phase={manual:_('открываю барабан · готовлюсь к перезарядке'),discovery:_('ищу патроны · Discovery WARP-узлов'),qualification:_('проверяю капсюли · Telegram API qualification'),building:_('заряжаю магазин · укладываю только VALID')};
 			busyLabel=_('Перезарядка')+' · '+(phase[rs.reason]||rs.reason||_('подготовка'));
 		}else if(rs.busy&&rs.state==='firing'){
-			busyLabel=_('Запуск WARP')+' · '+String(rs.index||0)+' / '+String(rs.total||0)+' · '+_('SOCKS → Telegram getMe');
+			busyLabel=_('Взвожу курок')+' · '+String(rs.index||0)+' / '+String(rs.total||0)+' · '+_('тестовый отстрел: SOCKS → Telegram getMe');
 		}
 		var stateNode=rs.running?dot('green',_('работает')):(rs.busy?dot('yellow',busyLabel):dot((rs.state==='exhausted'||rs.state==='reload_failed'||rs.state==='fire_failed')?'red':'grey',enabled?_('не запущен'):String(rs.state||_('остановлен'))));
 		var magNode=(rs.total||0)>0?dot('green',_('заряжен · ')+String(rs.total)+_(' VALID WARP-маршрутов')):dot('grey',_('пуст · сначала нужны VALID результаты Telegram API'));
-		var position=rs.busy&&rs.state==='reloading'?_('перезарядка'):String(rs.index||0)+' / '+String(rs.total||0);
+		var position=rs.busy&&rs.state==='reloading'?magazineLoader():E('span',{},String(rs.index||0)+' / '+String(rs.total||0));
 		return E('div',{},[
 			E('h2',{},_('Револьвер WARP')),
 			E('p',{'class':'pb-muted','style':'max-width:820px;'},_('Постоянный резервный WARP SOCKS для Telegram. Использует только WARP-узлы со статусом VALID и работает независимо от открытой страницы LuCI.')),
 			E('div',{'class':'cbi-section pb-card','style':'max-width:820px;'},[
 				E('h3',{'style':'margin-top:0;'},_('WARP Rescue')),
 				E('p',{'class':'pb-muted'},_('«Перезарядить» выполняет поиск WARP-узлов → проверку Telegram API → сбор магазина → запуск лучшего WARP. «Следующий WARP» переключает Rescue на следующий VALID узел.')),
-				row(_('WARP Rescue'),enabled?dot('green',_('включён')):dot('grey',_('выключен'))),row(_('Состояние'),stateNode),row(_('Магазин'),magNode),row(_('Позиция'),E('span',{},position)),row(_('Активный WARP-узел'),E('span',{},rs.endpoint||'—')),row(_('SOCKS WARP Rescue'),rs.running?dot('green',(rs.proxy||('socks5h://127.0.0.1:'+(cfg.socks_port||18191)))):E('span',{},rs.proxy||('socks5h://127.0.0.1:'+(cfg.socks_port||18191)))),row(_('Автоперезарядка при исчерпании магазина'),auto),
-				E('p',{'class':'pb-hint-90'},_('Если все сохранённые VALID WARP-узлы исчерпаны, автоперезарядка снова выполняет поиск, проверку Telegram API и сбор магазина, затем пытается поднять новый рабочий SOCKS WARP Rescue.')),
-				E('div',{'style':'display:flex;gap:.5em;flex-wrap:wrap;'},[powerBtn,saveAuto,act(callRescueNext,_('Следующий WARP'),!enabled),act(callRescueReload,_('Перезарядить'),false)]),actionStatus,
-				E('p',{'class':'pb-hint-90','style':'margin-top:.8em;'},_('OpenWrt Rescue / Bearhole: аварийный рубильник предусмотрен в backend, но пока не влияет на маршрутизацию.'))
+				row(_('WARP Rescue'),enabled?dot('green',_('включён')):dot('grey',_('выключен'))),row(_('Состояние'),stateNode),row(_('Магазин'),magNode),row(_('Позиция'),position),row(_('Активный WARP-узел'),E('span',{},rs.endpoint||'—')),row(_('SOCKS WARP Rescue'),rs.running?dot('green',(rs.proxy||('socks5h://127.0.0.1:'+(cfg.socks_port||18191)))):E('span',{},rs.proxy||('socks5h://127.0.0.1:'+(cfg.socks_port||18191)))),E('div',{'style':'margin:.8em 0;padding:.7em .8em;border:1px solid rgba(127,127,127,.18);border-radius:8px;'},[
+					E('h4',{'style':'margin:.05em 0 .55em;'},_('Автоматика Rescue')),
+					row(_('Автозапуск и самовосстановление'),E('label',{'style':'display:inline-flex;align-items:center;gap:.5em;font-weight:600;'},[autostart,E('span',{},_('Включить'))])),
+					E('p',{'class':'pb-hint-90','style':'margin:.25em 0 .65em;'},_('Поднимает WARP Rescue после загрузки роутера и восстанавливает SOCKS, если он упал. Ручная кнопка «Остановить WARP» отключает Rescue и запрещает watchdog поднимать его снова.')),
+					row(_('Автоперезарядка магазина'),E('label',{'style':'display:inline-flex;align-items:center;gap:.5em;font-weight:600;'},[auto,E('span',{},_('Включить'))])),
+					E('p',{'class':'pb-hint-90','style':'margin:.25em 0 0;'},_('Когда сохранённые VALID WARP-узлы исчерпаны, автоматически выполняет новый поиск, Telegram qualification и собирает магазин заново.'))
+				]),
+				E('div',{'style':'display:flex;gap:.5em;flex-wrap:wrap;'},[powerBtn,saveAuto,act(callRescueNext,_('Следующий WARP'),!enabled),act(callRescueReload,_('Перезарядить'),false)]),actionStatus
 			]),
 			this.magazineCard(mag,rs,actionStatus),
 			E('div',{'style':'margin-top:.7em;display:flex;gap:.5em;flex-wrap:wrap;'},[E('a',{'class':'cbi-button','href':L.url('admin/services/podkop-bot/settings/warpscout')},_('Расширенные настройки WARP Rescue')),E('a',{'class':'cbi-button','href':L.url('admin/services/podkop-bot/runtime/services')},_('Проверка маршрутов / Telegram API')),E('a',{'class':'cbi-button','href':L.url('admin/services/podkop-bot/update')+'#warpscout-update'},_('Установка / удаление WARPSCOUT'))])

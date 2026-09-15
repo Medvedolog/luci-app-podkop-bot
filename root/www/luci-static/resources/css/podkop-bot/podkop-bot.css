@@ -207,3 +207,11 @@
 .pb-wide {
 	max-width: 820px;
 }
+
+/* WARP revolver reload indicator: lightweight CSS-only magazine animation. */
+.pb-mag-load{display:inline-flex;align-items:center;gap:.65em;min-width:15em}
+.pb-mag-load-cells{display:inline-flex;gap:.18em;align-items:center;font-family:monospace;letter-spacing:0}
+.pb-mag-load-cell{display:inline-block;opacity:.18;transform:translateY(0);animation:pb-mag-load 1.25s ease-in-out infinite}
+.pb-mag-load-text{white-space:nowrap;color:var(--text-color-medium,#aaa)}
+@keyframes pb-mag-load{0%,70%,100%{opacity:.18;transform:translateY(0)}30%,45%{opacity:1;transform:translateY(-1px)}}
+@media (prefers-reduced-motion:reduce){.pb-mag-load-cell{animation:none;opacity:.7}}

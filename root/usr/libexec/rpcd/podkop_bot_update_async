@@ -1,16 +1,37 @@
 #!/bin/sh
-# Short launcher for podkop_update_run. The existing backend performs potentially
-# long direct/proxy preflight and install.sh download before it returns. Run that
-# RPC server-side so LuCI can immediately switch to the existing log poller.
+# Small server-side launchers for update operations which must not make LuCI
+# wait for network. Also owns the local vendored-bot path: the package copy is
+# deliberately checked before GitHub so a blocked GitHub cannot prevent repair.
 BACKEND="/usr/libexec/rpcd/podkop_bot"
+BEARHOLE_CTL="/usr/lib/podkop_bot/bearhole.sh"
+BOT="/usr/bin/podkop_bot"
+VENDORED_BOT="/usr/lib/podkop_bot/podkop_bot"
+HWELP="/usr/bin/hwelp-proxy"
 STATE_DIR="/tmp/podkop_bot"
 PID_FILE="$STATE_DIR/podkop_update_launcher.pid"
 RESULT_FILE="$STATE_DIR/podkop_update_launcher.result"
 CORE_LOCK="/tmp/podkop_core_update.lock"
 CORE_LOG="/tmp/podkop_core_update.log"
+HWELP_PID="$STATE_DIR/hwelp_install.pid"
+HWELP_RESULT="$STATE_DIR/hwelp_install.result"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
+json_str(){ printf '%s' "$1" | jsonfilter -e '@' >/dev/null 2>&1 && printf '%s' "$1" || printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g;s/"/\\"/g')"; }
+version_of(){ [ -f "$1" ] && sed -n 's/^BOT_VERSION="\([0-9][0-9.]*\)".*/\1/p' "$1" | head -n1; }
+ver_gt(){
+  a=$1 b=$2; [ "$a" = "$b" ] && return 1
+  i=1
+  while [ "$i" -le 4 ]; do
+    av=$(printf '%s' "$a" | cut -d. -f"$i"); bv=$(printf '%s' "$b" | cut -d. -f"$i")
+    case "$av" in ''|*[!0-9]*) av=0;; esac; case "$bv" in ''|*[!0-9]*) bv=0;; esac
+    [ "$av" -gt "$bv" ] 2>/dev/null && return 0
+    [ "$av" -lt "$bv" ] 2>/dev/null && return 1
+    i=$((i+1))
+  done
+  return 1
+}
 pid_alive(){ [ -s "$PID_FILE" ] || return 1; p=$(cat "$PID_FILE" 2>/dev/null); case "$p" in ''|*[!0-9]*) return 1;; esac; kill -0 "$p" 2>/dev/null; }
+hwelp_install_alive(){ [ -s "$HWELP_PID" ] || return 1; p=$(cat "$HWELP_PID" 2>/dev/null); case "$p" in ''|*[!0-9]*) return 1;; esac; kill -0 "$p" 2>/dev/null; }
 
 method_start(){
   read -r _in 2>/dev/null
@@ -49,8 +70,85 @@ method_status(){
   printf '{"ok":true,"running":%s,"pid":%s,"result":%s}\n' "$running" "$pid" "$result"
 }
 
+method_vendored_status(){
+  read -r _in 2>/dev/null || true
+  current=$(version_of "$BOT"); vendored=$(version_of "$VENDORED_BOT")
+  [ -n "$current" ] || current=unknown
+  [ -n "$vendored" ] || vendored=unknown
+  available=false
+  if [ "$vendored" != unknown ]; then
+    if [ "$current" = unknown ] || ver_gt "$vendored" "$current"; then available=true; fi
+  fi
+  printf '{"ok":true,"current":"%s","vendored":"%s","available":%s,"source":"package"}\n' "$current" "$vendored" "$available"
+}
+
+method_vendored_install(){
+  read -r _in 2>/dev/null || true
+  [ -f "$VENDORED_BOT" ] || { printf '{"ok":false,"reason":"vendored_missing"}\n'; return; }
+  current=$(version_of "$BOT"); vendored=$(version_of "$VENDORED_BOT")
+  [ -n "$vendored" ] || { printf '{"ok":false,"reason":"vendored_invalid"}\n'; return; }
+  if [ -n "$current" ] && ! ver_gt "$vendored" "$current"; then
+    printf '{"ok":true,"installed":false,"reason":"up_to_date","current":"%s","vendored":"%s"}\n' "$current" "$vendored"
+    return
+  fi
+  tmp=/tmp/podkop_bot_upload.sh
+  rm -f "$tmp" 2>/dev/null
+  cp "$VENDORED_BOT" "$tmp" || { printf '{"ok":false,"reason":"copy_failed"}\n'; return; }
+  chmod 600 "$tmp" 2>/dev/null
+  out=$(printf '{}\n' | "$BACKEND" call update_upload 2>/dev/null)
+  case "$out" in \{*\}) printf '%s\n' "$out";; *) printf '{"ok":false,"reason":"installer_error"}\n';; esac
+}
+
+method_hwelp_status(){
+  read -r _in 2>/dev/null || true
+  installed=false; ready=false; version=unknown; running=false; pid=0
+  if [ -x "$HWELP" ]; then
+    installed=true
+    "$HWELP" --check >/dev/null 2>&1 && ready=true
+    version=$("$HWELP" --version 2>/dev/null | awk '{print $2;exit}'); [ -n "$version" ] || version=unknown
+  fi
+  hwelp_install_alive && running=true
+  [ "$running" = true ] && pid=$(cat "$HWELP_PID" 2>/dev/null)
+  result=null
+  if [ -s "$HWELP_RESULT" ]; then
+    rc=$(cat "$HWELP_RESULT" 2>/dev/null | tr -dc '0-9'); [ -n "$rc" ] || rc=1
+    result=$rc
+  fi
+  printf '{"ok":true,"installed":%s,"ready":%s,"version":"%s","installing":%s,"pid":%s,"result":%s}\n' "$installed" "$ready" "$version" "$running" "$pid" "$result"
+}
+
+method_hwelp_install(){
+  read -r _in 2>/dev/null || true
+  if [ -x "$HWELP" ] && "$HWELP" --check >/dev/null 2>&1; then
+    v=$("$HWELP" --version 2>/dev/null | awk '{print $2;exit}')
+    printf '{"ok":true,"started":false,"reason":"already_installed","version":"%s"}\n' "${v:-unknown}"
+    return
+  fi
+  [ -x "$BEARHOLE_CTL" ] || { printf '{"ok":false,"reason":"bearhole_control_missing"}\n'; return; }
+  if hwelp_install_alive; then
+    printf '{"ok":true,"started":false,"reason":"already_running"}\n'; return
+  fi
+  rm -f "$HWELP_PID" "$HWELP_RESULT" 2>/dev/null
+  (
+    "$BEARHOLE_CTL" install-hwelp >/dev/null 2>&1
+    rc=$?
+    printf '%s\n' "$rc" > "$HWELP_RESULT"
+    rm -f "$HWELP_PID" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  p=$!; printf '%s\n' "$p" > "$HWELP_PID"
+  printf '{"ok":true,"started":true,"pid":%s}\n' "$p"
+}
+
 case "$1" in
-  list) echo '{"start":{},"status":{}}' ;;
-  call) case "$2" in start) method_start;; status) method_status;; *) echo '{"error":"unknown method"}'; exit 1;; esac ;;
+  list) echo '{"start":{},"status":{},"vendored_status":{},"vendored_install":{},"hwelp_status":{},"hwelp_install":{}}' ;;
+  call) case "$2" in
+    start) method_start;;
+    status) method_status;;
+    vendored_status) method_vendored_status;;
+    vendored_install) method_vendored_install;;
+    hwelp_status) method_hwelp_status;;
+    hwelp_install) method_hwelp_install;;
+    *) echo '{"error":"unknown method"}'; exit 1;;
+  esac ;;
   *) echo '{"error":"unknown command"}'; exit 1 ;;
 esac

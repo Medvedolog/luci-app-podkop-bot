@@ -1,0 +1,57 @@
+#!/bin/sh
+# rpcd object: podkop_bot_tsnet_repair
+# Small opt-in control plane for cron-driven tsnet runtime recovery.
+
+. /usr/lib/podkop_bot/tsnet-provider.sh
+
+json_in() { _IN=$(cat 2>/dev/null); [ -n "$_IN" ] || _IN='{}'; }
+
+auto_enabled() {
+    [ -r "$TSNET_STATE_FILE" ] || return 1
+    [ "$(tsnet_state_get auto_repair)" = true ]
+}
+
+set_auto_enabled() {
+    _want="$1"
+    [ -r "$TSNET_STATE_FILE" ] || return 1
+    umask 077
+    _tmp="$TSNET_STATE_FILE.$$"
+    jq --argjson v "$_want" '.auto_repair=$v' "$TSNET_STATE_FILE" >"$_tmp" || { rm -f "$_tmp"; return 1; }
+    chmod 600 "$_tmp" 2>/dev/null || true
+    mv -f "$_tmp" "$TSNET_STATE_FILE"
+}
+
+method_status() {
+    _provider=$(tsnet_provider)
+    _enabled=false; auto_enabled && _enabled=true
+    _supported=false
+    case "$_provider" in podkop|forkop-x) _supported=true ;; esac
+    jq -cn --arg provider "$_provider" --argjson enabled "$_enabled" --argjson supported "$_supported" \
+        '{ok:true,provider:$provider,enabled:$enabled,supported:$supported,interval_seconds:60,cooldown_seconds:300,readiness:"main_or_backup_mixed_proxy"}'
+}
+
+method_set_enabled() {
+    json_in
+    _provider=$(tsnet_provider)
+    case "$_provider" in
+        podkop|forkop-x) ;;
+        *) printf '{"ok":false,"reason":"unsupported_provider"}\n'; return ;;
+    esac
+    [ -r "$TSNET_STATE_FILE" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+    _v=$(printf '%s' "$_IN" | jq -r '.enabled // false' 2>/dev/null)
+    case "$_v" in true|1) _want=true ;; false|0) _want=false ;; *) printf '{"ok":false,"reason":"bad_value"}\n'; return ;; esac
+    set_auto_enabled "$_want" || { printf '{"ok":false,"reason":"state_write_failed"}\n'; return; }
+    jq -cn --argjson enabled "$_want" '{ok:true,enabled:$enabled}'
+}
+
+case "$1" in
+    list) echo '{"status":{},"set_enabled":{"enabled":false}}' ;;
+    call)
+        case "$2" in
+            status) cat >/dev/null 2>&1 || true; method_status ;;
+            set_enabled) method_set_enabled ;;
+            *) cat >/dev/null 2>&1 || true; printf '{"ok":false,"reason":"unknown_method"}\n' ;;
+        esac
+        ;;
+    *) exit 1 ;;
+esac

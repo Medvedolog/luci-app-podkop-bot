@@ -1,0 +1,96 @@
+#!/bin/sh /etc/rc.common
+# OpenWrt Bearhole HWELP proxy service.
+
+START=97
+STOP=15
+USE_PROCD=1
+
+BH_CTL=/usr/lib/podkop_bot/bearhole.sh
+BH_PROXY=/usr/bin/hwelp-proxy
+BH_ROUTES=/tmp/podkop_bot/bearhole/routes.conf
+BH_AUTH=/tmp/podkop_bot/bearhole/hwelp.auth
+BH_LOG=/tmp/podkop_bot/bearhole/bearhole.log
+
+engine_ready() {
+    [ -x "$BH_PROXY" ] || return 1
+    "$BH_PROXY" --check >/dev/null 2>&1
+}
+
+hwelp_port() {
+    local port
+    port="$(uci -q get podkop_bearhole.main.port 2>/dev/null)"
+    case "$port" in ''|*[!0-9]*) port=1066;; esac
+    [ "$port" -ge 1024 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || port=1066
+    printf '%s' "$port"
+}
+
+prepare_auth() {
+    local enabled user pass
+    rm -f "$BH_AUTH" 2>/dev/null || true
+    enabled="$(uci -q get podkop_bearhole.main.auth_enabled 2>/dev/null)"
+    [ "$enabled" = 1 ] || return 1
+    user="$(uci -q get podkop_bearhole.main.auth_user 2>/dev/null)"
+    pass="$(uci -q get podkop_bearhole.main.auth_pass 2>/dev/null)"
+    [ -n "$user" ] && [ -n "$pass" ] || return 2
+    mkdir -p "${BH_AUTH%/*}" 2>/dev/null
+    ( umask 077; printf 'user=%s\npass=%s\n' "$user" "$pass" > "$BH_AUTH" ) || return 2
+    chmod 600 "$BH_AUTH" 2>/dev/null
+    return 0
+}
+
+start_service() {
+    local enabled port auth_rc
+
+    # procd owns only the native HWELP process. The Bearhole control plane
+    # decides when it is safe to apply the global system proxy and qualification.
+    "$BH_CTL" system-off >/dev/null 2>&1 || true
+
+    enabled="$(uci -q get podkop_bearhole.main.enabled 2>/dev/null)"
+    [ "$enabled" = 1 ] || return 0
+
+    if ! engine_ready; then
+        logger -t podkop-bearhole 'event=engine_unavailable action=start_skipped' 2>/dev/null || true
+        return 0
+    fi
+
+    if ! "$BH_CTL" bootstrap >/dev/null 2>&1; then
+        logger -t podkop-bearhole 'event=no_routes action=start_skipped' 2>/dev/null || true
+        return 0
+    fi
+
+    auth_rc=1
+    prepare_auth || auth_rc=$?
+    if [ "$auth_rc" = 2 ]; then
+        logger -t podkop-bearhole 'event=hwelp_auth_invalid action=start_skipped' 2>/dev/null || true
+        return 0
+    fi
+
+    port="$(hwelp_port)"
+    mkdir -p "${BH_LOG%/*}" 2>/dev/null
+    touch "$BH_LOG" 2>/dev/null || true
+    chmod 600 "$BH_LOG" 2>/dev/null || true
+    procd_open_instance
+    if [ -f "$BH_AUTH" ]; then
+        procd_set_param command "$BH_PROXY" -l 127.0.0.1 -p "$port" -c "$BH_ROUTES" -a "$BH_AUTH" -L "$BH_LOG"
+    else
+        procd_set_param command "$BH_PROXY" -l 127.0.0.1 -p "$port" -c "$BH_ROUTES" -L "$BH_LOG"
+    fi
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    # Never leave curl/wget/opkg/environment pointing at a stopped HWELP proxy.
+    "$BH_CTL" system-off >/dev/null 2>&1 || true
+    rm -f "$BH_AUTH" 2>/dev/null || true
+}
+
+reload_service() {
+    "$BH_CTL" bootstrap >/dev/null 2>&1 || true
+}
+
+service_triggers() {
+    procd_add_reload_trigger podkop_bearhole
+}

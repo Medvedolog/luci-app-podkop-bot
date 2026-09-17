@@ -19,7 +19,7 @@
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INSTALLER_PATH="/usr/lib/podkop_bot/install.sh"
-LUCI_APP_VERSION="0.19.17"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
+LUCI_APP_VERSION="0.19.18"   # UI/version.txt use the clean X.Y.Z; the packaging -N suffix (control) is stripped before comparison
 
 # -- shared UCI lock ---------------------------------------------------------
 # The bot writes the same package from two processes (its command loop and the
@@ -815,21 +815,12 @@ method_luci_update_check() {
 	_latest=""
 	_via="none"
 	_url="https://raw.githubusercontent.com/Medvedolog/luci-app-podkop-bot/main/version.txt"
-	command -v curl >/dev/null 2>&1 && _latest=$(curl -fsS --connect-timeout 6 --max-time 12 "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
-	[ -z "$_latest" ] && command -v wget >/dev/null 2>&1 && _latest=$(wget -q -T 12 -O - "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
-	[ -n "$_latest" ] && _via="direct"
-	if [ -z "$_latest" ]; then
-		_sb_ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
-		_sb_port=""
-		_v=$(_cached_status | sed -n 's/.*"podkop_variant":"\([^"]*\)".*/\1/p')
-		_pk=$(podkop_uci_pkg "${_v:-podkop}")
-		_psec=$(_primary_section "$_pk" 2>/dev/null)
-		[ -n "$_psec" ] && _sb_port=$(uci -q get "$_pk.$_psec.mixed_proxy_port" 2>/dev/null)
-		if [ -n "$_sb_port" ] && [ -n "$_sb_ip" ]; then
-			_latest=$(curl -fsS --proxy "socks5h://$_sb_ip:$_sb_port" --connect-timeout 6 --max-time 12 "$_url" 2>/dev/null | head -1 | tr -d '\r\n\t ')
-			[ -n "$_latest" ] && _via="socks"
-		fi
+	_tmp="/tmp/podkop_luci_version.$$"
+	if _core_fetch "$_url" "$_tmp"; then
+		_latest=$(head -1 "$_tmp" 2>/dev/null | tr -d '\r\n\t ')
+		[ -n "$_latest" ] && _via="${_CORE_FETCH_ROUTE:-unknown}"
 	fi
+	rm -f "$_tmp" 2>/dev/null
 	[ -z "$_latest" ] && _latest="unknown"
 
 	_avail="false"
@@ -855,13 +846,47 @@ LUCI_UPDATE_LOG="/tmp/podkop_bot_luci_update.log"
 PODKOP_UPDATE_LOG="/tmp/podkop_core_update.log"
 _RESOLV_STATE="/tmp/podkop_bot_resolv.state"
 
-# Fetch a URL with the same practical fallover used by the bot: direct IPv4,
-# primary Mixed Proxy, configured fallback proxies, then custom_proxy. The
-# selected route is returned in _CORE_FETCH_ROUTE for logs/UI diagnostics.
+# Export Bearhole proxy variables only in a child/subshell that is about to run
+# package-manager or installer commands. rpcd itself must not retain them across
+# later ubus calls. apk-tools consumes HTTP(S)_PROXY from its process environment.
+_bearhole_export_env() {
+	[ "$(uci -q get podkop_bearhole.main.enabled 2>/dev/null)" = "1" ] || return 1
+	_bh_gateway="http://127.0.0.1:1066"
+	export http_proxy="$_bh_gateway" https_proxy="$_bh_gateway"
+	export HTTP_PROXY="$_bh_gateway" HTTPS_PROXY="$_bh_gateway"
+	export all_proxy="$_bh_gateway" ALL_PROXY="$_bh_gateway"
+	export no_proxy="127.0.0.1,localhost,::1" NO_PROXY="127.0.0.1,localhost,::1"
+	return 0
+}
+
+# Fetch a URL through the same route selector used by system recovery. When
+# OpenWrt Bearhole is enabled, the local gateway is the single routing source of
+# truth: do not re-implement its route order here. When Bearhole is disabled,
+# preserve the legacy bot fallover (direct -> tier1 -> fallback -> custom).
+#
+# Every curl call uses -q explicitly. Bearhole writes /root/.curlrc while it is
+# active; without -q a supposedly "direct" diagnostic silently inherits that
+# proxy and reports a false route label. The selected route is returned in
+# _CORE_FETCH_ROUTE for logs/UI diagnostics.
 _core_fetch() {
 	_url="$1"; _dest="$2"; _CORE_FETCH_ROUTE=""
 	rm -f "$_dest" 2>/dev/null
-	if curl -4 -fsSL --connect-timeout 8 --max-time 60 -o "$_dest" "$_url" 2>/dev/null; then
+
+	_bh_enabled=$(uci -q get podkop_bearhole.main.enabled 2>/dev/null)
+	if [ "$_bh_enabled" = "1" ]; then
+		_bh_gateway="http://127.0.0.1:1066"
+		if curl -q -4 -fsSL --proxy "$_bh_gateway" --connect-timeout 8 --max-time 90 -o "$_dest" "$_url" 2>/dev/null; then
+			_bh_route=$(cut -d'|' -f1 /tmp/podkop_bot/bearhole/current 2>/dev/null | head -n1)
+			[ -n "$_bh_route" ] || _bh_route="gateway"
+			_CORE_FETCH_ROUTE="bearhole:$_bh_route"
+			return 0
+		fi
+		rm -f "$_dest" 2>/dev/null
+		_CORE_FETCH_ROUTE="bearhole:unavailable"
+		return 1
+	fi
+
+	if curl -q -4 -fsSL --proxy '' --connect-timeout 8 --max-time 60 -o "$_dest" "$_url" 2>/dev/null; then
 		_CORE_FETCH_ROUTE="direct"; return 0
 	fi
 
@@ -874,7 +899,7 @@ _core_fetch() {
 		_port=$(uci -q get "$_pkg.$_sec.mixed_proxy_port" 2>/dev/null); [ -z "$_port" ] && _port="2080"
 		_ip=$(_resolve_proxy_ip "$_port")
 		_proxy="socks5h://$_ip:$_port"
-		if curl -fsSL --proxy "$_proxy" --connect-timeout 8 --max-time 90 -o "$_dest" "$_url" 2>/dev/null; then
+		if curl -q -fsSL --proxy "$_proxy" --connect-timeout 8 --max-time 90 -o "$_dest" "$_url" 2>/dev/null; then
 			_CORE_FETCH_ROUTE="tier1 $_proxy"; return 0
 		fi
 	fi
@@ -882,14 +907,14 @@ _core_fetch() {
 	for _proxy in $(uci -q get podkop_bot.settings.fallback_socks 2>/dev/null); do
 		_proxy=${_proxy%%#*}
 		[ -n "$_proxy" ] || continue
-		if curl -fsSL --proxy "$_proxy" --connect-timeout 8 --max-time 90 -o "$_dest" "$_url" 2>/dev/null; then
+		if curl -q -fsSL --proxy "$_proxy" --connect-timeout 8 --max-time 90 -o "$_dest" "$_url" 2>/dev/null; then
 			_CORE_FETCH_ROUTE="fallback proxy"; return 0
 		fi
 	done
 
 	_proxy=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
 	_proxy=${_proxy%%#*}
-	if [ -n "$_proxy" ] && curl -fsSL --proxy "$_proxy" --connect-timeout 8 --max-time 90 -o "$_dest" "$_url" 2>/dev/null; then
+	if [ -n "$_proxy" ] && curl -q -fsSL --proxy "$_proxy" --connect-timeout 8 --max-time 90 -o "$_dest" "$_url" 2>/dev/null; then
 		_CORE_FETCH_ROUTE="custom proxy"; return 0
 	fi
 
@@ -897,16 +922,24 @@ _core_fetch() {
 	return 1
 }
 
-# Reachability pre-flight. Package feeds must be reachable directly because
-# opkg/apk do not inherit the bot's curl proxy chain. GitHub raw may be reached
-# either directly or through the configured fallback chain used for the actual
-# install.sh download.
+# Reachability pre-flight for an actual core update. With Bearhole enabled both
+# checks go through the gateway, matching apk/opkg and install.sh. With Bearhole
+# disabled, the OpenWrt feed stays a real direct check while GitHub uses the
+# legacy bot fallover above. Keep the return string exactly "ok" for callers.
 _pkg_net_check() {
-	curl -4 -sf -o /dev/null --connect-timeout 5 --max-time 8 "https://downloads.openwrt.org/" 2>/dev/null; _feed_rc=$?
-	_core_fetch "https://raw.githubusercontent.com/" "/tmp/podkop_core_netcheck.$$"; _gh_rc=$?
-	rm -f "/tmp/podkop_core_netcheck.$$" 2>/dev/null
+	_feed_tmp="/tmp/podkop_feed_netcheck.$$"
+	_gh_tmp="/tmp/podkop_core_netcheck.$$"
+	_bh_enabled=$(uci -q get podkop_bearhole.main.enabled 2>/dev/null)
+	if [ "$_bh_enabled" = "1" ]; then
+		_core_fetch "https://downloads.openwrt.org/" "$_feed_tmp"; _feed_rc=$?
+	else
+		curl -q -4 -sfL --proxy '' -o /dev/null --connect-timeout 5 --max-time 8 "https://downloads.openwrt.org/" 2>/dev/null; _feed_rc=$?
+	fi
+	_core_fetch "https://raw.githubusercontent.com/" "$_gh_tmp"; _gh_rc=$?
+	rm -f "$_feed_tmp" "$_gh_tmp" 2>/dev/null
 	[ "$_feed_rc" = "0" ] && [ "$_gh_rc" = "0" ] && { printf 'ok'; return 0; }
 	_m="blocked:"; [ "$_feed_rc" != "0" ] && _m="$_m openwrt-feed"; [ "$_gh_rc" != "0" ] && _m="$_m github-raw"
+	[ "$_bh_enabled" = "1" ] && _m="$_m via-bearhole"
 	printf '%s' "$_m"; return 1
 }
 # 50 MB on /overlay — install.sh's own 15 MB threshold is too low for sing-box.
@@ -974,6 +1007,7 @@ method_podkop_update_run() {
 
 	(
 		trap '_resolv_v4_restore; rm -rf "/tmp/podkop_core_update.lock" 2>/dev/null' EXIT INT TERM
+		_bearhole_export_env || true
 		_resolv_v4_override
 		# Auto-answer the fork installer's interactive prompts with "n".
 		#
@@ -1063,7 +1097,10 @@ method_luci_update_run() {
 		printf '{"ok":false,"reason":"installer_missing","detail":"%s"}\n' "$INSTALLER_PATH"; return
 	fi
 	: > "$LUCI_UPDATE_LOG" 2>/dev/null
-	setsid sh "$INSTALLER_PATH" --unattended --action update-luci >> "$LUCI_UPDATE_LOG" 2>&1 &
+	(
+		_bearhole_export_env || true
+		exec setsid sh "$INSTALLER_PATH" --unattended --action update-luci
+	) >> "$LUCI_UPDATE_LOG" 2>&1 &
 	printf '{"ok":true,"started":true,"log":"%s"}\n' "$LUCI_UPDATE_LOG"
 }
 
@@ -2412,17 +2449,24 @@ method_active_probe() {
 	_clash_hdr=""
 	[ -n "$_clash_secret" ] && _clash_hdr="Authorization: Bearer $_clash_secret"
 	_proxy_cfg_type=$(_section_mode "$_variant" "$_pkg" "$_sec"); [ -z "$_proxy_cfg_type" ] && _proxy_cfg_type="selector"
-	_proxies=$(curl -s --connect-timeout 3 --max-time 8 ${_clash_hdr:+-H "$_clash_hdr"} "http://${_clash_addr}/proxies" 2>/dev/null)
+	_proxies=$(curl -q -s --noproxy '*' --connect-timeout 3 --max-time 8 ${_clash_hdr:+-H "$_clash_hdr"} "http://${_clash_addr}/proxies" 2>/dev/null)
+	# Bearhole installs a global curl config for system recovery. Clash API is a local
+	# control-plane endpoint and must never traverse hwelp. Retry once because sing-box
+	# may still be settling immediately after a reload.
+	if [ -z "$_proxies" ] || [ "$_proxies" = "null" ] || ! printf '%s' "$_proxies" | jq -e '.proxies | type == "object"' >/dev/null 2>&1; then
+		sleep 1
+		_proxies=$(curl -q -s --noproxy '*' --connect-timeout 3 --max-time 8 ${_clash_hdr:+-H "$_clash_hdr"} "http://${_clash_addr}/proxies" 2>/dev/null)
+	fi
 	_proxy_name=""
 	if [ -n "$_proxies" ] && [ "$_proxies" != "null" ] && command -v jq >/dev/null 2>&1; then
 		_sel=$(printf '%s' "$_proxies" | jq -r --arg s "$_sec" '
 			.proxies as $p |
-			if ($p[$s] and (($p[$s].type == "Selector") or ($p[$s].type == "URLTest"))) then $s
+			if ($p[$s] and (($p[$s].type == "Selector") or ($p[$s].type == "URLTest") or ($p[$s].type == "Fallback") or ($p[$s].type == "LoadBalance"))) then $s
 			elif $p[$s + "-out"] then ($s + "-out")
 			elif $p[$s + "-1-out"] then ($s + "-1-out")
 			else (
 				$p | to_entries
-				| map(select((.key | startswith($s)) and ((.value.type == "Selector") or (.value.type == "URLTest"))))
+				| map(select((.key | startswith($s)) and ((.value.type == "Selector") or (.value.type == "URLTest") or (.value.type == "Fallback") or (.value.type == "LoadBalance"))))
 				| sort_by((.value.all // []) | length) | last | .key
 			) // (
 				$p | to_entries
@@ -2433,7 +2477,7 @@ method_active_probe() {
 		if [ -n "$_sel" ]; then
 			_sel_type=$(printf '%s' "$_proxies" | jq -r --arg s "$_sel" '.proxies[$s].type // empty' 2>/dev/null)
 			case "$_sel_type" in
-				Selector|URLTest)
+				Selector|URLTest|Fallback|LoadBalance)
 					_proxy_name=$(printf '%s' "$_proxies" | jq -r --arg s "$_sel" '.proxies[$s].now // empty' 2>/dev/null)
 					[ -z "$_proxy_name" ] && _proxy_name=$(printf '%s' "$_proxies" | jq -r --arg s "$_sel" '(.proxies[$s].all // [])[0] // empty' 2>/dev/null)
 					# recurse to the real leaf (nested selector→urltest→…→server)
@@ -2457,7 +2501,7 @@ method_active_probe() {
 		# Delay to the active leaf (not service latency). Encode the path segment.
 		if [ -n "$_proxy_name" ]; then
 			_penc=$(printf '%s' "$_proxy_name" | jq -sRr @uri 2>/dev/null)
-			_dl=$(curl -s --connect-timeout 3 --max-time 8 ${_clash_hdr:+-H "$_clash_hdr"} \
+			_dl=$(curl -q -s --noproxy '*' --connect-timeout 3 --max-time 8 ${_clash_hdr:+-H "$_clash_hdr"} \
 				"http://${_clash_addr}/proxies/${_penc}/delay?timeout=5000&url=http://www.gstatic.com/generate_204" 2>/dev/null)
 			_srv_delay=$(printf '%s' "$_dl" | jq -r '.delay // empty' 2>/dev/null)
 		fi

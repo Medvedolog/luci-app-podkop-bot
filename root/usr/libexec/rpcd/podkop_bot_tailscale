@@ -1,0 +1,374 @@
+#!/bin/sh
+# rpcd object: podkop_bot_tailscale
+
+. /usr/lib/podkop_bot/tsnet-provider.sh
+
+UCI_PKG="forkop"
+FORKOP_INIT="/etc/init.d/forkop"
+RUNTIME_APPLY="/usr/lib/podkop_bot/tsnet-runtime-apply.sh"
+LOCK="/tmp/podkop_uci.lock"
+NATIVE_STATE_BASE="/etc/forkop/tailscale"
+
+json_in() { _IN=$(cat 2>/dev/null); [ -n "$_IN" ] || _IN='{}'; }
+lock_begin() { command -v flock >/dev/null 2>&1 || return 0; exec 8>>"$LOCK" 2>/dev/null || return 0; flock -x -w 10 8 2>/dev/null || flock -x -n 8 2>/dev/null || return 0; }
+lock_end() { exec 8>&- 2>/dev/null || true; }
+
+standalone_tailscale_present() {
+    [ -x /etc/init.d/tailscale ] || command -v tailscaled >/dev/null 2>&1 || command -v tailscale >/dev/null 2>&1
+}
+standalone_tailscale_running() {
+    if [ -x /etc/init.d/tailscale ]; then
+        /etc/init.d/tailscale running >/dev/null 2>&1 && return 0
+        /etc/init.d/tailscale status >/dev/null 2>&1 && return 0
+    fi
+    for _c in /proc/[0-9]*/cmdline; do
+        [ -r "$_c" ] || continue
+        tr '\0' ' ' <"$_c" 2>/dev/null | grep -q 'tailscaled' && return 0
+    done
+    return 1
+}
+standalone_confirmed() {
+    _v=$(printf '%s' "$_IN" | jq -r '.confirm_standalone // false' 2>/dev/null)
+    [ "$_v" = true ] || [ "$_v" = 1 ]
+}
+standalone_guard() {
+    standalone_tailscale_running || return 0
+    standalone_confirmed && return 0
+    printf '{"ok":false,"reason":"standalone_tailscale_running","requires_confirmation":true}\n'
+    return 1
+}
+
+valid_url() { case "$1" in http://?*|https://?*) return 0 ;; *) return 1 ;; esac; }
+valid_hostname() {
+    _h="$1"; [ -n "$_h" ] && [ ${#_h} -le 63 ] 2>/dev/null || return 1
+    printf '%s' "$_h" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$'
+}
+
+native_find_section() {
+    uci -q show "$UCI_PKG" 2>/dev/null | sed -n "s/^${UCI_PKG}\.\([^.=]*\)\.protocol='tailscale'$/\1/p" | head -n 1
+}
+native_gen_section() {
+    _i=1
+    while [ "$_i" -lt 100 ]; do
+        _n="server_ts_${_i}"
+        if ! uci -q get "${UCI_PKG}.${_n}" >/dev/null 2>&1 && [ ! -e "${NATIVE_STATE_BASE}/${_n}" ]; then printf '%s' "$_n"; return 0; fi
+        _i=$((_i + 1))
+    done
+    return 1
+}
+native_restart() { [ -x "$FORKOP_INIT" ] && "$FORKOP_INIT" restart >/dev/null 2>&1; }
+native_backup() { _b="/tmp/forkop.tailscale.$$.bak"; cp -p /etc/config/forkop "$_b" 2>/dev/null || : >"$_b"; printf '%s' "$_b"; }
+native_restore() { [ -f "$1" ] || return 1; cp -p "$1" /etc/config/forkop 2>/dev/null || return 1; rm -f "$1"; uci -q revert forkop >/dev/null 2>&1 || true; }
+
+runtime_apply() {
+    [ -x "$RUNTIME_APPLY" ] || return 1
+    "$RUNTIME_APPLY" >/dev/null 2>&1
+}
+
+auth_url() {
+    _auth=$(logread 2>/dev/null | grep -F 'Waiting for authentication:' | tail -n 1 | sed 's/.*Waiting for authentication:[[:space:]]*//')
+    case "$_auth" in http://*|https://*) printf '%s' "$_auth" ;; esac
+}
+
+singbox_running() {
+    if [ -x /etc/init.d/sing-box ]; then /etc/init.d/sing-box running >/dev/null 2>&1 && return 0; fi
+    pidof sing-box >/dev/null 2>&1
+}
+runtime_endpoint_applied() {
+    _cfg=$(tsnet_config_path); [ -r "$_cfg" ] || return 1
+    _tag="$1"
+    if [ -n "$_tag" ]; then jq -e --arg t "$_tag" '(.endpoints // []) | any(.type=="tailscale" and .tag==$t)' "$_cfg" >/dev/null 2>&1
+    else jq -e '(.endpoints // []) | any(.type=="tailscale")' "$_cfg" >/dev/null 2>&1; fi
+}
+clash_connections() {
+    _cfg=$(tsnet_config_path); [ -r "$_cfg" ] || return 1
+    _ctl=$(jq -r '.experimental.clash_api.external_controller // empty' "$_cfg" 2>/dev/null); [ -n "$_ctl" ] || return 1
+    case "$_ctl" in http://*|https://*) _base="$_ctl" ;; *) _base="http://$_ctl" ;; esac
+    curl -fsS --connect-timeout 1 --max-time 2 "${_base%/}/connections" 2>/dev/null
+}
+
+status_json() {
+    _provider=$(tsnet_provider)
+    _cap=false; tsnet_capable && _cap=true
+    _sp=false; standalone_tailscale_present && _sp=true
+    _sr=false; standalone_tailscale_running && _sr=true
+    _ver=$(tsnet_version_hint)
+    _configured=false; _enabled=false; _registered=false; _host=''; _url=''; _adv=false; _accept=false; _section=''
+    _integration=runtime
+    _legacy_present=false; _legacy_section=''; _legacy_enabled=false; _legacy_host=''; _legacy_url=''
+
+    if [ "$_provider" = forkop-native ]; then
+        _integration=native
+        _section=$(native_find_section)
+        if [ -n "$_section" ]; then
+            _configured=true
+            [ "$(uci -q get forkop.${_section}.enabled 2>/dev/null)" = 1 ] && _enabled=true
+            [ "$(uci -q get forkop.${_section}.tailscale_advertise_exit_node 2>/dev/null)" = 1 ] && _adv=true
+            [ "$(uci -q get forkop.${_section}.tailscale_accept_routes 2>/dev/null)" = 1 ] && _accept=true
+            _host=$(uci -q get "forkop.${_section}.tailscale_hostname" 2>/dev/null)
+            _url=$(uci -q get "forkop.${_section}.tailscale_control_url" 2>/dev/null)
+            [ -s "${NATIVE_STATE_BASE}/${_section}/tailscaled.state" ] && _registered=true
+        fi
+    elif [ "$_provider" != none ] && [ -r "$TSNET_STATE_FILE" ]; then
+        _configured=true
+        [ "$(tsnet_state_get enabled)" = true ] && _enabled=true
+        [ "$(tsnet_state_get advertise_exit_node)" = true ] && _adv=true
+        [ "$(tsnet_state_get accept_routes)" = true ] && _accept=true
+        _host=$(tsnet_state_get hostname); _url=$(tsnet_state_get control_url); _section="$TSNET_ENDPOINT_TAG"
+        [ -d "$TSNET_IDENTITY_DIR" ] && find "$TSNET_IDENTITY_DIR" -type f -size +0c -print -quit 2>/dev/null | grep -q . && _registered=true
+    fi
+
+    if [ "$_provider" != forkop-native ]; then
+        _legacy_section=$(native_find_section)
+        if [ -n "$_legacy_section" ]; then
+            _legacy_present=true
+            [ "$(uci -q get forkop.${_legacy_section}.enabled 2>/dev/null)" = 1 ] && _legacy_enabled=true
+            _legacy_host=$(uci -q get "forkop.${_legacy_section}.tailscale_hostname" 2>/dev/null)
+            _legacy_url=$(uci -q get "forkop.${_legacy_section}.tailscale_control_url" 2>/dev/null)
+        fi
+    fi
+
+    _sb=false; singbox_running && _sb=true
+    _applied=false
+    if [ "$_configured" = true ]; then
+        if [ "$_integration" = runtime ]; then runtime_endpoint_applied "$TSNET_ENDPOINT_TAG" && _applied=true
+        else runtime_endpoint_applied "" && _applied=true; fi
+    fi
+
+    _active=0; _peers='[]'
+    if [ "$_enabled" = true ] && [ "$_sb" = true ]; then
+        _cj=$(clash_connections 2>/dev/null || true)
+        if [ -n "$_cj" ]; then
+            if [ "$_integration" = runtime ]; then
+                _match="tailscale/$TSNET_ENDPOINT_TAG"
+                _active=$(printf '%s' "$_cj" | jq -r --arg t "$_match" '[.connections[]? | select(.metadata.type==$t)] | length' 2>/dev/null || echo 0)
+                _peers=$(printf '%s' "$_cj" | jq -c --arg t "$_match" '[.connections[]? | select(.metadata.type==$t) | .metadata.sourceIP] | map(select(. != "")) | unique' 2>/dev/null || echo '[]')
+            else
+                _active=$(printf '%s' "$_cj" | jq -r '[.connections[]? | select(.metadata.type|startswith("tailscale/"))] | length' 2>/dev/null || echo 0)
+                _peers=$(printf '%s' "$_cj" | jq -c '[.connections[]? | select(.metadata.type|startswith("tailscale/"))] | map(.metadata.sourceIP) | map(select(. != "")) | unique' 2>/dev/null || echo '[]')
+            fi
+        fi
+    fi
+    case "$_active" in ''|*[!0-9]*) _active=0 ;; esac
+
+    if [ "$_configured" != true ]; then _runtime_state=unconfigured
+    elif [ "$_enabled" != true ]; then _runtime_state=disabled
+    elif [ "$_sb" != true ]; then _runtime_state=failed
+    elif [ "$_applied" != true ]; then _runtime_state=degraded
+    elif [ "$_active" -gt 0 ]; then _runtime_state=active
+    elif [ "$_registered" = true ]; then _runtime_state=ready
+    else _runtime_state=starting; fi
+
+    jq -cn --arg provider "$_provider" --arg integration "$_integration" --arg ver "$_ver" \
+        --argjson cap "$_cap" --argjson configured "$_configured" --argjson enabled "$_enabled" \
+        --argjson registered "$_registered" --argjson adv "$_adv" --argjson accept "$_accept" --arg host "$_host" --arg url "$_url" \
+        --arg section "$_section" --arg auth_url "$(auth_url)" --argjson sp "$_sp" --argjson sr "$_sr" \
+        --argjson legacy_present "$_legacy_present" --arg legacy_section "$_legacy_section" \
+        --argjson legacy_enabled "$_legacy_enabled" --arg legacy_host "$_legacy_host" --arg legacy_url "$_legacy_url" \
+        --argjson sb "$_sb" --argjson applied "$_applied" --argjson active "$_active" --argjson peers "$_peers" --arg runtime_state "$_runtime_state" \
+        '{ok:true,provider:$provider,integration:$integration,forkop_present:($provider!="none"),tailscale_supported:$cap,singbox_version:$ver,configured:$configured,section:$section,hostname:$host,control_url:$url,enabled:$enabled,accept_routes:$accept,advertise_exit_node:$adv,registered:$registered,runtime_applied:$applied,singbox_running:$sb,active_connections:$active,active_peers:$peers,runtime_state:$runtime_state,auth_url:$auth_url,standalone_tailscale_present:$sp,standalone_tailscale_running:$sr,legacy_native_present:$legacy_present,legacy_native_section:$legacy_section,legacy_native_enabled:$legacy_enabled,legacy_native_hostname:$legacy_host,legacy_native_control_url:$legacy_url}'
+}
+
+parse_create_fields() {
+    _url=$(printf '%s' "$_IN" | jq -r '.control_url // "https://controlplane.tailscale.com"')
+    _key=$(printf '%s' "$_IN" | jq -r '.auth_key // ""')
+    _host=$(printf '%s' "$_IN" | jq -r '.hostname // ""')
+    _adv=$(printf '%s' "$_IN" | jq -r '.advertise_exit_node // false')
+    _accept=$(printf '%s' "$_IN" | jq -r '.accept_routes // false')
+    valid_url "$_url" || return 1
+    valid_hostname "$_host" || return 2
+    [ -n "$_key" ] || return 3
+    printf '%s' "$_key" | LC_ALL=C grep -q '[[:cntrl:]]' && return 4
+    case "$_adv" in true|1) _adv=true ;; false|0) _adv=false ;; *) return 5 ;; esac
+    case "$_accept" in true|1) _accept=true ;; false|0) _accept=false ;; *) return 6 ;; esac
+    return 0
+}
+
+method_create() {
+    json_in; _provider=$(tsnet_provider)
+    [ "$_provider" != none ] || { printf '{"ok":false,"reason":"provider_missing"}\n'; return; }
+    tsnet_capable || { printf '{"ok":false,"reason":"tailscale_unsupported"}\n'; return; }
+    standalone_guard || return
+    parse_create_fields; _rc=$?
+    case $_rc in
+        1) printf '{"ok":false,"reason":"bad_control_url"}\n'; return ;;
+        2) printf '{"ok":false,"reason":"bad_hostname"}\n'; return ;;
+        3) printf '{"ok":false,"reason":"auth_key_required"}\n'; return ;;
+        4) printf '{"ok":false,"reason":"bad_auth_key"}\n'; return ;;
+        5) printf '{"ok":false,"reason":"bad_advertise_value"}\n'; return ;;
+        6) printf '{"ok":false,"reason":"bad_accept_routes_value"}\n'; return ;;
+    esac
+
+    if [ "$_provider" = forkop-native ]; then
+        [ -z "$(native_find_section)" ] || { printf '{"ok":false,"reason":"already_configured"}\n'; return; }
+        _sec=$(native_gen_section) || { printf '{"ok":false,"reason":"section_name_exhausted"}\n'; return; }
+        lock_begin; _bak=$(native_backup); _ok=1
+        uci -q set "forkop.${_sec}=server" || _ok=0
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.protocol=tailscale" || _ok=0
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.enabled=0" || _ok=0
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.routing_mode=rules" || _ok=0
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.label=Tailscale" || _ok=0
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.tailscale_control_url=$_url" || _ok=0
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.tailscale_auth_key=$_key" || _ok=0
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.tailscale_hostname=$_host" || _ok=0
+        _advi=0; [ "$_adv" = true ] && _advi=1
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.tailscale_advertise_exit_node=$_advi" || _ok=0
+        _acci=0; [ "$_accept" = true ] && _acci=1
+        [ $_ok = 1 ] && uci -q set "forkop.${_sec}.tailscale_accept_routes=$_acci" || _ok=0
+        [ $_ok = 1 ] && uci -q commit forkop || _ok=0
+        if [ $_ok != 1 ]; then native_restore "$_bak" >/dev/null 2>&1 || true; lock_end; printf '{"ok":false,"reason":"uci_write_failed"}\n'; return; fi
+        rm -f "$_bak"; lock_end
+        jq -cn --arg provider "$_provider" --arg section "$_sec" '{ok:true,provider:$provider,section:$section,enabled:false}'
+        return
+    fi
+
+    [ ! -r "$TSNET_STATE_FILE" ] || { printf '{"ok":false,"reason":"already_configured"}\n'; return; }
+    tsnet_state_write false "$_host" "$_url" "$_key" "$_adv" "$_accept" || { printf '{"ok":false,"reason":"state_write_failed"}\n'; return; }
+    jq -cn --arg provider "$_provider" --arg section "$TSNET_ENDPOINT_TAG" '{ok:true,provider:$provider,section:$section,enabled:false}'
+}
+
+method_set_enabled() {
+    json_in; _provider=$(tsnet_provider); _v=$(printf '%s' "$_IN" | jq -r '.enabled // false')
+    case "$_v" in
+        true|1) _want=true; tsnet_capable || { printf '{"ok":false,"reason":"tailscale_unsupported"}\n'; return; }; standalone_guard || return ;;
+        false|0) _want=false ;;
+        *) printf '{"ok":false,"reason":"bad_value"}\n'; return ;;
+    esac
+
+    if [ "$_provider" = forkop-native ]; then
+        _sec=$(native_find_section); [ -n "$_sec" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+        _vi=0; [ "$_want" = true ] && _vi=1
+        lock_begin; _bak=$(native_backup)
+        if ! uci -q set "forkop.${_sec}.enabled=$_vi" || ! uci -q commit forkop || ! native_restart; then
+            native_restore "$_bak" >/dev/null 2>&1 || true; native_restart >/dev/null 2>&1 || true; lock_end
+            printf '{"ok":false,"reason":"restart_failed","rolled_back":true}\n'; return
+        fi
+        rm -f "$_bak"; lock_end
+        jq -cn --argjson enabled "$_want" '{ok:true,enabled:$enabled}'
+        return
+    fi
+
+    [ -r "$TSNET_STATE_FILE" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+    tsnet_state_set_enabled "$_want" || { printf '{"ok":false,"reason":"state_write_failed"}\n'; return; }
+    if ! runtime_apply; then
+        tsnet_state_set_enabled "$([ "$_want" = true ] && echo false || echo true)" >/dev/null 2>&1 || true
+        printf '{"ok":false,"reason":"runtime_apply_failed"}\n'; return
+    fi
+    jq -cn --argjson enabled "$_want" --arg provider "$_provider" '{ok:true,provider:$provider,enabled:$enabled,volatile_runtime:true}'
+}
+
+method_set_accept_routes() {
+    json_in; _provider=$(tsnet_provider); _v=$(printf '%s' "$_IN" | jq -r '.enabled // false')
+    case "$_v" in true|1) _want=true ;; false|0) _want=false ;; *) printf '{"ok":false,"reason":"bad_value"}\n'; return ;; esac
+    if [ "$_provider" = forkop-native ]; then
+        _sec=$(native_find_section); [ -n "$_sec" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+        _vi=0; [ "$_want" = true ] && _vi=1
+        uci -q set "forkop.${_sec}.tailscale_accept_routes=$_vi" && uci -q commit forkop || { printf '{"ok":false,"reason":"uci_write_failed"}\n'; return; }
+        [ "$(uci -q get forkop.${_sec}.enabled 2>/dev/null)" = 1 ] && native_restart >/dev/null 2>&1 || true
+    else
+        [ -r "$TSNET_STATE_FILE" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+        _old=$(tsnet_state_get accept_routes); [ "$_old" = true ] || _old=false
+        _tmp="$TSNET_STATE_FILE.$$"
+        jq --argjson v "$_want" '.accept_routes=$v' "$TSNET_STATE_FILE" >"$_tmp" && chmod 600 "$_tmp" && mv -f "$_tmp" "$TSNET_STATE_FILE" || { rm -f "$_tmp"; printf '{"ok":false,"reason":"state_write_failed"}\n'; return; }
+        if [ "$(tsnet_state_get enabled)" = true ] && ! runtime_apply; then
+            _tmp="$TSNET_STATE_FILE.$$"; jq --argjson v "$_old" '.accept_routes=$v' "$TSNET_STATE_FILE" >"$_tmp" && chmod 600 "$_tmp" && mv -f "$_tmp" "$TSNET_STATE_FILE" >/dev/null 2>&1 || true
+            printf '{"ok":false,"reason":"runtime_apply_failed"}\n'; return
+        fi
+    fi
+    jq -cn --argjson accept_routes "$_want" '{ok:true,accept_routes:$accept_routes}'
+}
+
+method_set_advertise() {
+    json_in; _provider=$(tsnet_provider); _v=$(printf '%s' "$_IN" | jq -r '.enabled // false')
+    case "$_v" in true|1) _want=true ;; false|0) _want=false ;; *) printf '{"ok":false,"reason":"bad_value"}\n'; return ;; esac
+    if [ "$_provider" = forkop-native ]; then
+        _sec=$(native_find_section); [ -n "$_sec" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+        _vi=0; [ "$_want" = true ] && _vi=1
+        uci -q set "forkop.${_sec}.tailscale_advertise_exit_node=$_vi" && uci -q commit forkop || { printf '{"ok":false,"reason":"uci_write_failed"}\n'; return; }
+        [ "$(uci -q get forkop.${_sec}.enabled 2>/dev/null)" = 1 ] && native_restart >/dev/null 2>&1 || true
+    else
+        [ -r "$TSNET_STATE_FILE" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+        _old=$(tsnet_state_get advertise_exit_node); [ "$_old" = true ] || _old=false
+        _tmp="$TSNET_STATE_FILE.$$"
+        jq --argjson v "$_want" '.advertise_exit_node=$v' "$TSNET_STATE_FILE" >"$_tmp" && chmod 600 "$_tmp" && mv -f "$_tmp" "$TSNET_STATE_FILE" || { rm -f "$_tmp"; printf '{"ok":false,"reason":"state_write_failed"}\n'; return; }
+        if [ "$(tsnet_state_get enabled)" = true ] && ! runtime_apply; then
+            _tmp="$TSNET_STATE_FILE.$$"; jq --argjson v "$_old" '.advertise_exit_node=$v' "$TSNET_STATE_FILE" >"$_tmp" && chmod 600 "$_tmp" && mv -f "$_tmp" "$TSNET_STATE_FILE" >/dev/null 2>&1 || true
+            printf '{"ok":false,"reason":"runtime_apply_failed"}\n'; return
+        fi
+    fi
+    jq -cn --argjson advertise_exit_node "$_want" '{ok:true,advertise_exit_node:$advertise_exit_node}'
+}
+
+method_reapply() {
+    json_in; _provider=$(tsnet_provider)
+    [ "$_provider" != none ] || { printf '{"ok":false,"reason":"provider_missing"}\n'; return; }
+    [ "$_provider" != forkop-native ] || { printf '{"ok":false,"reason":"native_managed"}\n'; return; }
+    [ -r "$TSNET_STATE_FILE" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+    [ "$(tsnet_state_get enabled)" = true ] || { printf '{"ok":false,"reason":"not_enabled"}\n'; return; }
+    tsnet_capable || { printf '{"ok":false,"reason":"tailscale_unsupported"}\n'; return; }
+    if ! runtime_apply; then
+        printf '{"ok":false,"reason":"runtime_apply_failed"}\n'; return
+    fi
+    runtime_endpoint_applied "$TSNET_ENDPOINT_TAG" || { printf '{"ok":false,"reason":"runtime_apply_not_visible"}\n'; return; }
+    jq -cn --arg provider "$_provider" '{ok:true,provider:$provider,reapplied:true,volatile_runtime:true}'
+}
+
+method_delete() {
+    json_in; _provider=$(tsnet_provider); _purge=$(printf '%s' "$_IN" | jq -r '.purge_state // false')
+    _legacy=$(printf '%s' "$_IN" | jq -r '.legacy_native // false')
+    case "$_purge" in true|1) _purge=true ;; *) _purge=false ;; esac
+    case "$_legacy" in true|1) _legacy=true ;; *) _legacy=false ;; esac
+
+    if [ "$_legacy" = true ]; then
+        [ "$_provider" != forkop-native ] || { printf '{"ok":false,"reason":"legacy_delete_not_allowed_on_native"}\n'; return; }
+        _sec=$(native_find_section); [ -n "$_sec" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+        lock_begin; _bak=$(native_backup)
+        if ! uci -q delete "forkop.${_sec}" || ! uci -q commit forkop; then
+            native_restore "$_bak" >/dev/null 2>&1 || true; lock_end
+            printf '{"ok":false,"reason":"uci_write_failed","rolled_back":true}\n'; return
+        fi
+        rm -f "$_bak"; lock_end
+        [ "$_purge" = true ] && rm -rf "${NATIVE_STATE_BASE:?}/${_sec}" 2>/dev/null || true
+        jq -cn --arg section "$_sec" --argjson purged "$_purge" '{ok:true,configured:false,legacy_native_deleted:true,section:$section,purged_state:$purged,restarted:false}'
+        return
+    fi
+
+    if [ "$_provider" = forkop-native ]; then
+        _sec=$(native_find_section); [ -n "$_sec" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+        lock_begin; _bak=$(native_backup); _was=$(uci -q get "forkop.${_sec}.enabled" 2>/dev/null)
+        if [ "$_was" = 1 ]; then
+            uci -q set "forkop.${_sec}.enabled=0" && uci -q commit forkop && native_restart || { native_restore "$_bak" >/dev/null 2>&1 || true; lock_end; printf '{"ok":false,"reason":"disable_failed","rolled_back":true}\n'; return; }
+        fi
+        uci -q delete "forkop.${_sec}" && uci -q commit forkop || { native_restore "$_bak" >/dev/null 2>&1 || true; lock_end; printf '{"ok":false,"reason":"uci_write_failed","rolled_back":true}\n'; return; }
+        rm -f "$_bak"; lock_end
+        [ "$_purge" = true ] && rm -rf "${NATIVE_STATE_BASE:?}/${_sec}" 2>/dev/null || true
+    else
+        [ -r "$TSNET_STATE_FILE" ] || { printf '{"ok":false,"reason":"not_configured"}\n'; return; }
+        _was_enabled=$(tsnet_state_get enabled); [ "$_was_enabled" = true ] || _was_enabled=false
+        tsnet_state_set_enabled false >/dev/null 2>&1 || true
+        if ! runtime_apply; then
+            tsnet_state_set_enabled "$_was_enabled" >/dev/null 2>&1 || true
+            printf '{"ok":false,"reason":"runtime_apply_failed"}\n'; return
+        fi
+        rm -f "$TSNET_STATE_FILE"
+        [ "$_purge" = true ] && rm -rf "$TSNET_IDENTITY_DIR" 2>/dev/null || true
+    fi
+    printf '{"ok":true,"configured":false}\n'
+}
+
+case "$1" in
+    list) echo '{"api_version":1,"status":{},"create":{"control_url":"","auth_key":"","hostname":"","accept_routes":false,"advertise_exit_node":false,"confirm_standalone":false},"set_enabled":{"enabled":false,"confirm_standalone":false},"set_accept_routes":{"enabled":false},"set_advertise_exit_node":{"enabled":false},"reapply":{},"delete":{"purge_state":false,"legacy_native":false}}' ;;
+    call)
+        case "$2" in
+            status) cat >/dev/null 2>&1 || true; status_json ;;
+            create) method_create ;;
+            set_enabled) method_set_enabled ;;
+            set_accept_routes) method_set_accept_routes ;;
+            set_advertise_exit_node) method_set_advertise ;;
+            reapply) method_reapply ;;
+            delete) method_delete ;;
+            *) cat >/dev/null 2>&1 || true; printf '{"ok":false,"reason":"unknown_method"}\n' ;;
+        esac
+        ;;
+    *) exit 1 ;;
+esac

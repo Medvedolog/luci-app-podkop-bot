@@ -1,0 +1,108 @@
+#!/bin/sh
+# Detached wrapper for long active_probe diagnostics.
+# Keeps the 15-60s probe off the LuCI XHR lifecycle and can restore WARP Rescue
+# server-side after a temporary WARPSCOUT test route.
+
+BACKEND="/usr/libexec/rpcd/podkop_bot"
+STATE_DIR="/tmp/podkop_bot"
+LOCK_DIR="$STATE_DIR/active_probe_async.lock"
+STATE_FILE="$STATE_DIR/active_probe_async.state"
+RESULT_FILE="$STATE_DIR/active_probe_async.result.json"
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+json_escape(){ printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '; }
+json_str(){ printf '"%s"' "$(json_escape "$1")"; }
+field(){ printf '%s' "$INPUT" | jq -r --arg k "$1" '.[$k] // ""' 2>/dev/null; }
+pid_alive(){ [ -s "$LOCK_DIR/pid" ] || return 1; p=$(cat "$LOCK_DIR/pid" 2>/dev/null); case "$p" in ''|*[!0-9]*) return 1;; esac; kill -0 "$p" 2>/dev/null; }
+state_get(){ [ -s "$STATE_FILE" ] && sed -n "s/^$1=//p" "$STATE_FILE" | head -n1; }
+state_write(){
+  s="$1"; label="$2"; restore="$3"; started="$4"; finished="$5"; reason="$6"
+  t="$STATE_FILE.$$"
+  { printf 'state=%s\n' "$s"; printf 'label=%s\n' "$label"; printf 'restore_warp=%s\n' "$restore"; printf 'started_at=%s\n' "$started"; printf 'finished_at=%s\n' "$finished"; printf 'reason=%s\n' "$reason"; } > "$t" && mv "$t" "$STATE_FILE"
+}
+reclaim_stale(){
+  [ -d "$LOCK_DIR" ] || return 0
+  pid_alive && return 1
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  return 0
+}
+restore_warp(){ ubus call podkop_bot_warpscout_runtime stop '{}' >/dev/null 2>&1 || true; }
+
+method_start(){
+  read -r INPUT 2>/dev/null
+  reclaim_stale || { printf '{"ok":false,"reason":"already_running"}\n'; return; }
+  mkdir "$LOCK_DIR" 2>/dev/null || { printf '{"ok":false,"reason":"already_running"}\n'; return; }
+
+  section=$(field section); proxy=$(field proxy); label=$(field label); restore=$(field restore_warp)
+  [ "$restore" = "true" ] || restore=false
+  started=$(date +%s 2>/dev/null || echo 0)
+  safe_label="$label"; [ -n "$safe_label" ] || safe_label="$section"; [ -n "$safe_label" ] || safe_label="route"
+  # Do not persist proxy/credentials. The request exists only in this process and
+  # the detached child environment/pipe.
+  probe_json=$(jq -cn --arg section "$section" --arg proxy "$proxy" --arg label "$label" '{cached:"",section:$section,proxy:$proxy,label:$label}' 2>/dev/null)
+  [ -n "$probe_json" ] || { rm -rf "$LOCK_DIR"; printf '{"ok":false,"reason":"bad_request"}\n'; return; }
+  rm -f "$RESULT_FILE" "$RESULT_FILE.tmp" 2>/dev/null
+  state_write running "$safe_label" "$restore" "$started" 0 ""
+
+  (
+    trap '[ "$restore" = true ] && restore_warp; rm -rf "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+    tmp="$RESULT_FILE.tmp.$$"
+    if printf '%s\n' "$probe_json" | "$BACKEND" call active_probe > "$tmp" 2>/dev/null && jq -e . "$tmp" >/dev/null 2>&1; then
+      mv "$tmp" "$RESULT_FILE"
+      rc=0; reason=""
+    else
+      rm -f "$tmp" 2>/dev/null
+      printf '{"ok":false,"available":false,"reason":"probe_worker_failed","detail":"active probe worker failed"}\n' > "$RESULT_FILE"
+      rc=1; reason="probe_worker_failed"
+    fi
+    [ "$restore" = true ] && restore_warp
+    finished=$(date +%s 2>/dev/null || echo 0)
+    state_write done "$safe_label" "$restore" "$started" "$finished" "$reason"
+    exit "$rc"
+  ) >/dev/null 2>&1 &
+  worker=$!
+  printf '%s\n' "$worker" > "$LOCK_DIR/pid"
+  printf '{"ok":true,"started":true,"pid":%s,"label":%s}\n' "$worker" "$(json_str "$safe_label")"
+}
+
+method_status(){
+  read -r INPUT 2>/dev/null
+  running=false; pid=0
+  if pid_alive; then running=true; pid=$(cat "$LOCK_DIR/pid" 2>/dev/null); fi
+  state=$(state_get state); [ -n "$state" ] || state=idle
+  label=$(state_get label); started=$(state_get started_at); finished=$(state_get finished_at); reason=$(state_get reason)
+  [ -n "$started" ] || started=0; [ -n "$finished" ] || finished=0
+  ready=false; [ -s "$RESULT_FILE" ] && ready=true
+  printf '{"ok":true,"running":%s,"state":%s,"pid":%s,"label":%s,"started_at":%s,"finished_at":%s,"result_ready":%s,"reason":%s}\n' \
+    "$running" "$(json_str "$state")" "$pid" "$(json_str "$label")" "$started" "$finished" "$ready" "$(json_str "$reason")"
+}
+
+method_result(){
+  read -r INPUT 2>/dev/null
+  if pid_alive; then printf '{"ok":true,"running":true,"done":false}\n'; return; fi
+  if [ -s "$RESULT_FILE" ]; then cat "$RESULT_FILE"; printf '\n'; return; fi
+  printf '{"ok":false,"available":false,"reason":"no_result"}\n'
+}
+
+method_cancel(){
+  read -r INPUT 2>/dev/null
+  restore=$(state_get restore_warp); [ "$restore" = true ] || restore=false
+  if pid_alive; then pid=$(cat "$LOCK_DIR/pid" 2>/dev/null); kill "$pid" 2>/dev/null || true; sleep 1; kill -9 "$pid" 2>/dev/null || true; fi
+  [ "$restore" = true ] && restore_warp
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  now=$(date +%s 2>/dev/null || echo 0); state_write cancelled "$(state_get label)" "$restore" "$(state_get started_at)" "$now" cancelled
+  printf '{"ok":true,"cancelled":true}\n'
+}
+
+case "$1" in
+  list) echo '{"active_probe_start":{"section":"x","proxy":"x","label":"x","restore_warp":"false"},"active_probe_status":{},"active_probe_result":{},"active_probe_cancel":{}}' ;;
+  call)
+    case "$2" in
+      active_probe_start) method_start ;;
+      active_probe_status) method_status ;;
+      active_probe_result) method_result ;;
+      active_probe_cancel) method_cancel ;;
+      *) echo '{"error":"unknown method"}'; exit 1 ;;
+    esac ;;
+  *) echo '{"error":"unknown command"}'; exit 1 ;;
+esac

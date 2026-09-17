@@ -7,13 +7,16 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-podkop-bot
-PKG_VERSION:=0.19.17
+PKG_VERSION:=0.19.19
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Medvedolog
 PKG_LICENSE:=GPL-2.0-or-later
 
-LUCI_TITLE:=LuCI interface for podkop_bot (Telegram bot for podkop/sing-box)
+LUCI_TITLE:=LuCI control panel for podkop_bot, Podkop/Forkop, Tailscale/tsnet, WARP and Bearhole
+# Native hwelp-proxy is an optional architecture-specific package. It is not a
+# hard dependency: Bearhole installs it on demand, while the LuCI/control package
+# remains installable and repairable when external feeds are unavailable.
 LUCI_DEPENDS:=+luci-base +jq +curl
 LUCI_PKGARCH:=all
 

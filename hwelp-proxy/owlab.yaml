@@ -1,0 +1,15 @@
+version: 1
+
+project:
+  name: hwelp-proxy
+
+# owlab currently exposes a deliberately small architecture set. Use it for the
+# x86_64 runtime smoke; Cortex-A53 release artifacts are built with the official
+# mediatek/filogic SDK by tools/build-hwelp-sdk.sh.
+routers:
+  - id: owrt2410-x86
+    release: "24.10.8"
+    arch: x86_64
+  - id: owrt2512-x86
+    release: "25.12.5"
+    arch: x86_64

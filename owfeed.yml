@@ -31,16 +31,21 @@ packages:
     version-from: file:./dist/VERSION
     files: ./dist/root
 
-    description: "LuCI web interface for installing, configuring and diagnosing the podkop_bot Telegram management service on OpenWrt."
+    description: "LuCI control panel and Telegram-bot integration for Podkop, Forkop and Forkop X on OpenWrt, with resilient proxy fallback, built-in sing-box Tailscale/tsnet multiprovider support, WARP Rescue, Warpscout and Bearhole multi-proxy rescue bootstrap."
+    # Bearhole engine modules are intentionally not hard dependencies. A broken
+    # feed must never block installation/repair of luci-app-podkop-bot itself;
+    # RPC/LuCI gate the Bearhole switch until the optional engine is available.
     depends: [libc, luci-base, jq, curl]
     license: GPL-2.0-or-later
     url: https://github.com/Medvedolog/luci-app-podkop-bot
     maintainer: "Medvedolog <Medvedolog@github.com>"
     repo-commit: env:GITHUB_SHA
 
-    # podkop_bot configuration is created and owned by the bot installer; this
-    # LuCI package intentionally ships no /etc/config/podkop_bot defaults.
+    # Bearhole UCI is runtime/user-owned and is deliberately not shipped in the
+    # package payload, so upgrades preserve the existing router configuration.
+    # podkop_bot configuration is likewise created and owned by the bot installer.
 
     scripts:
+      pre-install: ./dist/scripts/preinst
       post-install: ./dist/scripts/postinst
       post-deinstall: ./dist/scripts/postrm
